@@ -1,0 +1,24 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.pnpm-store/
+
+# 日志
+logs/
+*.log
+
+# 系统
+.DS_Store
+*.swp
+
+# 环境变量与密钥
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# 构建产物
+coverage/
+
+packages/pi-permission/config.json

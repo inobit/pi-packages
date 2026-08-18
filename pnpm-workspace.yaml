@@ -1,0 +1,22 @@
+packages:
+  - "packages/*"
+
+# 跨包链接需显式使用 workspace: 协议
+linkWorkspacePackages: false
+
+# 允许执行构建脚本的依赖（pnpm 11 默认忽略构建脚本）
+onlyBuiltDependencies:
+  - "@google/genai"
+  - protobufjs
+
+# 集中管理各包共享依赖版本
+catalog:
+  typescript: "^6.0.3"
+  "@types/node": "^24.0.0"
+  "@earendil-works/pi-coding-agent": "0.84.2"
+  "@earendil-works/pi-tui": "0.84.2"
+  typebox: "^0.35.0"
+
+allowBuilds:
+  '@google/genai': true
+  protobufjs: true

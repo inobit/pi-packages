@@ -1,0 +1,22 @@
+{
+  "name": "@inobit/pi-packages",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Monorepo for @inobit pi packages",
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "check": "pnpm -r run check",
+    "test": "pnpm -r run test",
+    "lint": "pnpm -r run lint",
+    "build": "pnpm -r run build",
+    "publish:all": "pnpm -r publish"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "@types/node": "^24.0.0"
+  }
+}

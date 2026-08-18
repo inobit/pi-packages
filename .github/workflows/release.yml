@@ -1,0 +1,133 @@
+name: Release
+
+# 手动打 tag 触发发布：`<pkg-dir>/v<version>`（如 `pi-permission/v0.1.0`）
+# 流程：1. 校验 + 测试 → 2. GitHub Release → 3. 发布到 npm
+on:
+  push:
+    tags:
+      - '*/v*'
+
+permissions:
+  contents: write   # 创建 GitHub Release
+  id-token: write   # npm provenance（如启用，见 publish job 注释）
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6   # 版本由 package.json 的 packageManager 锁定，无需 version 字段
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm check
+      - name: Test
+        run: pnpm test
+
+  release:
+    name: Release (GitHub)
+    needs: check
+    runs-on: ubuntu-latest
+    outputs:
+      project: ${{ steps.meta.outputs.project }}
+      version: ${{ steps.meta.outputs.version }}
+      pkg_name: ${{ steps.meta.outputs.pkg_name }}
+      pkg_path: ${{ steps.meta.outputs.pkg_path }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      # tag 格式 `<pkg-dir>/v<version>` → project=pi-permission, version=0.1.0
+      - name: Parse tag and verify version
+        id: meta
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          PROJECT="${TAG%%/*}"
+          VERSION="${TAG#*/}"
+          VERSION="${VERSION#v}"   # 剥掉 v 前缀，与 package.json 的 version（如 0.1.0）一致
+          PKG_PATH="packages/$PROJECT"
+          if [ ! -f "$PKG_PATH/package.json" ]; then
+            echo "::error::no package.json at $PKG_PATH (tag project must match a packages/<dir>)"
+            exit 1
+          fi
+          PKG_NAME=$(node -p "require('./$PKG_PATH/package.json').name")
+          PKG_VERSION=$(node -p "require('./$PKG_PATH/package.json').version")
+          if [ "$PKG_VERSION" != "$VERSION" ]; then
+            echo "::error::tag version '$VERSION' does not match package.json version '$PKG_VERSION'"
+            exit 1
+          fi
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "pkg_name=$PKG_NAME" >> "$GITHUB_OUTPUT"
+          echo "pkg_path=$PKG_PATH" >> "$GITHUB_OUTPUT"
+
+      # 从 CHANGELOG.md 提取 `## [<version>]` 段落作为 Release notes
+      - name: Extract changelog
+        id: changelog
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          CHANGELOG="${{ steps.meta.outputs.pkg_path }}/CHANGELOG.md"
+          BODY=$(awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
+            found && $0 ~ "^## \\[" { exit }
+            found { print }
+          ' "$CHANGELOG" || true)
+          if [ -z "$BODY" ]; then
+            echo "::warning::no changelog section for v$VERSION; falling back to generated notes"
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "body<<EOF"
+              echo "$BODY"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pack tarball
+        run: |
+          cd "${{ steps.meta.outputs.pkg_path }}"
+          pnpm pack --pack-destination /tmp/release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: "${{ steps.meta.outputs.pkg_name }} v${{ steps.meta.outputs.version }}"
+          body: "${{ steps.changelog.outputs.body }}"
+          generate_release_notes: ${{ steps.changelog.outputs.empty == 'true' }}
+          files: /tmp/release/*.tgz
+
+  publish:
+    name: Publish to npm
+    needs: [check, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Publish
+        env:
+          # npm 发布 token（需 bypass 2FA）：
+          #   GitHub 仓库 → Settings → Secrets and variables → Actions → NPM_TOKEN
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          pnpm --filter "${{ needs.release.outputs.pkg_name }}" publish \
+            --access public \
+            --no-git-checks
+      # 如需 npm provenance（源码可信链）：账号需在 npm 启用 trusted publishing，
+      # 然后在 publish 命令追加 `--provenance`（本 workflow 已声明 id-token: write）。
