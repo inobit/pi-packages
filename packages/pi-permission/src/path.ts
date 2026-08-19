@@ -66,6 +66,30 @@ export function isSensitivePath(
   return false;
 }
 
+
+/**
+ * 判断路径是否落在 trusted 外部路径前缀下（FR-9，如 `/tmp` 临时目录）。
+ * 双形态匹配（原始 + realpath，防 symlink 逃逸）+ 相对路径按 cwd 解析 + `~` 展开；
+ * 前缀匹配用 `p === prefix || p.startsWith(prefix + "/")`（避免 /tmp 误匹配 /tmpxxx）。
+ */
+export function isTrustedPath(
+  target: string,
+  prefixes: readonly string[],
+  cwd: string,
+  home: string,
+): boolean {
+  const abs = normalizePath(target, cwd, home);
+  const real = realpathOf(abs);
+  const candidates = [abs, real].filter((p): p is string => Boolean(p));
+  for (const p of candidates) {
+    for (const prefix of prefixes) {
+      const expanded = expandHome(prefix, home);
+      if (p === expanded || p.startsWith(expanded + path.sep)) return true;
+    }
+  }
+  return false;
+}
+
 /** 是否为 `.env.example`（读取豁免，FR-1 例外）。 */
 export function isSensitiveReadException(target: string, cwd: string, home: string): boolean {
   const abs = normalizePath(target, cwd, home);

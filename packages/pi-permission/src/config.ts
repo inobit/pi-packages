@@ -17,6 +17,9 @@ export interface PermissionConfig {
    * 固定规则不可配置：rm -r/-f、chmod -R、chown -R、curl/wget 管道到 shell、wrapper 命令（bash -c/eval/sudo/xargs/find -exec）。
    */
   dangerousBashCommands: string[];
+  /** trusted 外部路径前缀（FR-9）：落在前缀下的外部读写直接放行（如 `/tmp` 临时文件）；
+   * realpath 双形态防软链逃逸；仅作用于目录放行层面，不改变危险/敏感判定的优先级。 */
+  trustedExternalPaths: string[];
   /** 内置只读工具（FR-8.3 plan 放行；内置默认 ∪ 用户配置）。 */
   readonlyTools: string[];
   /** strictPlanMode：未知工具在 plan 下由 ask 收紧为 deny（FR-8.3）。 */
@@ -84,6 +87,8 @@ export const DEFAULT_CONFIG: PermissionConfig = {
     // 网络/防火墙
     "iptables", "ip6tables", "ufw", "firewall-cmd",
   ],
+  // trusted 外部路径：默认 `/tmp`（运行时并入 os.tmpdir() 系统临时目录），可配置追加
+  trustedExternalPaths: ["/tmp"],
   // 仅 pi 核心内置只读工具（createReadOnlyTools：read/grep/find/ls）；
   // 第三方扩展工具（web_search/agent-browser/skill/mcp_*/ffgrep 等）需用户自行追加（取并集）
   readonlyTools: [...BUILTIN_READONLY_TOOLS],
@@ -102,6 +107,7 @@ const ARRAY_FIELDS = new Set<keyof PermissionConfig>([
   "sensitivePatterns",
   "readonlyBashCommands",
   "dangerousBashCommands",
+  "trustedExternalPaths",
   "readonlyTools",
 ]);
 export interface LoadConfigOptions {

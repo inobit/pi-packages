@@ -147,11 +147,13 @@ describe("bash 决策（build 模式）", () => {
     expect(bashReq("build", "node build.js").action).toBe("allow");
   });
 
-  it("外部读取：read 白名单命中放行，unknown 弹窗 ask", () => {
+  it("外部读取：read 白名单命中放行，trusted /tmp 放行，其他 unknown 弹窗 ask", () => {
     expect(bashReq("build", "cat /outside/notes.txt").action).toBe("allow");
     expect(bashReq("build", "grep x /outside/data").action).toBe("allow");
-    expect(bashReq("build", "python3 /tmp/x.py").action).toBe("ask");
     expect(bashReq("build", "node /outside/server.js").action).toBe("ask");
+    // FR-9：trusted 外部路径（/tmp）非白名单命令读写放行
+    expect(bashReq("build", "python3 /tmp/x.py").action).toBe("allow");
+    expect(bashReq("build", "calc.sh /tmp/a > /tmp/b").action).toBe("allow");
   });
 
   it("reason 前缀标明来源（[bash]/[tool:）", () => {
@@ -334,5 +336,47 @@ describe("bash 决策（plan 模式，FR-8）", () => {
 
   it("fail-closed：命令替换在 plan 下 deny", () => {
     expect(bashReq("plan", "echo $(ls)").action).toBe("deny");
+  });
+});
+
+describe("trusted 路径赎免（FR-9）", () => {
+  it("plan：写 /tmp 临时文件放行，项目内/外部写仍 deny", () => {
+    expect(bashReq("plan", "echo 42 > /tmp/calc.txt").action).toBe("allow");
+    expect(bashReq("plan", "sort /tmp/a > /tmp/b").action).toBe("allow");
+    expect(bashReq("plan", "mv a /tmp/").action).toBe("allow");
+    expect(bashReq("plan", "echo x > ./note.txt").action).toBe("deny");
+    expect(bashReq("plan", "echo x > /outside/f").action).toBe("deny");
+  });
+
+  it("plan：未知命令读写 /tmp 放行（验证计算）", () => {
+    expect(bashReq("plan", "python /tmp/a.py > /tmp/out.txt").action).toBe("allow");
+    expect(bashReq("plan", "sed -n '1p' /tmp/data.csv").action).toBe("allow");
+  });
+
+  it("plan：trusted 内敏感文件名写仍 deny（/tmp/.env）", () => {
+    expect(bashReq("plan", "echo x > /tmp/.env").action).toBe("deny");
+    expect(bashReq("plan", "cat /tmp/normal.txt").action).toBe("allow");
+  });
+
+  it("build：/tmp 读写放行，非 trusted 外部写仍 ask", () => {
+    expect(bashReq("build", "echo 42 > /tmp/calc.txt").action).toBe("allow");
+    expect(bashReq("build", "calc.sh /tmp/a > /tmp/b").action).toBe("allow");
+    expect(bashReq("build", "echo x > /outside/foo").action).toBe("ask");
+  });
+
+  it("build：tool 外部路径在 /tmp 下放行", () => {
+    expect(toolReq("build", "write", { path: "/tmp/a.txt", content: "x" }).action).toBe("allow");
+    expect(toolReq("build", "my_tool", { path: "/tmp/a.txt" }).action).toBe("allow");
+    expect(toolReq("build", "my_tool", { path: "/outside/a.txt" }).action).toBe("ask");
+  });
+
+  it("config.trustedExternalPaths 可扩展（自定义前缀）", () => {
+    const custom = { ...cfg, trustedExternalPaths: ["/tmp", "/srv/cache"] };
+    expect(
+      decideBashRequest({ mode: "plan", config: custom, cwd: "/proj", command: "echo 1 > /srv/cache/x" }).action,
+    ).toBe("allow");
+    expect(
+      decideBashRequest({ mode: "plan", config: custom, cwd: "/proj", command: "echo 1 > /opt/x" }).action,
+    ).toBe("deny");
   });
 });

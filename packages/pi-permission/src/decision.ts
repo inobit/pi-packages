@@ -10,13 +10,13 @@ import {
   type BashSegment,
   type SegmentKind,
 } from "./bash.ts";
-import { expandHome, isSensitivePath, isSensitiveReadException, isWithinCwd, realpathOf } from "./path.ts";
+import { expandHome, isSensitivePath, isSensitiveReadException, isTrustedPath, isWithinCwd, realpathOf } from "./path.ts";
 
 export type DecisionAction = "allow" | "ask" | "deny";
 
 export interface Decision {
   action: DecisionAction;
-  /** 命中规则标识：FR-1 / FR-2 / FR-3 / FR-4 / FR-5 / FR-7 / FR-8 / default。 */
+  /** 命中规则标识：FR-1 / FR-2 / FR-3 / FR-4 / FR-5 / FR-7 / FR-8 / FR-9 / default。 */
   rule: string;
   /** 面向用户的说明（含 `[bash]` / `[tool:<name>]` 来源前缀，便于对照配置）。 */
   reason: string;
@@ -53,6 +53,11 @@ function displayCommand(command: string): string {
 
 /** ask 弹窗触发主体展示行：details 尾部统一加 `bash:<command>` / `tool:<tool_name>`，与 reason 前缀同源。 */
 const bashDetail = (command: string) => `bash: ${displayCommand(command)}`;
+
+/** trusted 外部路径前缀：配置项 ∪ 系统临时目录（os.tmpdir()），去重。 */
+function trustedPrefixes(cfg: PermissionConfig): string[] {
+  return [...new Set([...cfg.trustedExternalPaths, os.tmpdir()])];
+}
 
 /**
  * FR-1 敏感文件检查：任何模式、任何优先级之前评估，命中即 ask（D9：ask 非 deny）。
@@ -131,13 +136,18 @@ export function decideToolRequest(req: ToolDecisionRequest): Decision {
   if (paths.length === 0) {
     return { action: "allow", rule: "FR-5", reason: `${label} no external path, allowed` };
   }
-  // 3. cwd 外：read 白名单放行，否则 ask
+  // 3. cwd 外：trusted 赎免放行；read 白名单放行；否则 ask
   const external = paths.filter((p) => !isWithinCwd(p, cwd, home()));
   if (external.length > 0) {
     if (readTool) {
       return { action: "allow", rule: "FR-5", reason: `${label} read-only tool whitelist, external path allowed` };
     }
-    return { action: "ask", rule: "FR-3", reason: `${label} external path referenced by a non-whitelisted tool requires confirmation`, details: [...external, `tool:${toolName}`] };
+    // FR-9：外部路径全部落在 trusted 前缀（如 /tmp）→ 放行
+    const nonTrusted = external.filter((p) => !isTrustedPath(p, trustedPrefixes(config), cwd, home()));
+    if (nonTrusted.length === 0) {
+      return { action: "allow", rule: "FR-9", reason: `${label} trusted external path allowed` };
+    }
+    return { action: "ask", rule: "FR-3", reason: `${label} external path referenced by a non-whitelisted tool requires confirmation`, details: [...nonTrusted, `tool:${toolName}`] };
   }
   // 4. cwd 内放行
   return { action: "allow", rule: "FR-2", reason: `${label} inside project, allowed` };
@@ -210,24 +220,42 @@ export function decideBashRequest(req: BashDecisionRequest): Decision {
   const uncertainRelative = segmentCwds.includes(undefined);
 
   // 收集段信息（相对路径按各段有效 cwd 判定内外）
-  const allReadRefs: string[] = [];
-  const allWriteTargets: string[] = [];
+  // trusted 判定按段 cwd 解析（相对路径写 /tmp 也算 trusted）；cd 无法跟踪时相对路径保守视为非 trusted
+  const prefixes = trustedPrefixes(config);
   const externalRefs: string[] = [];
   const externalTargets: string[] = [];
+  const nonTrustedWriteTargets: string[] = []; // plan：所有写目标中不在 trusted 下
+  const sensitiveWriteTargets: string[] = []; // trusted 内但命中敏感文件的写（plan 下也：deny；如 /tmp/.env）
+  const nonTrustedExternalRefs: string[] = []; // 外部读中不在 trusted 下
+  const nonTrustedExternalTargets: string[] = []; // 外部写中不在 trusted 下
+  const isTrustedForSegment = (p: string, segCwd: string): boolean => {
+    if (uncertainRelative && !path.isAbsolute(p)) return false;
+    return isTrustedPath(p, prefixes, segCwd, home());
+  };
   for (let i = 0; i < parsed.segments.length; i++) {
     const seg = parsed.segments[i]!;
     const segCwd = segmentCwds[i] ?? cwd;
     const readRefs = collectReadRefs(seg);
     const writeTargets = collectWriteTargets(seg);
-    allReadRefs.push(...readRefs);
-    allWriteTargets.push(...writeTargets);
     for (const r of readRefs) {
       const external = uncertainRelative && !path.isAbsolute(r) ? true : !isWithinCwd(r, segCwd, home());
-      if (external) externalRefs.push(r);
+      if (external) {
+        externalRefs.push(r);
+        if (!isTrustedForSegment(r, segCwd)) nonTrustedExternalRefs.push(r);
+      }
     }
     for (const w of writeTargets) {
       const external = uncertainRelative && !path.isAbsolute(w) ? true : !isWithinCwd(w, segCwd, home());
-      if (external) externalTargets.push(w);
+      if (!isTrustedForSegment(w, segCwd)) {
+        nonTrustedWriteTargets.push(w);
+      } else if (isSensitivePath(w, config.sensitivePatterns, segCwd, home())) {
+        // trusted 内但命中敏感文件名/realpath（如 /tmp/.env）：plan 下写仍 deny，不弹 ask
+        sensitiveWriteTargets.push(w);
+      }
+      if (external) {
+        externalTargets.push(w);
+        if (!isTrustedForSegment(w, segCwd)) nonTrustedExternalTargets.push(w);
+      }
     }
   }
 
@@ -252,42 +280,52 @@ export function decideBashRequest(req: BashDecisionRequest): Decision {
   const dangerous = mostRestrictive === "dangerous";
 
   if (mode === "plan") {
-    // 1. 明确的写（重定向/写命令，等价 write/edit deny）+ 敏感操作 → deny
-    if (allWriteTargets.length > 0) {
-      return { action: "deny", rule: "FR-8", reason: `${label} plan mode forbids writes (redirect/write command)`, details: allWriteTargets };
-    }
+    // 1. 敏感操作（操作级、路径无关）→ deny
     if (dangerous) {
       return { action: "deny", rule: "FR-8", reason: `${label} plan mode forbids sensitive operations`, details: [command] };
     }
-    // 2. 敏感文件 ask（按段 cwd）
+    // 2. 非赎免的写 deny：写目标不在 trusted（如 /tmp）下 → deny
+    //    （含项目内写、~ 写、敏感文件写、外部非 /tmp 写，全部拒绝于此，不弹 ask）
+    if (nonTrustedWriteTargets.length > 0 || sensitiveWriteTargets.length > 0) {
+      return { action: "deny", rule: "FR-8", reason: `${label} plan mode forbids writes outside trusted temp paths`, details: [...nonTrustedWriteTargets, ...sensitiveWriteTargets] };
+    }
+    // 3. 敏感文件 ask（此时只剩读引用 + trusted 写目标；realpath 软链仍捕获）
     const sensitive = sensitiveBySegment();
     if (sensitive) return { ...sensitive, details: [...(sensitive.details ?? []), bashDetail(command)] };
-    // 3. read 白名单放行
+    // 4. trusted 外部赎免（FR-9）：存在外部引用且全部落在 trusted 前缀 → 放行（未知命令读写 /tmp 验证计算）
+    if (
+      (externalRefs.length > 0 || externalTargets.length > 0) &&
+      nonTrustedExternalRefs.length === 0 &&
+      nonTrustedExternalTargets.length === 0
+    ) {
+      return { action: "allow", rule: "FR-9", reason: `${label} plan mode trusted external path allowed`, details: [...externalRefs, ...externalTargets] };
+    }
+    // 5. read 白名单放行
     if (mostRestrictive === "read") {
       return { action: "allow", rule: "FR-8", reason: `${label} plan mode read-only command allowed` };
     }
-    // 4. 未知命令：strictPlanMode deny，否则 ask（FR-8.3，与未知工具语义统一）
+    // 6. 未知命令：strictPlanMode deny，否则 ask（FR-8.3，与未知工具语义统一）
     if (config.strictPlanMode) {
-      return { action: "deny", rule: "FR-8", reason: `${label} plan mode strict: non-read-only command denied`, details: [command] };
+      return { action: "deny", rule: "FR-8", reason: `${label} plan mode strict: non-read-only command denied`, details: [bashDetail(command)] };
     }
     return { action: "ask", rule: "FR-8", reason: `${label} plan mode non-read-only command requires confirmation`, details: [bashDetail(command)] };
   }
 
   // build 模式
-  // 1. 敏感操作 ask（项目内外同权）
+  // 1. 敏感操作 ask（项目内外同权，与路径无关）
   if (dangerous) {
     return { action: "ask", rule: "FR-4", reason: `${label} dangerous operation requires confirmation`, details: [bashDetail(command)] };
   }
-  // 2. 敏感文件 ask（按段 cwd）
+  // 2. 敏感文件 ask（按段 cwd；build 下写敏感文件也 ask，可确认后写）
   const sensitive = sensitiveBySegment();
   if (sensitive) return { ...sensitive, details: [...(sensitive.details ?? []), bashDetail(command)] };
-  // 3. cwd 内 → 默认放行
-  if (externalTargets.length === 0 && externalRefs.length === 0) {
+  // 3. cwd 内，或外部引用全部落在 trusted 前缀（如 /tmp）→ 默认放行
+  if (nonTrustedExternalRefs.length === 0 && nonTrustedExternalTargets.length === 0) {
     return { action: "allow", rule: "FR-5", reason: `${label} inside project, allowed` };
   }
-  // 4. cwd 外：写目标 → ask；read 白名单 → allow；other → ask
-  if (externalTargets.length > 0) {
-    return { action: "ask", rule: "FR-3", reason: `${label} writing outside project requires confirmation`, details: [...externalTargets, bashDetail(command)] };
+  // 4. cwd 外（非 trusted）：写目标 → ask；read 白名单 → allow；other → ask
+  if (nonTrustedExternalTargets.length > 0) {
+    return { action: "ask", rule: "FR-3", reason: `${label} writing outside project requires confirmation`, details: [...nonTrustedExternalTargets, bashDetail(command)] };
   }
   if (mostRestrictive === "read") {
     return { action: "allow", rule: "FR-5", reason: `${label} read-only command whitelist, external path allowed` };
@@ -297,6 +335,6 @@ export function decideBashRequest(req: BashDecisionRequest): Decision {
     action: "ask",
     rule: "FR-3",
     reason: `${label} external path referenced by a non-whitelisted command requires confirmation`,
-    details: [...externalRefs, bashDetail(command)],
+    details: [...nonTrustedExternalRefs, bashDetail(command)],
   };
 }

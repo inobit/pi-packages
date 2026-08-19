@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   isSensitivePath,
   isSensitiveReadException,
+  isTrustedPath,
   isWithinCwd,
   normalizePath,
   patternToRegExp,
@@ -111,5 +112,20 @@ describe("isWithinCwd", () => {
       return;
     }
     expect(isWithinCwd(link, dir, HOME)).toBe(false);
+  });
+});
+
+describe("isTrustedPath（FR-9）", () => {
+  it("前缀匹配：绝对/边界/相对按 cwd/非匹配", () => {
+    expect(isTrustedPath("/tmp/foo.txt", ["/tmp"], "/proj", HOME)).toBe(true);
+    expect(isTrustedPath("/tmp", ["/tmp"], "/proj", HOME)).toBe(true);
+    expect(isTrustedPath("/tmpxxx/a", ["/tmp"], "/proj", HOME)).toBe(false);
+    expect(isTrustedPath("/var/tmp/x", ["/tmp"], "/proj", HOME)).toBe(false);
+    expect(isTrustedPath("out.txt", ["/tmp"], "/tmp", HOME)).toBe(true); // cwd 在 /tmp 下的相对写
+    expect(isTrustedPath("out.txt", ["/tmp"], "/proj", HOME)).toBe(false);
+  });
+  it("自定义前缀", () => {
+    expect(isTrustedPath("/srv/cache/x", ["/tmp", "/srv/cache"], "/proj", HOME)).toBe(true);
+    expect(isTrustedPath("/opt/x", ["/tmp", "/srv/cache"], "/proj", HOME)).toBe(false);
   });
 });

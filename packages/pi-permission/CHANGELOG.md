@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.3] - 2026-08-19
+
+### 新增
+
+- trusted 外部路径赎免（FR-9）：新增配置项 `trustedExternalPaths`（默认 `["/tmp"]`，运行时并入 `os.tmpdir()`）；落在前缀下的外部读写直接放行（临时验证计算场景，普通用户不能删除整个 /tmp：sticky 1777），并入 ARRAY_FIELDS 走 default ∪ global ∪ project 并集。
+  - plan 模式：sensitive 操作 deny → 非赎免写 deny（含敏感文件名写，如 /tmp/.env / .env）→ 敏感文件读 ask → trusted 读写 allow（FR-9）→ read 白名单 → other ask/deny
+  - build 模式：sensitive ask → trusted 赎免（过滤后 externalRefs/externalTargets 为空则放行）→ 剩余外部写 ask → 剩余外部读 read 白名单/ask
+  - realpath 双形态 + 段 cwd 解析防软链逃逸；敏感/危险判定始终优先于 trusted 赎免
+
 ## [0.2.2] - 2026-08-19
 
 ### 新增
