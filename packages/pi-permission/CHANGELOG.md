@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.2] - 2026-08-19
+
+### 修复
+
+- 无副作用重定向不再误判为外部写入：`2>/dev/null`、`&>/dev/null`、`2>&1`、`>&2`、`> /dev/null` 及 `tee /dev/null` 等不再触发「writing outside project」确认（纯读命令 `ls ... 2>/dev/null` 曾错误弹窗并列出 `/dev/null`）
+- 位置参数/输入重定向的 `/dev/null` 不再视为外部读引用（`cat < /dev/null`、`tee /dev/null`）
+- 真实外部写入（如 `> /tmp/x`、`2>~/err.log`）仍按 FR-3 拦截，行为不变
+- 补充重定向豁免单元测试与 bash 决策集成回归用例（117 个用例全部通过）
+
 ## [0.1.1] - 2026-08-19
 
 ### 修复

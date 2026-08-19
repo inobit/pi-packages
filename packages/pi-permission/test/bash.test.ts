@@ -189,11 +189,45 @@ describe("collectReadRefs / collectWriteTargets", () => {
 
   it("echo 仅重定向目标为写（read 白名单命令通过重定向写文件）", () => {
     expect(collectWriteTargets(parseBashCommand("echo x > /tmp/foo").segments[0]!)).toEqual(["/tmp/foo"]);
-    expect(collectWriteTargets(parseBashCommand("echo hi > /tmp/out.txt 2>&1").segments[0]!)).toEqual([
-      "/tmp/out.txt",
-      "&1",
-    ]);
+    // 2>&1 是 fd 复制（非文件路径），不视为写目标
+    expect(collectWriteTargets(parseBashCommand("echo hi > /tmp/out.txt 2>&1").segments[0]!)).toEqual(["/tmp/out.txt"]);
     expect(collectReadRefs(parseBashCommand("echo x").segments[0]!)).toEqual([]);
+  });
+
+  it("无副作用重定向豁免：/dev/null 与 fd 复制不产生写目标", () => {
+    // 2>/dev/null 丢弃 stderr，不触发外部写确认（修复误判：ls ... 2>/dev/null 曾被弹窗）
+    expect(collectWriteTargets(parseBashCommand("ls ~/x 2>/dev/null").segments[0]!)).toEqual([]);
+    expect(collectWriteTargets(parseBashCommand("ls 2>>/dev/null").segments[0]!)).toEqual([]);
+    expect(collectWriteTargets(parseBashCommand("ls &>/dev/null").segments[0]!)).toEqual([]);
+    expect(collectWriteTargets(parseBashCommand("make &>>/dev/null").segments[0]!)).toEqual([]);
+    expect(collectWriteTargets(parseBashCommand("echo x 1>/dev/null").segments[0]!)).toEqual([]);
+    expect(collectWriteTargets(parseBashCommand("echo hi > /dev/null").segments[0]!)).toEqual([]);
+    expect(collectWriteTargets(parseBashCommand("make > /dev/null 2>&1").segments[0]!)).toEqual([]);
+    expect(collectWriteTargets(parseBashCommand("ls 2>&1").segments[0]!)).toEqual([]);
+    expect(collectWriteTargets(parseBashCommand("echo x >&2").segments[0]!)).toEqual([]);
+    expect(collectWriteTargets(parseBashCommand("ls < /dev/null 2>&1").segments[0]!)).toEqual([]);
+    // 引号包裹的 /dev/null 同样豁免
+    expect(collectWriteTargets(parseBashCommand('ls 2>"/dev/null"').segments[0]!)).toEqual([]);
+    // 嵌入式：grep 丢弃 stderr
+    expect(collectWriteTargets(parseBashCommand("grep foo file 2>/dev/null").segments[0]!)).toEqual([]);
+    // tee /dev/null 丢弃输出（WRITE_ALL_ARGS 位置参数豁免）
+    expect(collectWriteTargets(parseBashCommand("tee /dev/null").segments[0]!)).toEqual([]);
+    expect(collectWriteTargets(parseBashCommand("tee -a /dev/null").segments[0]!)).toEqual([]);
+    // 仍拦截真实写入：stderr 重定向到普通外部文件、显式重定向到普通文件、tee 到普通文件
+    expect(collectWriteTargets(parseBashCommand("ls 2>~/err.log").segments[0]!)).toEqual(["~/err.log"]);
+    expect(collectWriteTargets(parseBashCommand("echo x > /tmp/foo").segments[0]!)).toEqual(["/tmp/foo"]);
+    expect(collectWriteTargets(parseBashCommand("tee /tmp/out").segments[0]!)).toEqual(["/tmp/out"]);
+  });
+
+  it("输入重定向 < /dev/null 不视为外部读引用", () => {
+    expect(collectReadRefs(parseBashCommand("cat < /dev/null").segments[0]!)).toEqual([]);
+    expect(collectWriteTargets(parseBashCommand("cat < /dev/null").segments[0]!)).toEqual([]);
+  });
+
+  it("位置参数 /dev/null 不视为外部读引用（tee /dev/null）", () => {
+    expect(collectReadRefs(parseBashCommand("tee /dev/null").segments[0]!)).toEqual([]);
+    expect(collectWriteTargets(parseBashCommand("tee /dev/null").segments[0]!)).toEqual([]);
+    expect(collectReadRefs(parseBashCommand("cat /dev/null").segments[0]!)).toEqual([]);
   });
 
   it("内置写命令位置参数为写目标（mv 末位、mkdir 全部）", () => {

@@ -453,7 +453,8 @@ export function collectReadRefs(segment: BashSegment): string[] {
   const refs: string[] = [];
   for (const r of segment.redirects) {
     // 仅 `<` 输入重定向是读取；其余重定向是写入
-    if (r.op === "<") refs.push(r.target);
+    // `< /dev/null` 为惯用写法（丢弃 stdin），无副作用，不视为外部读引用
+    if (r.op === "<" && r.target !== "/dev/null") refs.push(r.target);
   }
   if (segment.program === "echo" || segment.program === "printf" || segment.program === "git") {
     return refs;
@@ -472,9 +473,19 @@ export function collectReadRefs(segment: BashSegment): string[] {
       skipFirst = false;
       continue;
     }
+    // 读取 /dev/null 无副作用（如 `tee /dev/null` 的写位置、`cat /dev/null`），豁免外部读判定
+    if (a === "/dev/null") continue;
     refs.push(a);
   }
   return refs;
+}
+
+/** 重定向目标是否为无副作用目标（不作为写入目标）：
+ * - `/dev/null`：空设备，写入无副作用（`> /dev/null`、`2>/dev/null` 均为惯用写法）
+ * - `&N`（如 `&1`、`&2`）：fd 复制（`2>&1`、`>&2`），非文件路径
+ */
+function isHarmlessRedirectTarget(target: string): boolean {
+  return target === "/dev/null" || target.startsWith("&");
 }
 
 /** 内置写命令（硬编码，不可配置）：位置参数视为写入目标，用于区分读写语义与外部写判定。 */
@@ -495,7 +506,8 @@ export function collectWriteTargets(segment: BashSegment): string[] {
   const targets: string[] = [];
   for (const r of segment.redirects) {
     // 输出重定向（> >> 2> &> 等）→ 写入目标；纯输入 < 除外
-    if (r.op !== "<") targets.push(r.target);
+    // `2>/dev/null` 等 fd 重定向到空设备/&N 不产生文件副作用，豁免
+    if (r.op !== "<" && !isHarmlessRedirectTarget(r.target)) targets.push(r.target);
   }
   if (WRITE_LAST_ARG.has(segment.program)) {
     const positionals = segment.args.filter((a) => !a.startsWith("-"));
@@ -512,6 +524,8 @@ export function collectWriteTargets(segment: BashSegment): string[] {
         skipFirst = false;
         continue;
       }
+      // /dev/null 无副作用（如 `tee /dev/null` 丢弃输出），豁免
+      if (a === "/dev/null") continue;
       targets.push(a);
     }
     return targets;

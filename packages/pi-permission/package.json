@@ -1,6 +1,6 @@
 {
   "name": "@inobit/pi-permission",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Lightweight permission enforcement extension for the Pi coding agent: sensitive-file guard, read/write-aware project boundary, dangerous-operation confirmation, and plan/build read-only mode.",
   "type": "module",
   "exports": {

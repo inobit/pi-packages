@@ -180,6 +180,21 @@ describe("bash 决策（build 模式）", () => {
     expect(bashReq("build", "echo x > ./out.txt").action).toBe("allow");
   });
 
+  it("无副作用重定向不触发外部写弹窗（回归：2>/dev/null 误判）", () => {
+    // 纯读命令丢弃 stderr → 外部路径不产生写目标，直接放行
+    expect(bashReq("build", "ls ~/.pi/agent 2>/dev/null").action).toBe("allow");
+    expect(bashReq("build", 'ls ~/.pi/agent 2>/dev/null; echo "---"; ls ~/.pi/agent/extensions 2>/dev/null').action).toBe("allow");
+    // read 白名单命令的外部读校验不受重定向豁免影响
+    expect(bashReq("build", "cat ~/notes.txt 2>/dev/null").action).toBe("allow");
+    // 构建类命令 stdout/stderr 全丢弃 → 放行
+    expect(bashReq("build", "make > /dev/null 2>&1").action).toBe("allow");
+    // tee /dev/null 丢弃输出 → 放行
+    expect(bashReq("build", "tee /dev/null < f").action).toBe("allow");
+    // 真实外部写仍拦截，豁免不生效
+    expect(bashReq("build", "make > /outside/build.log 2>&1").action).toBe("ask");
+    expect(bashReq("build", "echo x > /outside/foo 2>/dev/null").action).toBe("ask");
+  });
+
   it("软链指向 .env 的 cat 弹窗（验收 3）", () => {
     const dir = tmpdir();
     fs.writeFileSync(path.join(dir, ".env"), "KEY=1");
