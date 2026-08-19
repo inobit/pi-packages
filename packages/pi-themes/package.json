@@ -1,0 +1,41 @@
+{
+  "name": "@inobit/pi-themes",
+  "version": "0.1.0",
+  "description": "Curated themes for the Pi coding agent: Rosé Pine (dawn/main) and Tokyonight (day/night) — each pair ships a light & dark variant ready for automatic terminal-following switching.",
+  "type": "module",
+  "files": [
+    "themes",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-theme",
+    "pi-coding-agent",
+    "theme",
+    "rosepine",
+    "tokyonight"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inobit/pi-packages.git",
+    "directory": "packages/pi-themes"
+  },
+  "scripts": {
+    "pack:check": "pnpm pack --pack-destination /tmp"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "themes": [
+      "./themes"
+    ]
+  }
+}
