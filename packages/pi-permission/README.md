@@ -12,6 +12,7 @@
 - 零第三方依赖（除 pi 核心包），纯本地确定性决策，fail-closed 绝不静默放行
 - 只读/写精确区分到路径粒度，符号链接/相对路径不可绕过，cd 后相对路径正确判定
 - 敏感文件规则跨所有工具 + bash 统一生效
+- trusted 临时目录（`/tmp`）豁免：plan/build 下 /tmp 内读写直接放行（计划中用临时文件验证计算友好），危险/敏感判定不受影响
 - 高频必需操作（`cat`/`grep`/`ls`/`git status`/`sleep` 等）零打扰
 
 ## 安装
@@ -34,9 +35,9 @@ pi install npm:@inobit/pi-permission
 
 ## 判定优先级（从高到低）
 
-**plan 模式**（不分 cwd 内外）：明确的写（write/edit、bash 重定向/写命令）→ deny；敏感操作 → deny；敏感文件 → ask；read 白名单 → allow；其他 → ask（`strictPlanMode` 时 deny）
+**plan 模式**（不分 cwd 内外）：敏感操作 → deny；非豁免的写（写目标不在 trusted 下，含敏感文件写）→ deny；敏感文件 → ask；trusted 路径（如 `/tmp`）读写 → allow；read 白名单 → allow；其他 → ask（`strictPlanMode` 时 deny）
 
-**build 模式**：敏感操作 ask → 敏感文件 ask →（cwd 内 allow；cwd 外 read 白名单 allow → 其他 ask）
+**build 模式**：敏感操作 ask → 敏感文件 ask →（cwd 内或全部外部引用落在 trusted 下 → allow；cwd 外 read 白名单 allow → 其他 ask）
 
 ## 配置
 
@@ -54,6 +55,7 @@ pi install npm:@inobit/pi-permission
 | `envExampleReadAllowed` | `.env.example` 读取免弹窗 | `true` |
 | `readonlyBashCommands` | bash read 白名单 | 高频只读命令（cat/grep/ls/...，约 70 项） |
 | `dangerousBashCommands` | 敏感操作统一清单（`sudo` 或 `git commit`） | git 写子命令 + 危险 shell |
+| `trustedExternalPaths` | trusted 外部路径前缀：前缀下读写直接放行（如 `/tmp` 临时文件；运行时并入系统临时目录 `os.tmpdir()`） | `["/tmp"]` |
 | `readonlyTools` | 工具 read 白名单（各层并集） | `read grep find ls` |
 | `strictPlanMode` | plan 下非白名单由 ask 收紧为 deny | `false` |
 | `toggleModeShortcut` | plan/build 切换快捷键（空字符串禁用） | `alt+p` |
@@ -65,6 +67,10 @@ pi install npm:@inobit/pi-permission
 > `curl/wget | sh/bash`、`bash -c`/`eval`/`sudo`/`xargs`/`find -exec` 恒为敏感操作；
 > 重定向 `>`/`>>` 写目标固定检测；不在 `dangerousBashCommands` 的 git 子命令自动视为只读。
 > 弹窗 reason 带 `[bash]` / `[tool:<name>]` 来源前缀并附配置建议。
+>
+> **trusted 豁免边界**：只放行"目录边界"，永远排在危险/敏感判定之后——即使位于 trusted 目录内，
+> 命中敏感文件名的写入（如 `/tmp/.env`、cwd 恰在 `/tmp` 下写 `.env`）plan 下仍 deny、build 下仍 ask；
+> 危险命令（`sudo rm -rf /tmp` 等）与路径无关，始终先于 trusted 拦截；realpath 双形态防软链逃逸。
 
 ## /readonly-tools 交互
 
