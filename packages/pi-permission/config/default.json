@@ -6,5 +6,6 @@
   "readonlyTools": ["read", "grep", "find", "ls"],
   "strictPlanMode": false,
   "reviewLog": true,
+  "debugLog": false,
   "logDir": "logs"
 }

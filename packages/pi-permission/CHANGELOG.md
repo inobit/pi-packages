@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1] - 2026-08-19
+
+### 修复
+
+- 审查日志不再写入项目目录，改到全局扩展目录 `~/.pi/agent/extensions/pi-permission/logs/<project>/`，按项目分目录隔离
+- 对齐 pi 生态日志实践：debug/review 双流分离、字段宽度上限、大小轮转、`extension`/`stream`/`sessionId` 上下文
+- 新增 `debugLog` 配置（默认关），审查日志开关仍为 `reviewLog`
+
 ## [0.1.0] - 2026-08-18
 
 ### 新增

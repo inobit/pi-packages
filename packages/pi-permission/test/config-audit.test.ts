@@ -83,22 +83,69 @@ describe("config 加载与合并", () => {
 });
 
 describe("audit 审查日志（FR-6）", () => {
-  it("日志写入 logs/ 且权限 0600", () => {
+  it("review 日志写入 base/logs/<project>/ 且权限 0600，含上下文", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-audit-"));
-    const auditor = createAuditor(dir, "logs", true);
-    auditor.log({ mode: "build", toolName: "bash", rule: "FR-4", action: "ask", reason: "危险操作" });
-    const logDir = path.join(dir, "logs");
-    const file = path.join(logDir, "pi-permission.log");
+    const auditor = createAuditor({ base: dir, logDir: "logs", project: "/proj/myapp", reviewEnabled: true, debugEnabled: false });
+    auditor.review({ mode: "build", toolName: "bash", rule: "FR-4", action: "ask", reason: "危险操作", sessionId: "sess-1" });
+    const file = path.join(dir, "logs", "myapp", "pi-permission-review.jsonl");
     expect(fs.existsSync(file)).toBe(true);
     expect(fs.statSync(file).mode & 0o777).toBe(0o600);
     const line = JSON.parse(fs.readFileSync(file, "utf8").trim());
     expect(line.rule).toBe("FR-4");
+    expect(line.project).toBe("/proj/myapp");
+    expect(line.sessionId).toBe("sess-1");
+    expect(line.stream).toBe("review");
+    expect(line.extension).toBe("pi-permission");
+  });
+
+  it("不同项目写入不同目录（隔离）", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-audit-"));
+    const a = createAuditor({ base: dir, logDir: "logs", project: "/p/alpha", reviewEnabled: true, debugEnabled: false });
+    const b = createAuditor({ base: dir, logDir: "logs", project: "/p/beta", reviewEnabled: true, debugEnabled: false });
+    a.review({ mode: "build", toolName: "bash", rule: "FR-1", action: "ask", reason: "x" });
+    b.review({ mode: "build", toolName: "bash", rule: "FR-4", action: "deny", reason: "y" });
+    expect(fs.existsSync(path.join(dir, "logs", "alpha", "pi-permission-review.jsonl"))).toBe(true);
+    expect(fs.existsSync(path.join(dir, "logs", "beta", "pi-permission-review.jsonl"))).toBe(true);
+  });
+
+  it("debug 流独立文件且默认受 debugEnabled 控制", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-audit-"));
+    const on = createAuditor({ base: dir, logDir: "logs", project: "app", reviewEnabled: false, debugEnabled: true });
+    const off = createAuditor({ base: dir, logDir: "logs", project: "off", reviewEnabled: false, debugEnabled: false });
+    on.debug("decision", { tool: "bash", action: "ask" });
+    off.debug("decision", { tool: "bash" });
+    expect(fs.existsSync(path.join(dir, "logs", "app", "pi-permission-debug.jsonl"))).toBe(true);
+    expect(fs.existsSync(path.join(dir, "logs", "off", "pi-permission-debug.jsonl"))).toBe(false);
+  });
+
+  it("超过阈值时轮转归档", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-audit-"));
+    const auditor = createAuditor({
+      base: dir, logDir: "logs", project: "app", reviewEnabled: true, debugEnabled: false,
+      maxBytes: 200, maxBackups: 2,
+    });
+    for (let i = 0; i < 60; i++) {
+      auditor.review({ mode: "build", toolName: "bash", rule: "FR-4", action: "ask", reason: "pad-".repeat(20) });
+    }
+    const file = path.join(dir, "logs", "app", "pi-permission-review.jsonl");
+    expect(fs.existsSync(file)).toBe(true);
+    expect(fs.existsSync(`${file}.1`)).toBe(true);
+  });
+
+  it("字段宽度上限（review 防膨胀）", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-audit-"));
+    const auditor = createAuditor({
+      base: dir, logDir: "logs", project: "app", reviewEnabled: true, debugEnabled: false, maxFieldWidth: 50,
+    });
+    auditor.review({ mode: "build", toolName: "bash", rule: "FR-1", action: "ask", reason: "x".repeat(200) });
+    const line = JSON.parse(fs.readFileSync(path.join(dir, "logs", "app", "pi-permission-review.jsonl"), "utf8").trim());
+    expect((line.reason as string).length).toBeLessThan(100);
   });
 
   it("禁用时不写日志", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-audit-"));
-    const auditor = createAuditor(dir, "logs", false);
-    auditor.log({ mode: "build", toolName: "bash", rule: "FR-4", action: "ask", reason: "x" });
+    const auditor = createAuditor({ base: dir, logDir: "logs", project: "app", reviewEnabled: false, debugEnabled: false });
+    auditor.review({ mode: "build", toolName: "bash", rule: "FR-4", action: "ask", reason: "x" });
     expect(fs.existsSync(path.join(dir, "logs"))).toBe(false);
   });
 

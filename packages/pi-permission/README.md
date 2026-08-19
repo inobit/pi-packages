@@ -55,7 +55,9 @@ pi install npm:@inobit/pi-permission
 | `dangerousBashCommands` | 敏感操作统一清单（`sudo` 或 `git commit`） | git 写子命令 + 危险 shell |
 | `readonlyTools` | 工具 read 白名单（各层并集） | `read grep find ls` |
 | `strictPlanMode` | plan 下非白名单由 ask 收紧为 deny | `false` |
-| `reviewLog` / `logDir` | 审查日志开关 / 目录（0600） | `true` / `logs` |
+| `reviewLog` | 审查日志开关（FR-6） | `true` |
+| `debugLog` | 调试日志开关（与审查日志分离，详细事件） | `false` |
+| `logDir` | 日志目录（相对全局扩展目录 `~/.pi/agent/extensions/pi-permission`，0600） | `logs` |
 
 > 固定规则（不可配置）：内置写工具 `write`/`edit`、`rm -r/-f`、`chmod -R`、`chown -R`、
 > `curl/wget | sh/bash`、`bash -c`/`eval`/`sudo`/`xargs`/`find -exec` 恒为敏感操作；

@@ -52,7 +52,7 @@ build：敏感操作 ask → 敏感文件 ask →（cwd 内 allow | cwd 外 read
 | `mode.ts` | plan/build 内存状态、命令、状态栏、系统提示注入 |
 | `tools.ts` | `/readonly-tools`：空格多选 readonly tools，session（内置+全局锁定）/ global（仅内置锁定） |
 | `ui.ts` | y/s/n 选择弹窗、无 UI 降级拒绝 |
-| `audit.ts` | JSONL 审查日志 + 敏感键脱敏 |
+| `audit.ts` | 双流 JSONL 日志（review 审查 / debug 调试，参考 pi 生态实践）：脱敏 + 字段宽度上限 + 按项目分目录 + 大小轮转；写入全局扩展目录 `~/.pi/agent/extensions/pi-permission/logs/<project>/`，不污染项目 |
 
 ## 集成
 

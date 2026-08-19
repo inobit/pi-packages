@@ -51,7 +51,6 @@ function approvalDetail(decision: Decision): string | undefined {
 
 export default function (pi: ExtensionAPI) {
   const configCache = new Map<string, PermissionConfig>();
-  const auditorCache = new Map<string, Auditor>();
   const modeStore = new ModeStore();
   const confirmer: Confirmer = createConfirmer();
   // 会话级批准集合：`<sessionKey>:<approvalKey>`（FR-3/FR-8.3/NFR-5 的 s 语义）
@@ -82,10 +81,19 @@ export default function (pi: ExtensionAPI) {
     configCache.delete(`${cwd}:${trusted}`);
   };
 
+  const auditorCache = new Map<string, Auditor>();
   const getAuditor = (cwd: string, cfg: PermissionConfig): Auditor => {
+    // 审查日志写入全局扩展目录（与全局配置同位置），按项目分目录隔离，不污染工作区
+    const base = path.join(os.homedir(), ".pi", "agent", "extensions", "pi-permission");
     let auditor = auditorCache.get(cwd);
     if (!auditor) {
-      auditor = createAuditor(cwd, cfg.logDir, cfg.reviewLog);
+      auditor = createAuditor({
+        base,
+        logDir: cfg.logDir,
+        project: cwd,
+        reviewEnabled: cfg.reviewLog,
+        debugEnabled: cfg.debugLog,
+      });
       auditorCache.set(cwd, auditor);
     }
     return auditor;
@@ -153,7 +161,7 @@ export default function (pi: ExtensionAPI) {
       });
 
       if (decision.action === "deny") {
-        auditor.log({ mode, toolName, rule: decision.rule, action: "deny", reason: decision.reason, details: decision.details });
+        auditor.review({ mode, toolName, rule: decision.rule, action: "deny", reason: decision.reason, details: decision.details, sessionId: key });
         if (ctx.hasUI) ctx.ui.notify(`[pi-permission] denied: ${decision.reason}`, "warning");
         return denyFeedback("was");
       }
@@ -169,10 +177,10 @@ export default function (pi: ExtensionAPI) {
       });
       if (choice === "yes" || choice === "session") {
         if (choice === "session") sessionApprovals.add(`${key}:${approveKey}`);
-        auditor.log({ mode, toolName, rule: decision.rule, action: "allow-after-ask", reason: decision.reason, details: decision.details });
+        auditor.review({ mode, toolName, rule: decision.rule, action: "allow-after-ask", reason: decision.reason, details: decision.details, sessionId: key });
         return undefined;
       }
-      auditor.log({ mode, toolName, rule: decision.rule, action: "deny", reason: decision.reason, details: decision.details });
+      auditor.review({ mode, toolName, rule: decision.rule, action: "deny", reason: decision.reason, details: decision.details, sessionId: key });
       return denyFeedback("by user");
     } catch {
       // FR-7：插件自身异常不拦截，降级为放行

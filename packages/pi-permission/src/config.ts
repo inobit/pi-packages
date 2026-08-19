@@ -23,7 +23,9 @@ export interface PermissionConfig {
   strictPlanMode: boolean;
   /** 是否记录审查日志（FR-6 / D4）。 */
   reviewLog: boolean;
-  /** 审查日志目录，相对 cwd。 */
+  /** 是否记录调试日志（详细事件，默认关；与审查日志分离，参考 pi 生态双流实践）。 */
+  debugLog: boolean;
+  /** 审查日志目录，相对全局扩展目录 `~/.pi/agent/extensions/pi-permission`（不写入项目目录）。 */
   logDir: string;
 }
 
@@ -85,6 +87,7 @@ export const DEFAULT_CONFIG: PermissionConfig = {
   readonlyTools: [...BUILTIN_READONLY_TOOLS],
   strictPlanMode: false,
   reviewLog: true,
+  debugLog: false,
   logDir: "logs",
 };
 
@@ -98,7 +101,6 @@ const ARRAY_FIELDS = new Set<keyof PermissionConfig>([
   "dangerousBashCommands",
   "readonlyTools",
 ]);
-
 export interface LoadConfigOptions {
   /** 全局配置路径，默认 `~/.pi/agent/extensions/pi-permission/config.json`。 */
   globalPath?: string;
