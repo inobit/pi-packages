@@ -7,6 +7,11 @@ import type { WorkMode } from "./decision.ts";
 export const PLAN_SYSTEM_PROMPT =
   "You are in PLAN (read-only) mode. Do not modify files or run any command that changes state; only read, search, and plan.";
 
+/** build 模式切换公告（FR-8.4b）：从 plan 切到 build 后的首个 turn 注入一次，
+ * 显式撤销 plan 只读约束；权限拦截是另一层行为，模型用到时自然被拦，无需预告。 */
+export const BUILD_SWITCH_NOTICE =
+  "Plan mode is now disabled. Full tool access is restored; you may modify files and run state-changing commands.";
+
 /** pi 全局主题实例键（与 pi 内部 getMarkdownTheme 同机制）。 */
 const THEME_KEY = Symbol.for("@earendil-works/pi-coding-agent:theme");
 

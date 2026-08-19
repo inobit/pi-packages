@@ -4,8 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { loadConfig, type PermissionConfig } from "./config.ts";
-import { decideBashRequest, decideToolRequest, type Decision } from "./decision.ts";
-import { ModeStore, PLAN_SYSTEM_PROMPT, registerModeCommands, sessionKey, statusText } from "./mode.ts";
+import { decideBashRequest, decideToolRequest, type Decision, type WorkMode } from "./decision.ts";
+import { BUILD_SWITCH_NOTICE, ModeStore, PLAN_SYSTEM_PROMPT, registerModeCommands, sessionKey, statusText } from "./mode.ts";
 import { registerToolsCommand } from "./tools.ts";
 import { createConfirmer, type Confirmer } from "./ui.ts";
 import { createAuditor, type Auditor } from "./audit.ts";
@@ -52,6 +52,8 @@ function approvalDetail(decision: Decision): string | undefined {
 export default function (pi: ExtensionAPI) {
   const configCache = new Map<string, PermissionConfig>();
   const modeStore = new ModeStore();
+  // 上次 agent_start 时的模式（FR-8.4b）：plan→build 切换后首个 turn 注入一次 build 公告，常态 build 零注入
+  const lastAgentStartMode = new Map<string, WorkMode>();
   const confirmer: Confirmer = createConfirmer();
   // 会话级批准集合：`<sessionKey>:<approvalKey>`（FR-3/FR-8.3/NFR-5 的 s 语义）
   const sessionApprovals = new Set<string>();
@@ -194,8 +196,15 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", (event, ctx) => {
     try {
       const key = sessionKey(ctx);
-      if (modeStore.getMode(key) === "plan") {
+      const mode = modeStore.getMode(key);
+      const prev = lastAgentStartMode.get(key) ?? "build";
+      lastAgentStartMode.set(key, mode);
+      if (mode === "plan") {
         return { systemPrompt: `${event.systemPrompt}\n\n${PLAN_SYSTEM_PROMPT}` };
+      }
+      // 刚切回 build：显式撤销只读约束（一次），避免模型延续 plan 行为；build 常态不注入
+      if (prev === "plan") {
+        return { systemPrompt: `${event.systemPrompt}\n\n${BUILD_SWITCH_NOTICE}` };
       }
       return undefined;
     } catch {

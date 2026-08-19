@@ -175,6 +175,32 @@ describe("index.ts 工厂装配", () => {
     expect(result).toMatchObject({ systemPrompt: expect.stringContaining("PLAN (read-only)") });
   });
 
+  it("plan→build 切换后首个 turn 注入 build 公告，随后 build 常态不注入", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-factory-"));
+    const pi = makePi(dir);
+    factory(pi as never);
+    const ctx = makeCtx(dir);
+    const event = { type: "before_agent_start", prompt: "hi", systemPrompt: "BASE", systemPromptOptions: {} };
+
+    // 从未 plan：build 常态首个 turn 不注入
+    expect(await pi.emit("before_agent_start", event, ctx)).toBeUndefined();
+
+    // 进入 plan：注入只读提示
+    await pi.commands.get("plan")!.handler("", ctx as never);
+    const planTurn = await pi.emit("before_agent_start", event, ctx);
+    expect(planTurn).toMatchObject({ systemPrompt: expect.stringContaining("PLAN (read-only)") });
+
+    // 切回 build：首个 turn 注入 build 公告（显式撤销只读约束）
+    await pi.commands.get("build")!.handler("", ctx as never);
+    const firstBuild = await pi.emit("before_agent_start", event, ctx);
+    expect(firstBuild).toMatchObject({
+      systemPrompt: expect.stringContaining("Plan mode is now disabled. Full tool access is restored"),
+    });
+
+    // build 常态：再次 turn 不注入（单次公告，无累积）
+    expect(await pi.emit("before_agent_start", event, ctx)).toBeUndefined();
+  });
+
   it("isToolCallEventType 类型收窄可用", () => {
     const event = { type: "tool_call", toolCallId: "3", toolName: "bash", input: { command: "ls" } };
     expect(isToolCallEventType("bash", event as never)).toBe(true);

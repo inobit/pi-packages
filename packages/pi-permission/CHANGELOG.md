@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.2] - 2026-08-19
+
+### 新增
+
+- plan→build 切换后模型感知修复：`before_agent_start` 记录上次 agent 启动时的模式，从 plan 切到 build 后的首个 turn 注入一次 build 公告（`Plan mode is now disabled. Full tool access is restored; you may modify files and run state-changing commands.`），显式撤销 plan 只读约束，避免模型延续只读行为；build 常态零注入、无上下文累积（参考 @narumiruna/pi-plan-mode 的 handoff 通知模式）
+
 ## [0.2.1] - 2026-08-19
 
 ### 修复
