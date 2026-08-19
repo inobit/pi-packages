@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1] - 2026-08-19
+
+### 修复
+
+- 修正 FR-3/FR-5 外部路径提示文案歧义：原「not in read whitelist」易被误解为存在路径白名单（实际只有命令/工具级白名单）；改为「\`external path referenced by a non-whitelisted command/tool\`」，FR-5 明确为「\`read-only command/tool whitelist, external path allowed\`」
+- ask 弹窗统一带触发主体展示行：bash 层所有 ask（FR-1 敏感文件 / FR-3 外部读写 / FR-4 危险 / FR-7 fail-closed / FR-8.3 plan 未知）details 尾部追加 \`bash:<command>\` 行，tool 层所有 ask 追加 \`tool:<tool_name>\` 行（空白归一化单行 + 120 字符截断，替换原 \`command: …\` 格式）；路径类详情保持首位，`s` 会话批准仍按路径记忆的粒度
+
 ## [0.2.0] - 2026-08-19
 
 ### 新增

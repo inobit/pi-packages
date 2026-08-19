@@ -42,6 +42,18 @@ export interface BashDecisionRequest {
 
 const home = () => os.homedir();
 
+/** 弹窗展示用命令：空白归一化单行 + 长度截断。
+ * FR-3 场景已排除外部写目标（externalTargets>0 先走 write ask），截断丢失的只是命令尾部路径，路径已单独列为 detail，安全。 */
+const COMMAND_DISPLAY_MAX = 120;
+function displayCommand(command: string): string {
+  const flat = command.replace(/\s+/g, " ").trim();
+  if (flat.length <= COMMAND_DISPLAY_MAX) return flat;
+  return `${flat.slice(0, COMMAND_DISPLAY_MAX)}…`;
+}
+
+/** ask 弹窗触发主体展示行：details 尾部统一加 `bash:<command>` / `tool:<tool_name>`，与 reason 前缀同源。 */
+const bashDetail = (command: string) => `bash: ${displayCommand(command)}`;
+
 /**
  * FR-1 敏感文件检查：任何模式、任何优先级之前评估，命中即 ask（D9：ask 非 deny）。
  * `readRefs` 中命中的 `.env.example` 读取豁免（FR-1 例外）。
@@ -99,7 +111,7 @@ export function decideToolRequest(req: ToolDecisionRequest): Decision {
     }
     // 2. 敏感文件 ask
     const sensitive = sensitiveDecision(paths, cwd, config, readTool ? paths : [], label);
-    if (sensitive) return sensitive;
+    if (sensitive) return { ...sensitive, details: [...(sensitive.details ?? []), `tool:${toolName}`] };
     // 3. read 白名单放行
     if (readTool) {
       return { action: "allow", rule: "FR-8", reason: `${label} plan mode read-only tool allowed` };
@@ -108,13 +120,13 @@ export function decideToolRequest(req: ToolDecisionRequest): Decision {
     if (config.strictPlanMode) {
       return { action: "deny", rule: "FR-8", reason: `${label} plan mode strict: unknown tool denied`, details: [toolName] };
     }
-    return { action: "ask", rule: "FR-8", reason: `${label} plan mode unknown tool requires confirmation`, details: [toolName] };
+    return { action: "ask", rule: "FR-8", reason: `${label} plan mode unknown tool requires confirmation`, details: [`tool:${toolName}`] };
   }
 
   // build 模式
   // 1. 敏感文件 ask（工具层无敏感操作概念，最前）
   const sensitive = sensitiveDecision(paths, cwd, config, readTool ? paths : [], label);
-  if (sensitive) return sensitive;
+  if (sensitive) return { ...sensitive, details: [...(sensitive.details ?? []), `tool:${toolName}`] };
   // 2. 无路径信息（MCP 等未知工具）→ 视为 cwd 内，放行
   if (paths.length === 0) {
     return { action: "allow", rule: "FR-5", reason: `${label} no external path, allowed` };
@@ -123,18 +135,24 @@ export function decideToolRequest(req: ToolDecisionRequest): Decision {
   const external = paths.filter((p) => !isWithinCwd(p, cwd, home()));
   if (external.length > 0) {
     if (readTool) {
-      return { action: "allow", rule: "FR-5", reason: `${label} read whitelist, external path allowed` };
+      return { action: "allow", rule: "FR-5", reason: `${label} read-only tool whitelist, external path allowed` };
     }
-    return { action: "ask", rule: "FR-3", reason: `${label} external path not in read whitelist, requires confirmation`, details: external };
+    return { action: "ask", rule: "FR-3", reason: `${label} external path referenced by a non-whitelisted tool requires confirmation`, details: [...external, `tool:${toolName}`] };
   }
   // 4. cwd 内放行
   return { action: "allow", rule: "FR-2", reason: `${label} inside project, allowed` };
 }
 
-function failClosed(mode: WorkMode, label: string, reason: string): Decision {
+function failClosed(mode: WorkMode, label: string, reason: string, command?: string): Decision {
   return mode === "plan"
     ? { action: "deny", rule: "FR-7", reason: `${label} plan mode ${reason} (fail-closed)` }
-    : { action: "ask", rule: "FR-7", reason: `${label} ${reason} (fail-closed)` };
+    : {
+        action: "ask",
+        rule: "FR-7",
+        reason: `${label} ${reason} (fail-closed)`,
+        // ask 必须带触发命令，否则弹窗无上下文，用户无法定位问题
+        details: command === undefined ? undefined : [bashDetail(command)],
+      };
 }
 
 const MOST_RESTRICTIVE: Record<SegmentKind, number> = { dangerous: 2, unknown: 1, read: 0 };
@@ -174,9 +192,9 @@ export function decideBashRequest(req: BashDecisionRequest): Decision {
   const parsed = parseBashCommand(command);
 
   // FR-7 fail-closed：语法无法解析 / 含复杂语法 → build=ask、plan=deny
-  if (parsed.parseError) return failClosed(mode, label, "unparseable command syntax");
+  if (parsed.parseError) return failClosed(mode, label, "unparseable command syntax", command);
   if (parsed.hasCommandSubstitution || parsed.hasProcessSubstitution || parsed.hasSubshell) {
-    return failClosed(mode, label, "command substitution / subshell / complex syntax");
+    return failClosed(mode, label, "command substitution / subshell / complex syntax", command);
   }
 
   if (parsed.segments.length === 0) {
@@ -184,7 +202,7 @@ export function decideBashRequest(req: BashDecisionRequest): Decision {
   }
 
   // 管道到 shell（curl | sh）fail-closed
-  if (hasPipeToShell(parsed.segments)) return failClosed(mode, label, "curl/wget piped to shell detected");
+  if (hasPipeToShell(parsed.segments)) return failClosed(mode, label, "curl/wget piped to shell detected", command);
 
   // 跟踪 cd：每段的有效工作目录（cd 后相对路径按新目录解析，防 cd 到外部绕过）
   // cd 无法解析（如 `cd -`）时置 undefined，后续相对路径引用保守按外部处理
@@ -243,7 +261,7 @@ export function decideBashRequest(req: BashDecisionRequest): Decision {
     }
     // 2. 敏感文件 ask（按段 cwd）
     const sensitive = sensitiveBySegment();
-    if (sensitive) return sensitive;
+    if (sensitive) return { ...sensitive, details: [...(sensitive.details ?? []), bashDetail(command)] };
     // 3. read 白名单放行
     if (mostRestrictive === "read") {
       return { action: "allow", rule: "FR-8", reason: `${label} plan mode read-only command allowed` };
@@ -252,27 +270,33 @@ export function decideBashRequest(req: BashDecisionRequest): Decision {
     if (config.strictPlanMode) {
       return { action: "deny", rule: "FR-8", reason: `${label} plan mode strict: non-read-only command denied`, details: [command] };
     }
-    return { action: "ask", rule: "FR-8", reason: `${label} plan mode non-read-only command requires confirmation`, details: [command] };
+    return { action: "ask", rule: "FR-8", reason: `${label} plan mode non-read-only command requires confirmation`, details: [bashDetail(command)] };
   }
 
   // build 模式
   // 1. 敏感操作 ask（项目内外同权）
   if (dangerous) {
-    return { action: "ask", rule: "FR-4", reason: `${label} dangerous operation requires confirmation`, details: [command] };
+    return { action: "ask", rule: "FR-4", reason: `${label} dangerous operation requires confirmation`, details: [bashDetail(command)] };
   }
   // 2. 敏感文件 ask（按段 cwd）
   const sensitive = sensitiveBySegment();
-  if (sensitive) return sensitive;
+  if (sensitive) return { ...sensitive, details: [...(sensitive.details ?? []), bashDetail(command)] };
   // 3. cwd 内 → 默认放行
   if (externalTargets.length === 0 && externalRefs.length === 0) {
     return { action: "allow", rule: "FR-5", reason: `${label} inside project, allowed` };
   }
   // 4. cwd 外：写目标 → ask；read 白名单 → allow；other → ask
   if (externalTargets.length > 0) {
-    return { action: "ask", rule: "FR-3", reason: `${label} writing outside project requires confirmation`, details: externalTargets };
+    return { action: "ask", rule: "FR-3", reason: `${label} writing outside project requires confirmation`, details: [...externalTargets, bashDetail(command)] };
   }
   if (mostRestrictive === "read") {
-    return { action: "allow", rule: "FR-5", reason: `${label} read whitelist, external path allowed` };
+    return { action: "allow", rule: "FR-5", reason: `${label} read-only command whitelist, external path allowed` };
   }
-  return { action: "ask", rule: "FR-3", reason: `${label} external path not in read whitelist, requires confirmation`, details: externalRefs };
+  // 外部路径 ask：details 首位仍是路径（approvalKey 按路径记忆，保 s 会话批准粒度），尾部追加命令展示行
+  return {
+    action: "ask",
+    rule: "FR-3",
+    reason: `${label} external path referenced by a non-whitelisted command requires confirmation`,
+    details: [...externalRefs, bashDetail(command)],
+  };
 }

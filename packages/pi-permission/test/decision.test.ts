@@ -159,6 +159,64 @@ describe("bash 决策（build 模式）", () => {
     expect(toolReq("build", "write", { path: "/outside/a.txt", content: "x" }).reason).toMatch(/^\[tool:write\]/);
   });
 
+  it("FR-3 外部路径 ask：details 首位路径保批准粒度，尾部 bash:<command> 展示行", () => {
+    const d = bashReq("build", "sed -n '395,515p' /outside/notes.txt");
+    expect(d.action).toBe("ask");
+    expect(d.rule).toBe("FR-3");
+    expect(d.reason).toBe("[bash] external path referenced by a non-whitelisted command requires confirmation");
+    expect(d.details?.[0]).toBe("/outside/notes.txt");
+    expect(d.details?.[1]).toBe("bash: sed -n '395,515p' /outside/notes.txt");
+  });
+
+  it("bash 展示行：换行归一化 + 超长截断（路径仍首位）", () => {
+    const long = Array.from({ length: 40 }, (_, i) => `arg${i}`).join(" ");
+    const d = bashReq("build", `sed 's/x/y/' /outside/notes.txt ${long}`);
+    expect(d.action).toBe("ask");
+    expect(d.details?.[0]).toBe("/outside/notes.txt");
+    expect(d.details?.[d.details!.length - 1]).toContain("bash: sed 's/x/y/' /outside/notes.txt arg0");
+    expect(d.details?.at(-1)).toMatch(/…$/);
+  });
+
+  it("所有 bash ask 均带 bash:<command> 触发主体行", () => {
+    // FR-4 危险
+    expect(bashReq("build", "sudo ls").details?.at(-1)).toBe("bash: sudo ls");
+    // FR-7 fail-closed（命令替换 → build ask）
+    expect(bashReq("build", "echo $(ls)").details?.at(-1)).toBe("bash: echo $(ls)");
+    // FR-8.3 plan 未知命令
+    expect(bashReq("plan", "curl https://x").details?.at(-1)).toBe("bash: curl https://x");
+    // FR-1 敏感文件（build）：路径首位 + bash 尾行
+    const dir = tmpdir();
+    fs.writeFileSync(path.join(dir, ".env"), "KEY=1");
+    const d1 = decideBashRequest({ mode: "build", config: cfg, cwd: dir, command: "cat .env" });
+    expect(d1.details?.[0]).toBe(".env");
+    expect(d1.details?.at(-1)).toBe("bash: cat .env");
+    // FR-3 外部写（build）：写目标首位 + bash 尾行
+    const d2 = bashReq("build", "echo x > /outside/foo");
+    expect(d2.details?.[0]).toBe("/outside/foo");
+    expect(d2.details?.at(-1)).toBe("bash: echo x > /outside/foo");
+  });
+
+  it("所有 tool ask 均带 tool:<name> 触发主体行", () => {
+    // FR-3 外部（build）：路径首位 + tool 尾行
+    const ext = toolReq("build", "my_tool", { path: "/outside/a.txt" });
+    expect(ext.details?.[0]).toBe("/outside/a.txt");
+    expect(ext.details?.at(-1)).toBe("tool:my_tool");
+    // FR-8.3 plan 未知工具
+    expect(toolReq("plan", "web_search", { q: "x" }).details?.at(-1)).toBe("tool:web_search");
+    // FR-1 敏感文件（build）：路径首位 + tool 尾行
+    const dir = tmpdir();
+    fs.writeFileSync(path.join(dir, ".env"), "KEY=1");
+    const d = decideToolRequest({ mode: "build", config: cfg, cwd: dir, toolName: "read", input: { path: ".env" } });
+    expect(d.details?.[0]).toBe(".env");
+    expect(d.details?.at(-1)).toBe("tool:read");
+  });
+
+  it("FR-5/FR-3 文案：read-only 白名单描述不暗示路径白名单", () => {
+    expect(bashReq("build", "cat /outside/notes.txt").reason).toBe("[bash] read-only command whitelist, external path allowed");
+    const t = toolReq("build", "read", { path: "/outside/a.txt" });
+    expect(t.reason).toBe("[tool:read] read-only tool whitelist, external path allowed");
+  });
+
   it("cat .env 弹窗 ask（验收 2/3）", () => {
     const dir = tmpdir();
     fs.writeFileSync(path.join(dir, ".env"), "KEY=1");
