@@ -31,6 +31,13 @@ pi -e ./packages/<pkg>/src/index.ts       # 本地冒烟（免编译直载）
 - 依赖版本走 `pnpm-workspace.yaml` 的 catalog；跨包引用需显式 `workspace:` 协议（`linkWorkspacePackages: false`）
 - 每个包自带 README（安装/配置/集成）、CHANGELOG、AGENTS.md（包级上下文）
 
+## 版本与发布
+
+- **提交/发布前必须同步更新 `packages/<pkg>/package.json` 的 `version`**，否则无法发布（npm 不允许与已发布版本重复）。
+- 版本语义：`fix` → patch（`x.y.z` → `x.y.(z+1)`）；`feat` → minor；破坏性 → major。
+- 同一次修改中同步更新 `CHANGELOG.md`（用 `## [新版本] - YYYY-MM-DD` 格式在顶部新增条目）。
+- tag 使用包名前缀 + semver：`pi-permission/v0.1.2`（对齐现有 `pi-permission/v0.1.x` 惯例）。
+
 ## 包列表
 
 | 包 | 说明 |
