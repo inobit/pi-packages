@@ -268,6 +268,8 @@ describe("bash 决策（build 模式）", () => {
 
   it("fail-closed：命令替换在 build 下 ask（FR-7）", () => {
     expect(bashReq("build", "echo $(ls)").action).toBe("ask");
+    // 回归：$(...) 闭合后不再误报 unparseable，reason 应命中复杂语法分支
+    expect(bashReq("build", "echo $(ls)").reason).toBe("[bash] command substitution / subshell / complex syntax (fail-closed)");
     expect(bashReq("build", 'echo "`date`"').action).toBe("ask");
   });
 

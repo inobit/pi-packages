@@ -142,9 +142,9 @@ function splitTopLevel(command: string): {
     }
     if (ch === "$" && next === "(") {
       hasCommandSubstitution = true;
-      parenDepth++;
+      parenDepth++; // 与闭合 ) 配对，深度归零
       current += ch;
-      i++;
+      i += 2; // 同时跳过 $ 和 (，避免 ( 分支二次计数把平衡的 $(...) 误判为 parseError
       continue;
     }
     if ((ch === "<" && next === "(") || (ch === ">" && next === "(")) {

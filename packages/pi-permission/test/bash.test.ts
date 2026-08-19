@@ -71,6 +71,20 @@ describe("parseBashCommand 复杂语法 fail-closed 标记", () => {
     expect(p.hasCommandSubstitution).toBe(true);
   });
 
+  it("$(...) 闭合后括号深度归零（回归：$ 与 ( 双重计数导致 parseError）", () => {
+    // 修复前 $ 分支 +1、随后 ( 分支又 +1，匹配的 ) 只 -1 → 平衡的 $(...) 残留深度 1 → 误报 parseError
+    const p = parseBashCommand("echo $(ls)");
+    expect(p.parseError).toBe(false);
+    expect(p.hasCommandSubstitution).toBe(true);
+    expect(p.hasSubshell).toBe(false);
+  });
+
+  it("嵌套 $(...) 同样深度归零", () => {
+    const p = parseBashCommand("echo $(ls $(pwd))");
+    expect(p.parseError).toBe(false);
+    expect(p.hasCommandSubstitution).toBe(true);
+  });
+
   it("反引号", () => {
     const p = parseBashCommand("echo `date`");
     expect(p.hasCommandSubstitution).toBe(true);

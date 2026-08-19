@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4] - 2026-08-19
+
+### 修复
+
+- 修复 `$(` 命令替换的括号深度 off-by-one：`splitTopLevel` 中 `$` 分支先 `parenDepth++`，随后 `(` 分支又 `parenDepth++`，而匹配的 `)` 只 `-1`，导致任何合法闭合的 `$(...)` 结束后深度残留 1 → 误报 `parseError` → fail-closed 提示始终为「unparseable command syntax」。现改为 `$(` 一次性跳过两个字符（深度只 +1），平衡的 `$(...)` 深度归零，命中「command substitution / subshell / complex syntax」分支（决策不变，仍 fail-closed：build=ask、plan=deny）
+- 补充回归测试：`$(...)` 及嵌套 `$(...)` 不再误报 parseError；决策层 reason 断言命中的是复杂语法分支
+
 ## [0.2.3] - 2026-08-19
 
 ### 新增
