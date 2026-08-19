@@ -28,6 +28,7 @@ function makeCtx(cwd: string, overrides: Record<string, unknown> = {}) {
 function makePi(cwd: string) {
   const handlers = new Map<string, EventHandler[]>();
   const commands = new Map<string, { description: string; handler: (args: string, ctx: unknown) => Promise<void> }>();
+  const shortcuts = new Map<string, { description: string; handler: (ctx: unknown) => Promise<void> }>();
   let activeTools: string[] = [];
   return {
     on: (event: string, handler: EventHandler) => {
@@ -35,6 +36,9 @@ function makePi(cwd: string) {
     },
     registerCommand: (name: string, opts: { description: string; handler: (args: string, ctx: unknown) => Promise<void> }) => {
       commands.set(name, opts);
+    },
+    registerShortcut: (shortcut: string, opts: { description: string; handler: (ctx: unknown) => Promise<void> }) => {
+      shortcuts.set(shortcut, opts);
     },
     getActiveTools: () => activeTools,
     setActiveTools: (tools: string[]) => {
@@ -62,6 +66,7 @@ function makePi(cwd: string) {
     },
     handlers,
     commands,
+    shortcuts,
   };
 }
 
@@ -72,6 +77,32 @@ describe("index.ts 工厂装配", () => {
     factory(pi as never);
     expect(pi.commands.has("plan")).toBe(true);
     expect(pi.commands.has("build")).toBe(true);
+  });
+
+  it("注册 Alt+P 快捷键在 plan/build 间切换", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-factory-"));
+    const pi = makePi(dir);
+    factory(pi as never);
+    expect(pi.shortcuts.has("alt+p")).toBe(true);
+
+    const ctx = makeCtx(dir);
+    const toggle = pi.shortcuts.get("alt+p")!;
+    const writeCall = {
+      type: "tool_call",
+      toolCallId: "1",
+      toolName: "write",
+      input: { filePath: "x" },
+    };
+
+    // 默认 build：Alt+P 进入只读 plan，写工具被拒绝
+    await toggle.handler(ctx as never);
+    const denied = await pi.emit("tool_call", writeCall as never, makeCtx(dir));
+    expect(denied).toMatchObject({ block: true });
+
+    // 再按 Alt+P 回到 build，写工具恢复放行
+    await toggle.handler(ctx as never);
+    const allowed = await pi.emit("tool_call", writeCall as never, makeCtx(dir));
+    expect(allowed).toBeUndefined();
   });
 
   it("订阅 tool_call 与 before_agent_start", () => {

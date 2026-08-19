@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0] - 2026-08-19
+
+### 新增
+
+- plan/build 切换快捷键：默认 `Alt+P`，在只读规划模式与正常模式之间循环切换（`registerShortcut` 实现，不占用 TUI 输入键位）
+- 新增配置项 `toggleModeShortcut`（全局 `config.json`）：可自定义快捷键或空字符串禁用，键位格式与 pi 内置键位一致
+
 ## [0.1.2] - 2026-08-19
 
 ### 修复

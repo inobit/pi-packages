@@ -109,7 +109,10 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  registerModeCommands(pi, modeStore);
+  // plan/build 命令 + 切换快捷键；快捷键配置读取全局层（trusted=false 跳过项目配置，避免未信任项目影响全局键位）
+  registerModeCommands(pi, modeStore, {
+    toggleModeShortcut: getConfig(process.cwd(), false).toggleModeShortcut,
+  });
 
   // /readonly-tools：UI 空格多选 readonly tools，session/project/global 三级，每层只改自己
   registerToolsCommand(pi, {

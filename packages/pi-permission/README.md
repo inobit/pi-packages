@@ -29,6 +29,7 @@ pi install npm:@inobit/pi-permission
 ```
 
 - 默认 build 模式，会话级、不持久化（重启回到 build）
+- **切换快捷键**：`Alt+P` 在 plan/build 之间循环切换（可在 `toggleModeShortcut` 配置中改为其他键位，空字符串禁用，键位格式见 pi [keybindings](https://pi.dev/docs/keybindings)）
 - 状态栏：`Plan` 绿 / `Build` 红（主题色），键名 `pi-permission-mode`
 
 ## 判定优先级（从高到低）
@@ -55,6 +56,7 @@ pi install npm:@inobit/pi-permission
 | `dangerousBashCommands` | 敏感操作统一清单（`sudo` 或 `git commit`） | git 写子命令 + 危险 shell |
 | `readonlyTools` | 工具 read 白名单（各层并集） | `read grep find ls` |
 | `strictPlanMode` | plan 下非白名单由 ask 收紧为 deny | `false` |
+| `toggleModeShortcut` | plan/build 切换快捷键（空字符串禁用） | `alt+p` |
 | `reviewLog` | 审查日志开关（FR-6） | `true` |
 | `debugLog` | 调试日志开关（与审查日志分离，详细事件） | `false` |
 | `logDir` | 日志目录（相对全局扩展目录 `~/.pi/agent/extensions/pi-permission`，0600） | `logs` |

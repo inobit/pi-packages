@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { KeyId } from "@earendil-works/pi-tui";
 import { BUILTIN_WRITE_TOOLS } from "./config.ts";
 import type { WorkMode } from "./decision.ts";
 
@@ -73,8 +74,12 @@ export class ModeStore {
   }
 }
 
-/** 注册 /plan、/build 命令（FR-8.2，重复输入幂等）。 */
-export function registerModeCommands(pi: ExtensionAPI, store: ModeStore): void {
+/** 注册 /plan、/build 命令（FR-8.2，重复输入幂等）与可配置的切换快捷键。 */
+export function registerModeCommands(
+  pi: ExtensionAPI,
+  store: ModeStore,
+  opts: { toggleModeShortcut: string },
+): void {
   pi.registerCommand("plan", {
     description: "Switch to read-only planning mode: all writes denied, read-only operations allowed",
     handler: async (args, ctx) => {
@@ -91,4 +96,20 @@ export function registerModeCommands(pi: ExtensionAPI, store: ModeStore): void {
       if (ctx.hasUI) ctx.ui.notify("[pi-permission] switched to build mode", "info");
     },
   });
+
+  // 快捷键在 plan/build 之间来回切换（如 Alt+P）；配置为空字符串则禁用。
+  // 键位格式见 pi keybindings.md（`modifier+key`，如 `alt+p`、`f4`）。
+  // 配置为非法键位或与内置受保护键位冲突时，pi 会发警告并跳过，不会影响加载。
+  const shortcut = opts.toggleModeShortcut.trim();
+  if (shortcut) {
+    pi.registerShortcut(shortcut as KeyId, {
+      description: "Toggle between plan (read-only) and build mode",
+      handler: async (ctx) => {
+        const key = sessionKey(ctx);
+        const next: WorkMode = store.getMode(key) === "plan" ? "build" : "plan";
+        await store.setMode(key, next, pi, ctx);
+        if (ctx.hasUI) ctx.ui.notify(`[pi-permission] switched to ${next} mode`, "info");
+      },
+    });
+  }
 }

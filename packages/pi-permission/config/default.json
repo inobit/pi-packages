@@ -5,6 +5,7 @@
   "dangerousBashCommands": ["git add", "git commit", "git push", "git pull", "git merge", "git rebase", "git reset", "git checkout", "git restore", "git clean", "git branch", "git remote", "git stash", "git tag", "git mv", "git rm", "git switch", "git revert", "git cherry-pick", "git gc", "git prune", "git repack", "git am", "git apply", "git submodule", "git worktree", "git update-index", "git update-ref", "git lfs", "git init", "git clone", "git config", "git notes", "git replace", "git filter-branch", "git bisect", "sudo", "su", "dd", "mkfs", "mkfs.ext2", "mkfs.ext3", "mkfs.ext4", "mkfs.xfs", "fdisk", "gdisk", "parted", "wipefs", "mount", "umount", "chroot", "shutdown", "reboot", "halt", "poweroff", "init", "kill", "pkill", "killall", "iptables", "ip6tables", "ufw", "firewall-cmd"],
   "readonlyTools": ["read", "grep", "find", "ls"],
   "strictPlanMode": false,
+  "toggleModeShortcut": "alt+p",
   "reviewLog": true,
   "debugLog": false,
   "logDir": "logs"

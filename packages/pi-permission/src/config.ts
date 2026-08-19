@@ -21,6 +21,8 @@ export interface PermissionConfig {
   readonlyTools: string[];
   /** strictPlanMode：未知工具在 plan 下由 ask 收紧为 deny（FR-8.3）。 */
   strictPlanMode: boolean;
+  /** plan/build 切换快捷键（pi 键位 id，如 `alt+p`）；空字符串或省略禁用快捷键。 */
+  toggleModeShortcut: string;
   /** 是否记录审查日志（FR-6 / D4）。 */
   reviewLog: boolean;
   /** 是否记录调试日志（详细事件，默认关；与审查日志分离，参考 pi 生态双流实践）。 */
@@ -86,6 +88,7 @@ export const DEFAULT_CONFIG: PermissionConfig = {
   // 第三方扩展工具（web_search/agent-browser/skill/mcp_*/ffgrep 等）需用户自行追加（取并集）
   readonlyTools: [...BUILTIN_READONLY_TOOLS],
   strictPlanMode: false,
+  toggleModeShortcut: "alt+p",
   reviewLog: true,
   debugLog: false,
   logDir: "logs",
