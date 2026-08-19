@@ -7,6 +7,7 @@ Pi coding agent 扩展包的 monorepo（pnpm workspace）。面向 `@earendil-wo
 | 包 | 说明 |
 | -- | ---- |
 | [`@inobit/pi-permission`](packages/pi-permission) | 轻量权限控制扩展：敏感文件保护 / 项目边界读写区分 / 敏感操作确认 / plan-build 只读模式 |
+| [`@inobit/pi-todo`](packages/pi-todo) | 最小侵入任务清单扩展：`todo` 工具 + `/todos` 命令 + 编辑器上方常驻面板，状态存会话分支可重放 |
 
 各包安装、配置、使用详见其 README（上表链接）。
 
