@@ -3,7 +3,7 @@ import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadConfig, type PermissionConfig } from "./config.ts";
+import { getAgentDir, loadConfig, type PermissionConfig } from "./config.ts";
 import { decideBashRequest, decideToolRequest, type Decision, type WorkMode } from "./decision.ts";
 import { BUILD_SWITCH_NOTICE, ModeStore, PLAN_SYSTEM_PROMPT, registerModeCommands, sessionKey, statusText } from "./mode.ts";
 import { registerToolsCommand } from "./tools.ts";
@@ -85,9 +85,10 @@ export default function (pi: ExtensionAPI) {
 
   const auditorCache = new Map<string, Auditor>();
   const getAuditor = (cwd: string, cfg: PermissionConfig): Auditor => {
-    // 审查日志写入全局扩展目录（与全局配置同位置），按项目分目录隔离，不污染工作区
-    const base = path.join(os.homedir(), ".pi", "agent", "extensions", "pi-permission");
-    let auditor = auditorCache.get(cwd);
+    // 审查日志写入 agentDir/logs/pi-permission（扩展目录仅放配置），按项目分目录隔离；与 pi-debug.log 同级，规避同步工具误同步
+    const base = getAgentDir();
+    const cacheKey = `${cwd}::${cfg.logDir}::${cfg.reviewLog}::${cfg.debugLog}`;
+    let auditor = auditorCache.get(cacheKey);
     if (!auditor) {
       auditor = createAuditor({
         base,
@@ -96,13 +97,13 @@ export default function (pi: ExtensionAPI) {
         reviewEnabled: cfg.reviewLog,
         debugEnabled: cfg.debugLog,
       });
-      auditorCache.set(cwd, auditor);
+      auditorCache.set(cacheKey, auditor);
     }
     return auditor;
   };
 
   const globalConfigPath = () =>
-    path.join(os.homedir(), ".pi", "agent", "extensions", "pi-permission", "config.json");
+    path.join(getAgentDir(), "extensions", "pi-permission", "config.json");
   const readConfigFile = (p: string): Record<string, unknown> => {
     try {
       return JSON.parse(fs.readFileSync(p, "utf8")) as Record<string, unknown>;

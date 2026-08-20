@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 /** 审查日志条目（FR-6）。timestamp/extension/stream/project 由 Auditor 自动填充。 */
@@ -54,9 +55,9 @@ function capFieldWidths(value: unknown, max: number): unknown {
 
 /** Auditor 选项。 */
 export interface AuditorOptions {
-  /** 审计根目录（生产：全局扩展目录 `~/.pi/agent/extensions/pi-permission`）。 */
+  /** 日志根目录（生产：`~/.pi/agent`，尊重 `PI_CODING_AGENT_DIR`）。 */
   base: string;
-  /** 日志目录（相对 base，默认 `logs`）。 */
+  /** 日志目录（相对 base，默认 `logs/pi-permission`；支持绝对路径与 `~/` 前缀）。 */
   logDir: string;
   /** 当前项目 cwd：按项目分目录写入，并记录在每条日志中。 */
   project: string;
@@ -106,7 +107,7 @@ function rotateIfNeeded(file: string, maxBytes: number, maxBackups: number): voi
  * - review：JSONL 追加到 `<base>/<logDir>/<project>/pi-permission-review.jsonl`
  * - debug：JSONL 追加到 `<base>/<logDir>/<project>/pi-permission-debug.jsonl`
  * 文件 0600、目录 0700、按项目分目录隔离、支持大小轮转、字段宽度上限；
- * 写入全局扩展目录，不污染被审查的工作区。
+ * 写入 `~/.pi/agent/logs/pi-permission`（扩展目录仅放配置），不污染被审查的工作区。
  */
 export interface Auditor {
   /** 审查日志（ask/deny/allow 事件）。 */
@@ -115,8 +116,16 @@ export interface Auditor {
   debug(event: string, details?: Record<string, unknown>): void;
 }
 
+/** 展开 `~/` 前缀为 homedir（与 pi 的 expandTildePath 对齐）。 */
+function expandTilde(p: string): string {
+  if (p === "~" || p.startsWith("~/") || p.startsWith("~\\")) {
+    return path.join(os.homedir(), p.slice(2));
+  }
+  return p;
+}
+
 export function createAuditor(options: AuditorOptions): Auditor {
-  const dir = path.resolve(options.base, options.logDir, sanitizeProject(options.project));
+  const dir = path.resolve(expandTilde(options.base), expandTilde(options.logDir), sanitizeProject(options.project));
   const reviewFile = path.join(dir, "pi-permission-review.jsonl");
   const debugFile = path.join(dir, "pi-permission-debug.jsonl");
   const maxBytes = options.maxBytes ?? 512 * 1024;

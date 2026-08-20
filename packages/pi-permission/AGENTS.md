@@ -20,7 +20,7 @@ build：敏感操作 ask → 敏感文件 ask →（cwd 内 allow | cwd 外 read
 
 ## 配置（config.ts 定义默认清单；全局/项目 config.json 覆盖）
 
-字段：`sensitivePatterns`、`envExampleReadAllowed`、`readonlyBashCommands`、`dangerousBashCommands`（`git <子命令>` + 危险 shell）、`readonlyTools`、`strictPlanMode`（默认 false）、`reviewLog`、`logDir`。
+字段：`sensitivePatterns`、`envExampleReadAllowed`、`readonlyBashCommands`、`dangerousBashCommands`（`git <子命令>` + 危险 shell）、`readonlyTools`、`strictPlanMode`（默认 false）、`reviewLog`/`debugLog`、`logDir`（默认 `logs/pi-permission`，相对 `~/.pi/agent`，支持绝对路径/`~/`，扩展目录仅放配置）。
 
 - **数组字段全部跨层并集**（`sensitivePatterns`/`readonlyBashCommands`/`dangerousBashCommands`/`readonlyTools`）：
   default ∪ global ∪ project ∪ session，去重不覆盖（`ARRAY_FIELDS`）；非数组字段高层覆盖
@@ -52,7 +52,7 @@ build：敏感操作 ask → 敏感文件 ask →（cwd 内 allow | cwd 外 read
 | `mode.ts` | plan/build 内存状态、命令、状态栏、系统提示注入 |
 | `tools.ts` | `/readonly-tools`：空格多选 readonly tools，session（内置+全局锁定）/ global（仅内置锁定） |
 | `ui.ts` | y/s/n 选择弹窗、无 UI 降级拒绝 |
-| `audit.ts` | 双流 JSONL 日志（review 审查 / debug 调试，参考 pi 生态实践）：脱敏 + 字段宽度上限 + 按项目分目录 + 大小轮转；写入全局扩展目录 `~/.pi/agent/extensions/pi-permission/logs/<project>/`，不污染项目 |
+| `audit.ts` | 双流 JSONL 日志（review 审查 / debug 调试，参考 pi 生态实践）：脱敏 + 字段宽度上限 + 按项目分目录 + 大小轮转；写入 `~/.pi/agent/logs/pi-permission/<project>/`（更规范，与 `pi-debug.log` 同级），扩展目录仅放配置 |
 
 ## 集成
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.6] - 2026-08-20
+
+### 变更
+
+- **日志目录更规范**：默认日志目录由 `~/.pi/agent/extensions/pi-permission/logs/<project>/` 调整为 `~/.pi/agent/logs/pi-permission/<project>/`（更规范，与 `pi-debug.log` 同级，扩展目录仅放 `config.json`），`logDir` 默认值由 `"logs"` 改为 `"logs/pi-permission"`（相对 `~/.pi/agent`），支持绝对路径与 `~/` 前缀。
+- `config.ts` 导出 `getAgentDir()`（对齐 pi 核心），`index.ts`/`loadConfig` 的全局配置与日志根均跟随 `PI_CODING_AGENT_DIR`；`audit.ts` 新增 `~/` 展开，`logDir` 为绝对路径时覆盖 `base`。
+- 更新 `config/default.json`、`README.md`、`AGENTS.md` 及测试。
+
 ## [0.2.4] - 2026-08-19
 
 ### 修复

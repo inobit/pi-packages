@@ -9,5 +9,5 @@
   "toggleModeShortcut": "alt+p",
   "reviewLog": true,
   "debugLog": false,
-  "logDir": "logs"
+  "logDir": "logs/pi-permission"
 }

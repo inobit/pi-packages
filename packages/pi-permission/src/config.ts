@@ -30,7 +30,7 @@ export interface PermissionConfig {
   reviewLog: boolean;
   /** 是否记录调试日志（详细事件，默认关；与审查日志分离，参考 pi 生态双流实践）。 */
   debugLog: boolean;
-  /** 审查日志目录，相对全局扩展目录 `~/.pi/agent/extensions/pi-permission`（不写入项目目录）。 */
+  /** 审查日志目录，相对 `~/.pi/agent`（尊重 `PI_CODING_AGENT_DIR`）；支持绝对路径与 `~/`。扩展目录仅放配置。 */
   logDir: string;
 }
 
@@ -96,7 +96,7 @@ export const DEFAULT_CONFIG: PermissionConfig = {
   toggleModeShortcut: "alt+p",
   reviewLog: true,
   debugLog: false,
-  logDir: "logs",
+  logDir: "logs/pi-permission",
 };
 
 /** 浅合并：仅允许覆盖 PermissionConfig 顶层字段。 */
@@ -110,8 +110,18 @@ const ARRAY_FIELDS = new Set<keyof PermissionConfig>([
   "trustedExternalPaths",
   "readonlyTools",
 ]);
+/** 与 pi 核心 getAgentDir() 对齐的 agent 根（尊重 PI_CODING_AGENT_DIR）。 */
+export function getAgentDir(): string {
+  const env = process.env.PI_CODING_AGENT_DIR ?? process.env.PI_AGENT_DIR;
+  if (env) {
+    if (env === "~" || env.startsWith("~/") || env.startsWith("~\\")) return path.join(os.homedir(), env.slice(2));
+    return env;
+  }
+  return path.join(os.homedir(), ".pi", "agent");
+}
+
 export interface LoadConfigOptions {
-  /** 全局配置路径，默认 `~/.pi/agent/extensions/pi-permission/config.json`。 */
+  /** 全局配置路径，默认 `<agentDir>/extensions/pi-permission/config.json`（`~/.pi/agent/...`，尊重 PI_CODING_AGENT_DIR）。 */
   globalPath?: string;
   /** 项目配置路径，默认 `<cwd>/.pi/extensions/pi-permission/config.json`。 */
   projectPath?: string;
@@ -121,10 +131,8 @@ export interface LoadConfigOptions {
 
 /** 加载并合并配置：default < global < project；数组字段逐层并集，其余字段高层覆盖。 */
 export function loadConfig(cwd: string, options: LoadConfigOptions = {}): PermissionConfig {
-  const home = os.homedir();
   const globalPath =
-    options.globalPath ??
-    path.join(home, ".pi", "agent", "extensions", "pi-permission", "config.json");
+    options.globalPath ?? path.join(getAgentDir(), "extensions", "pi-permission", "config.json");
   const projectPath = options.projectPath ?? path.join(cwd, ".pi", "extensions", "pi-permission", "config.json");
 
   const merged: PartialConfig = {};

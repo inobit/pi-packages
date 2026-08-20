@@ -61,12 +61,14 @@ pi install npm:@inobit/pi-permission
 | `toggleModeShortcut` | plan/build 切换快捷键（空字符串禁用） | `alt+p` |
 | `reviewLog` | 审查日志开关（FR-6） | `true` |
 | `debugLog` | 调试日志开关（与审查日志分离，详细事件） | `false` |
-| `logDir` | 日志目录（相对全局扩展目录 `~/.pi/agent/extensions/pi-permission`，0600） | `logs` |
+| `logDir` | 日志目录（相对 `~/.pi/agent`，尊重 `PI_CODING_AGENT_DIR`；支持绝对路径与 `~/`，0600；扩展目录仅放配置） | `logs/pi-permission` |
 
 > 固定规则（不可配置）：内置写工具 `write`/`edit`、`rm -r/-f`、`chmod -R`、`chown -R`、
 > `curl/wget | sh/bash`、`bash -c`/`eval`/`sudo`/`xargs`/`find -exec` 恒为敏感操作；
 > 重定向 `>`/`>>` 写目标固定检测；不在 `dangerousBashCommands` 的 git 子命令自动视为只读。
 > 弹窗 reason 带 `[bash]` / `[tool:<name>]` 来源前缀并附配置建议。
+>
+> **日志位置**：默认 `~/.pi/agent/logs/pi-permission/<project>/pi-permission-{review,debug}.jsonl`（更规范，与 `pi-debug.log` 同级），按项目分目录隔离，文件 `0600`、目录 `0700`、支持大小轮转。扩展目录 `~/.pi/agent/extensions/pi-permission` 仅放 `config.json`。自定义可用绝对路径或 `~/`，如 `"logDir": "~/my-logs/pi-permission"` 或 `"/var/log/pi-permission"`。
 >
 > **trusted 豁免边界**：只放行"目录边界"，永远排在危险/敏感判定之后——即使位于 trusted 目录内，
 > 命中敏感文件名的写入（如 `/tmp/.env`、cwd 恰在 `/tmp` 下写 `.env`）plan 下仍 deny、build 下仍 ask；
