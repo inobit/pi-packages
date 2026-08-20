@@ -45,5 +45,6 @@ pi -e ./packages/<pkg>/src/index.ts       # 本地冒烟（免编译直载）
 | 包 | 说明 |
 | -- | ---- |
 | `@inobit/pi-permission` | 轻量权限控制：敏感文件保护 / 项目边界读写区分 / 敏感操作确认 / plan-build 只读模式 |
+| `@inobit/pi-reader` | 阅读模式：`alt+o` 切换、`ctrl-u/d` 半页、`ctrl-f/b` 整页、`gg/G` 顶底、`?` 帮助 |
 | `@inobit/pi-todo` | 最小侵入任务清单：`todo` 工具 + `/todos` 命令 + 编辑器上方常驻面板，状态存会话分支可重放 |
 | `@inobit/pi-themes` | 精选主题包：Rosé Pine / TokyoNight 两族亮暗主题，支持 `theme: "亮/暗"` 配对自动切换 |
