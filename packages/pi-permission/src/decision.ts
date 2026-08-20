@@ -212,11 +212,12 @@ export function decideBashRequest(req: BashDecisionRequest): Decision {
 
   // yolo：彻底放行但敏感文件仍 deny（跳过 fail-closed / 管道等检查）
   if (mode === "yolo") {
-    // 敏感文件检查仍需解析后的段信息
+    // 复用段 cwd 缓存，避免每轮重算
+    const yoloSegmentCwds = resolveSegmentCwds(parsed.segments, cwd);
     const yoloSensitive = (() => {
       for (let i = 0; i < parsed.segments.length; i++) {
         const seg = parsed.segments[i]!;
-        const segCwd = resolveSegmentCwds(parsed.segments, cwd)[i] ?? cwd;
+        const segCwd = yoloSegmentCwds[i] ?? cwd;
         const readRefs = collectReadRefs(seg);
         const writeTargets = collectWriteTargets(seg);
         const hit = sensitiveDecision([...readRefs, ...writeTargets], segCwd, config, readRefs, label);

@@ -5,6 +5,7 @@
 ## 判定优先级（改 decision.ts 前必读）
 
 ```
+yolo：敏感文件 deny（FR-1，terminate:false，引导 .example/占位符）→ 其余全部 allow（rule:"yolo"，含 fail-closed/curl|sh/危险操作均放行）
 plan（不分 cwd 内外）：明确的写(重定向/写命令/write/edit) deny → 敏感操作 deny → 敏感文件 ask → read 白名单 allow → 其他 ask（strictPlanMode:true 时 deny）
 build：敏感操作 ask → 敏感文件 ask →（cwd 内 allow | cwd 外 read 白名单 allow → 其他 ask）
 ```
@@ -15,8 +16,7 @@ build：敏感操作 ask → 敏感文件 ask →（cwd 内 allow | cwd 外 read
   `cd -`/无法解析时相对路径保守按外部处理
 - fail-closed：解析失败 / `$(...)` / 子 shell / `curl|sh` → build=ask、plan=deny，绝不静默放行
 - 插件自身异常降级为不拦截（不拖垮 pi 启动）
-- **deny/拒绝反馈**：block 时给模型的 reason 为 `Permission was/by user denied. Do not retry this operation. (FR-x: ...)` +
-  `terminate: true`，明确告知模型勿重试（避免把 deny 当"可批准，重试等确认"）
+- **deny/拒绝反馈**：按规则分流（0.2.7）：`FR-1`/`FR-7` → `terminate:false`（`Sensitive file blocked` / `Command too complex` 引导替代/拆解，不终止任务，供 yolo 敏感拒绝复用）；`FR-8 plan 只读`/`兜底` → `terminate:true`（`Plan is read-only` / `Permission denied`）
 
 ## 配置（config.ts 定义默认清单；全局/项目 config.json 覆盖）
 
@@ -46,17 +46,17 @@ build：敏感操作 ask → 敏感文件 ask →（cwd 内 allow | cwd 外 read
 | -- | ---- |
 | `index.ts` | 工厂装配：订阅 tool_call/before_agent_start/session_start，注册 /plan /build，会话级批准 |
 | `config.ts` | 默认清单 + 配置加载合并 |
-| `decision.ts` | 判定引擎，reason 带 `[bash]`/`[tool:<name>]` 前缀 |
+| `decision.ts` | 判定引擎，reason 带 `[bash]`/`[tool:<name>]`/`[yolo]` 前缀；yolo 首检敏感 `FR-1 deny` 其余 `allow yolo`（跳过 fail-closed） |
 | `bash.ts` | 自研简化解析器：切分/token/重定向/git 子命令/wrapper/分类/写目标（仅重定向） |
 | `path.ts` | 归一化 + realpath 双形态 + 敏感匹配 + cwd 边界 |
-| `mode.ts` | plan/build 内存状态、命令、状态栏、系统提示注入 |
+| `mode.ts` | plan/build/yolo 内存状态、命令（/yolo 需二次确认 `y: confirm yolo`）、状态栏（`Yolo` warning 橙）、系统提示注入（`YOLO_SWITCH_NOTICE` 仅切入首轮） |
 | `tools.ts` | `/readonly-tools`：空格多选 readonly tools，session（内置+全局锁定）/ global（仅内置锁定） |
 | `ui.ts` | y/s/n 选择弹窗、无 UI 降级拒绝 |
 | `audit.ts` | 双流 JSONL 日志（review 审查 / debug 调试，参考 pi 生态实践）：脱敏 + 字段宽度上限 + 按项目分目录 + 大小轮转；写入 `~/.pi/agent/logs/pi-permission/<project>/`（更规范，与 `pi-debug.log` 同级），扩展目录仅放配置 |
 
 ## 集成
 
-- 模式状态键 `pi-permission-mode`（值 `Plan`/`Build`，主题色：Plan 绿、Build 红；**不带 `[` 前缀**，
+- 模式状态键 `pi-permission-mode`（值 `Plan`/`Build`/`Yolo`，主题色：Plan 绿、Build 红、Yolo 橙 `warning`；**不带 `[` 前缀**，
   否则 powerline 会归为通知类显示在编辑器上方而非 footer）；无 powerline 时显示于内置 footer 扩展状态行；
   需放主状态栏最左边时在 settings.json 配 `powerline.customItems`（position: left，见 README）
 - subagent 继承宿主模式（内存态，会话级，不持久化）
@@ -68,4 +68,4 @@ pnpm --filter @inobit/pi-permission test    # vitest（决策/bash/path/config/a
 pnpm --filter @inobit/pi-permission check   # tsc --noEmit
 ```
 
-覆盖验收要点：`.env` 弹窗/豁免、软链绕过、外部读写区分、git 只读/写子命令、plan 全量行为、未知 ask/strict deny、日志脱敏。
+覆盖验收要点：`.env` 弹窗/豁免、软链绕过、外部读写区分、git 只读/写子命令、plan/yolo 全量行为、未知 ask/strict deny、fail-closed 拆解引导、日志脱敏。
