@@ -5,12 +5,16 @@ import type { WorkMode } from "./decision.ts";
 
 /** plan 模式系统提示注入文案（FR-8.4）。 */
 export const PLAN_SYSTEM_PROMPT =
-  "You are in PLAN (read-only) mode. Do not modify files or run any command that changes state; only read, search, and plan.";
+  "You are in PLAN mode — read-only. Do not edit files or run state-changing commands. Use read, search, and planning only.";
 
-/** build 模式切换公告（FR-8.4b）：从 plan 切到 build 后的首个 turn 注入一次，
- * 显式撤销 plan 只读约束；权限拦截是另一层行为，模型用到时自然被拦，无需预告。 */
+/** build 模式切换公告（FR-8.4b）：从 plan/yolo 切到 build 后的首个 turn 注入一次，
+ * 显式撤销只读约束；与 BUILD_SWITCH_NOTICE 复用。 */
 export const BUILD_SWITCH_NOTICE =
-  "Plan mode is now disabled. Full tool access is restored; you may modify files and run state-changing commands.";
+  "Plan mode off. Normal permission checks restored.";
+
+/** yolo 模式切入公告：仅从非 yolo 切到 yolo 的首轮注入一次。 */
+export const YOLO_SWITCH_NOTICE =
+  "Yolo on: prompts bypassed, sensitive files still blocked. Stay cautious — avoid destructive commands unless the user explicitly asks.";
 
 /** pi 全局主题实例键（与 pi 内部 getMarkdownTheme 同机制）。 */
 const THEME_KEY = Symbol.for("@earendil-works/pi-coding-agent:theme");
@@ -24,12 +28,14 @@ function getTheme(): Theme | undefined {
   }
 }
 
-/** 状态栏文案：Plan 偏绿（success）、Build 偏红（error），跟随当前主题。 */
+/** 状态栏文案：Plan 偏绿（success）、Build 偏红（error）、Yolo 偏橙（warning），跟随当前主题。 */
 export function statusText(mode: WorkMode): string {
   const theme = getTheme();
-  const label = mode === "plan" ? "Plan" : "Build";
+  const label = mode === "plan" ? "Plan" : mode === "yolo" ? "Yolo" : "Build";
   if (!theme) return label;
-  return mode === "plan" ? theme.fg("success", label) : theme.fg("error", label);
+  if (mode === "plan") return theme.fg("success", label);
+  if (mode === "yolo") return theme.fg("warning", label);
+  return theme.fg("error", label);
 }
 
 /** 取会话标识；无 sessionManager 时回退到全局键。 */
@@ -41,7 +47,7 @@ export function sessionKey(ctx: ExtensionContext): string {
   }
 }
 
-/** plan/build 内存状态（FR-8 / D8：会话级、不持久化），subagent 继承宿主模式。 */
+/** plan/build/yolo 内存状态（FR-8 / D8：会话级、不持久化），subagent 继承宿主模式。 */
 export class ModeStore {
   private modes = new Map<string, WorkMode>();
   private savedActiveTools = new Map<string, string[]>();
@@ -58,11 +64,12 @@ export class ModeStore {
 
     try {
       const active = pi.getActiveTools();
-      if (mode === "plan") {
+      // plan 为只读需隐藏写工具，yolo/build 均为非 plan 需恢复
+      if (mode === "plan" && prev !== "plan") {
         this.savedActiveTools.set(key, active);
         const next = active.filter((t) => !BUILTIN_WRITE_TOOLS.includes(t));
         if (next.length !== active.length) pi.setActiveTools(next);
-      } else {
+      } else if (prev === "plan" && mode !== "plan") {
         const saved = this.savedActiveTools.get(key);
         if (saved) pi.setActiveTools(saved);
         this.savedActiveTools.delete(key);
@@ -79,7 +86,7 @@ export class ModeStore {
   }
 }
 
-/** 注册 /plan、/build 命令（FR-8.2，重复输入幂等）与可配置的切换快捷键。 */
+/** 注册 /plan、/build、/yolo 命令（FR-8.2，重复输入幂等）与可配置的切换快捷键。 */
 export function registerModeCommands(
   pi: ExtensionAPI,
   store: ModeStore,
@@ -99,6 +106,26 @@ export function registerModeCommands(
       const key = sessionKey(ctx);
       await store.setMode(key, "build", pi, ctx);
       if (ctx.hasUI) ctx.ui.notify("[pi-permission] switched to build mode", "info");
+    },
+  });
+  pi.registerCommand("yolo", {
+    description: "Switch to yolo mode: bypass all checks except sensitive files (requires confirmation)",
+    handler: async (args, ctx) => {
+      if (!ctx.hasUI) {
+        ctx.ui.notify("[pi-permission] yolo requires UI confirmation", "warning");
+        return;
+      }
+      const choice = await ctx.ui.select("Enable yolo mode? Prompts bypassed, sensitive files still blocked.", [
+        "y: confirm yolo",
+        "n: cancel",
+      ]);
+      if (choice !== "y: confirm yolo") {
+        ctx.ui.notify("[pi-permission] yolo cancelled", "info");
+        return;
+      }
+      const key = sessionKey(ctx);
+      await store.setMode(key, "yolo", pi, ctx);
+      if (ctx.hasUI) ctx.ui.notify("[pi-permission] switched to yolo mode — prompts bypassed (sensitive files still blocked)", "warning");
     },
   });
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0] - 2026-08-20
+
+### 新增
+
+- **yolo 模式**：新增 `/yolo` 命令（`yolo` = 彻底放行但敏感文件仍拦）。需 UI 二次确认 `y: confirm yolo`，无快捷键，会话级不持久化。
+  - 判定：`yolo` 下敏感文件 `FR-1` 仍 `deny`（`terminate:false`，复用 0.2.7 的 `Sensitive file blocked` 引导，不终止任务），其余 `FR-3/FR-4/FR-5/FR-7/FR-8/FR-9` 及 `fail-closed` 全部 `allow rule:"yolo"`（含 `$(...)`/subshell/`curl|sh` 等）。
+  - 注入（方案 B）：`plan` 每轮注入 `PLAN_SYSTEM_PROMPT`；`yolo` 仅切入首轮注入 `YOLO_SWITCH_NOTICE`（`Yolo on: prompts bypassed, sensitive files still blocked...`），驻留零注入；`build` 首轮零注入，`plan->build` 与 `yolo->build` 统一 `BUILD_SWITCH_NOTICE`（精简为 `Plan mode off. Normal permission checks restored.`）。
+  - 状态栏：`Yolo` 橙色 `warning`（`Build` 红 / `Plan` 绿），键 `pi-permission-mode`。
+  - `ModeStore` 将 `yolo` 视为与 `build` 同组，`plan<->yolo` 自动恢复/保存写工具。
+- **提示词精简**：`PLAN_SYSTEM_PROMPT` 精简为 `You are in PLAN mode — read-only...`，`BUILD_SWITCH_NOTICE` 精简为 `Plan mode off...`，`deny` 分流已在 0.2.7 完成。
+
 ## [0.2.7] - 2026-08-20
 
 ### 优化

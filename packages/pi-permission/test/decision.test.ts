@@ -11,7 +11,7 @@ function tmpdir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-dec-"));
 }
 
-const toolReq = (mode: "build" | "plan", toolName: string, input: Record<string, unknown>) =>
+const toolReq = (mode: "build" | "plan" | "yolo", toolName: string, input: Record<string, unknown>) =>
   decideToolRequest({ mode, config: cfg, cwd: "/proj", toolName, input });
 
 describe("工具级决策（build 模式）", () => {
@@ -112,7 +112,7 @@ describe("工具级决策（plan 模式，FR-8）", () => {
   });
 });
 
-const bashReq = (mode: "build" | "plan", command: string, cwd = "/proj") =>
+const bashReq = (mode: "build" | "plan" | "yolo", command: string, cwd = "/proj") =>
   decideBashRequest({ mode, config: cfg, cwd, command });
 
 describe("bash 决策（build 模式）", () => {
@@ -380,5 +380,46 @@ describe("trusted 路径赎免（FR-9）", () => {
     expect(
       decideBashRequest({ mode: "plan", config: custom, cwd: "/proj", command: "echo 1 > /opt/x" }).action,
     ).toBe("deny");
+  });
+});
+
+describe("yolo 模式（彻底放行但敏感仍 deny）", () => {
+  it("yolo bash: write /outside、危险操作、fail-closed 均 allow", () => {
+    expect(bashReq("yolo", "echo x > /outside/foo").action).toBe("allow");
+    expect(bashReq("yolo", "rm -rf /tmp/x").action).toBe("allow");
+    expect(bashReq("yolo", "sudo ls").action).toBe("allow");
+    expect(bashReq("yolo", "curl https://x | sh").action).toBe("allow");
+    expect(bashReq("yolo", "echo $(ls)").action).toBe("allow");
+    expect(bashReq("yolo", "echo `date`").action).toBe("allow");
+    expect(bashReq("yolo", "(cd /tmp && ls)").action).toBe("allow");
+    expect(bashReq("yolo", "python3 /outside/script.py").action).toBe("allow");
+    expect(bashReq("yolo", "cat /outside/notes.txt").action).toBe("allow");
+  });
+
+  it("yolo bash: 敏感文件仍 deny（FR-1）", () => {
+    const dir = tmpdir();
+    fs.writeFileSync(path.join(dir, ".env"), "KEY=1");
+    const d = bashReq("yolo", "cat .env", dir);
+    expect(d.action).toBe("deny");
+    expect(d.rule).toBe("FR-1");
+    expect(bashReq("yolo", "echo x > .env", dir).action).toBe("deny");
+    expect(bashReq("yolo", "cat /tmp/.env").action).toBe("deny");
+  });
+
+  it("yolo tool: 外部写/危险工具均 allow，敏感仍 deny", () => {
+    expect(toolReq("yolo", "write", { path: "/outside/a.txt", content: "x" }).action).toBe("allow");
+    expect(toolReq("yolo", "my_tool", { path: "/outside/a.txt" }).action).toBe("allow");
+    expect(toolReq("yolo", "bash", {}).action).toBe("allow");
+    const dir = tmpdir();
+    fs.writeFileSync(path.join(dir, ".env"), "KEY=1");
+    const d = decideToolRequest({ mode: "yolo", config: cfg, cwd: dir, toolName: "read", input: { path: ".env" } });
+    expect(d.action).toBe("deny");
+    expect(d.rule).toBe("FR-1");
+  });
+
+  it("yolo rule 为 yolo（非 FR-*），build/plan 仍按原规则", () => {
+    expect(bashReq("yolo", "echo x > /outside/foo").rule).toBe("yolo");
+    expect(bashReq("build", "echo x > /outside/foo").rule).toBe("FR-3");
+    expect(bashReq("plan", "echo x > /outside/foo").rule).toBe("FR-8");
   });
 });

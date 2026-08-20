@@ -173,7 +173,7 @@ describe("index.ts 工厂装配", () => {
       { type: "before_agent_start", prompt: "hi", systemPrompt: "BASE", systemPromptOptions: {} },
       ctx,
     );
-    expect(result).toMatchObject({ systemPrompt: expect.stringContaining("PLAN (read-only)") });
+    expect(result).toMatchObject({ systemPrompt: expect.stringContaining("PLAN mode — read-only") });
   });
 
   it("plan→build 切换后首个 turn 注入 build 公告，随后 build 常态不注入", async () => {
@@ -189,13 +189,13 @@ describe("index.ts 工厂装配", () => {
     // 进入 plan：注入只读提示
     await pi.commands.get("plan")!.handler("", ctx as never);
     const planTurn = await pi.emit("before_agent_start", event, ctx);
-    expect(planTurn).toMatchObject({ systemPrompt: expect.stringContaining("PLAN (read-only)") });
+    expect(planTurn).toMatchObject({ systemPrompt: expect.stringContaining("PLAN mode — read-only") });
 
     // 切回 build：首个 turn 注入 build 公告（显式撤销只读约束）
     await pi.commands.get("build")!.handler("", ctx as never);
     const firstBuild = await pi.emit("before_agent_start", event, ctx);
     expect(firstBuild).toMatchObject({
-      systemPrompt: expect.stringContaining("Plan mode is now disabled. Full tool access is restored"),
+      systemPrompt: expect.stringContaining("Plan mode off. Normal permission checks restored."),
     });
 
     // build 常态：再次 turn 不注入（单次公告，无累积）
@@ -424,5 +424,85 @@ describe("index.ts 工厂装配", () => {
     expect(result.block).toBe(true);
     expect(result.terminate).toBe(true);
     expect(result.reason).toMatch(/Plan is read-only/);
+  });
+
+  it("注册 /yolo 命令且需二次确认", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-factory-"));
+    const pi = makePi(dir);
+    factory(pi as never);
+    expect(pi.commands.has("yolo")).toBe(true);
+    // 取消
+    const ctxCancel = makeCtx(dir, { hasUI: true, ui: { notify: () => {}, select: async () => "n: cancel", setStatus: () => {} } });
+    await pi.commands.get("yolo")!.handler("", ctxCancel as never);
+    const statuses = new Map<string, string>();
+    const ctx = makeCtx(dir, { ui: { notify: () => {}, select: async () => "n: cancel", setStatus: (k: string, v: string) => statuses.set(k, v) } });
+    // 仍为 build（未切入 yolo）
+    await pi.emit("session_start", { type: "session_start" }, ctx);
+    expect(statuses.get("pi-permission-mode")).toBe("Build");
+    // 确认进入 yolo
+    const ctxYolo = makeCtx(dir, { hasUI: true, ui: { notify: () => {}, select: async () => "y: confirm yolo", setStatus: (k: string, v: string) => statuses.set(k, v) } });
+    await pi.commands.get("yolo")!.handler("", ctxYolo as never);
+    expect(statuses.get("pi-permission-mode")).toBe("Yolo");
+  });
+
+  it("yolo 首轮注入 Yolo on，驻留零注入，yolo->build 注入 build 公告", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-factory-"));
+    const pi = makePi(dir);
+    factory(pi as never);
+    const event = { type: "before_agent_start", prompt: "hi", systemPrompt: "BASE", systemPromptOptions: {} };
+    // build 首轮不注入
+    expect(await pi.emit("before_agent_start", event, makeCtx(dir))).toBeUndefined();
+    // 切 yolo
+    const ctxYolo = makeCtx(dir, { hasUI: true, ui: { notify: () => {}, select: async () => "y: confirm yolo", setStatus: () => {} } });
+    await pi.commands.get("yolo")!.handler("", ctxYolo as never);
+    const firstYolo = await pi.emit("before_agent_start", event, ctxYolo);
+    expect(firstYolo).toMatchObject({ systemPrompt: expect.stringContaining("Yolo on: prompts bypassed") });
+    // 驻留 yolo 第二轮不注入
+    expect(await pi.emit("before_agent_start", event, ctxYolo)).toBeUndefined();
+    // 切回 build 首轮注入 build 公告
+    await pi.commands.get("build")!.handler("", ctxYolo as never);
+    const firstBuild = await pi.emit("before_agent_start", event, ctxYolo);
+    expect(firstBuild).toMatchObject({ systemPrompt: expect.stringContaining("Plan mode off. Normal permission checks restored.") });
+    // build 常态不注入
+    expect(await pi.emit("before_agent_start", event, ctxYolo)).toBeUndefined();
+  });
+
+  it("yolo 下敏感文件 deny 且 terminate:false（可继续）", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-factory-"));
+    fs.writeFileSync(path.join(dir, ".env"), "KEY=1");
+    const pi = makePi(dir);
+    factory(pi as never);
+    const ctxYolo = makeCtx(dir, { hasUI: true, ui: { notify: () => {}, select: async () => "y: confirm yolo", setStatus: () => {} } });
+    await pi.commands.get("yolo")!.handler("", ctxYolo as never);
+    const result = await pi.emit("tool_call", {
+      type: "tool_call",
+      toolCallId: "y1",
+      toolName: "read",
+      input: { path: ".env" },
+    }, ctxYolo) as { block: boolean; reason: string; terminate?: boolean };
+    expect(result.block).toBe(true);
+    expect(result.terminate).toBe(false);
+    expect(result.reason).toMatch(/Sensitive file blocked/);
+    // yolo 下非敏感写放行
+    const ok = await pi.emit("tool_call", {
+      type: "tool_call",
+      toolCallId: "y2",
+      toolName: "bash",
+      input: { command: "rm -rf /tmp/x" },
+    }, ctxYolo);
+    expect(ok).toBeUndefined();
+  });
+
+  it("yolo 模式状态栏显示 Yolo（warning 色）", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-factory-"));
+    const statuses = new Map<string, string>();
+    const pi = makePi(dir);
+    factory(pi as never);
+    const ctx = makeCtx(dir, { hasUI: true, ui: { notify: () => {}, select: async () => "y: confirm yolo", setStatus: (k: string, v: string) => statuses.set(k, v) } });
+    await pi.commands.get("yolo")!.handler("", ctx as never);
+    expect(statuses.get("pi-permission-mode")).toBe("Yolo");
+    // yolo->plan 切换恢复只读工具集语义可在 decision 层验证，此处仅验状态
+    await pi.commands.get("plan")!.handler("", ctx as never);
+    expect(statuses.get("pi-permission-mode")).toBe("Plan");
   });
 });

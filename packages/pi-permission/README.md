@@ -26,14 +26,17 @@ pi install npm:@inobit/pi-permission
 ```
 /plan   进入只读规划模式（写操作拒绝，状态栏显示 Plan）
 /build  回到正常模式（Build）
+/yolo   进入 yolo 模式（彻底放行但敏感文件仍拦，需二次确认，状态栏显示 Yolo）
 /readonly-tools   管理 plan 模式只读工具（空格多选，session/project/global 三级）
 ```
 
-- 默认 build 模式，会话级、不持久化（重启回到 build）
+- 默认 build 模式，会话级、不持久化（重启回到 build），`yolo` 需 `y: confirm yolo` 二次确认，无快捷键
 - **切换快捷键**：`Alt+P` 在 plan/build 之间循环切换（可在 `toggleModeShortcut` 配置中改为其他键位，空字符串禁用，键位格式见 pi [keybindings](https://pi.dev/docs/keybindings)）
 - 状态栏：`Plan` 绿 / `Build` 红（主题色），键名 `pi-permission-mode`
 
 ## 判定优先级（从高到低）
+
+**yolo 模式**：敏感文件 → deny（`terminate:false`，`Sensitive file blocked` 引导走 `.example`/占位符）；其余全部 → allow（`rule:"yolo"`，含 `fail-closed`/`curl|sh`/危险操作均放行）
 
 **plan 模式**（不分 cwd 内外）：敏感操作 → deny；非豁免的写（写目标不在 trusted 下，含敏感文件写）→ deny；敏感文件 → ask；trusted 路径（如 `/tmp`）读写 → allow；read 白名单 → allow；其他 → ask（`strictPlanMode` 时 deny）
 

@@ -23,7 +23,7 @@ export interface Decision {
   details?: string[];
 }
 
-export type WorkMode = "build" | "plan";
+export type WorkMode = "build" | "plan" | "yolo";
 
 export interface ToolDecisionRequest {
   mode: WorkMode;
@@ -108,6 +108,15 @@ export function decideToolRequest(req: ToolDecisionRequest): Decision {
   const paths = extractPaths(toolName, input);
   const readTool = isReadTool(toolName, config);
   const writeTool = isWriteTool(toolName);
+
+  // yolo：彻底放行但敏感文件仍 deny（FR-1）
+  if (mode === "yolo") {
+    const sensitive = sensitiveDecision(paths, cwd, config, readTool ? paths : [], label);
+    if (sensitive) {
+      return { action: "deny", rule: "FR-1", reason: `${label} sensitive file access requires confirmation`, details: [...(sensitive.details ?? []), `tool:${toolName}`] };
+    }
+    return { action: "allow", rule: "yolo", reason: `[yolo] yolo mode, all operations allowed` };
+  }
 
   if (mode === "plan") {
     // 1. 内置 write/edit 明确 deny（固定，不受 strictPlanMode 影响）
@@ -200,6 +209,27 @@ export function decideBashRequest(req: BashDecisionRequest): Decision {
   const { mode, config, cwd, command } = req;
   const label = "[bash]";
   const parsed = parseBashCommand(command);
+
+  // yolo：彻底放行但敏感文件仍 deny（跳过 fail-closed / 管道等检查）
+  if (mode === "yolo") {
+    // 敏感文件检查仍需解析后的段信息
+    const yoloSensitive = (() => {
+      for (let i = 0; i < parsed.segments.length; i++) {
+        const seg = parsed.segments[i]!;
+        const segCwd = resolveSegmentCwds(parsed.segments, cwd)[i] ?? cwd;
+        const readRefs = collectReadRefs(seg);
+        const writeTargets = collectWriteTargets(seg);
+        const hit = sensitiveDecision([...readRefs, ...writeTargets], segCwd, config, readRefs, label);
+        if (hit) return hit;
+      }
+      return undefined;
+    })();
+    if (yoloSensitive) {
+      return { action: "deny", rule: "FR-1", reason: yoloSensitive.reason, details: [...(yoloSensitive.details ?? []), bashDetail(command)] };
+    }
+    // 即使含复杂语法/管道也放行（yolo bypass）
+    return { action: "allow", rule: "yolo", reason: `[yolo] yolo mode, all operations allowed` };
+  }
 
   // FR-7 fail-closed：语法无法解析 / 含复杂语法 → build=ask、plan=deny
   if (parsed.parseError) return failClosed(mode, label, "unparseable command syntax", command);

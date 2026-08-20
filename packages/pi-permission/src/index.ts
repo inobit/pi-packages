@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { getAgentDir, loadConfig, type PermissionConfig } from "./config.ts";
 import { decideBashRequest, decideToolRequest, type Decision, type WorkMode } from "./decision.ts";
-import { BUILD_SWITCH_NOTICE, ModeStore, PLAN_SYSTEM_PROMPT, registerModeCommands, sessionKey, statusText } from "./mode.ts";
+import { BUILD_SWITCH_NOTICE, ModeStore, PLAN_SYSTEM_PROMPT, registerModeCommands, sessionKey, statusText, YOLO_SWITCH_NOTICE } from "./mode.ts";
 import { registerToolsCommand } from "./tools.ts";
 import { createConfirmer, type Confirmer } from "./ui.ts";
 import { createAuditor, type Auditor } from "./audit.ts";
@@ -226,8 +226,12 @@ export default function (pi: ExtensionAPI) {
       if (mode === "plan") {
         return { systemPrompt: `${event.systemPrompt}\n\n${PLAN_SYSTEM_PROMPT}` };
       }
-      // 刚切回 build：显式撤销只读约束（一次），避免模型延续 plan 行为；build 常态不注入
-      if (prev === "plan") {
+      // yolo 仅切入首轮注入一次（首轮即 yolo 也算 build->yolo 的切入），驻留期零注入
+      if (mode === "yolo" && prev !== "yolo") {
+        return { systemPrompt: `${event.systemPrompt}\n\n${YOLO_SWITCH_NOTICE}` };
+      }
+      // 切回 build：plan->build 与 yolo->build 统一用同一句精简公告
+      if (mode === "build" && prev !== "build") {
         return { systemPrompt: `${event.systemPrompt}\n\n${BUILD_SWITCH_NOTICE}` };
       }
       return undefined;
