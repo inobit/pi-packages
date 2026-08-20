@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.7] - 2026-08-20
+
+### 优化
+
+- **deny 提示词分流**：`src/index.ts` 的 `denyFeedback` 由统一 `Permission was/by user denied. Do not retry this operation.`（`terminate:true`）改为按规则分流，正确性优先、精简次之：
+  - `FR-1` 敏感文件 → `terminate:false`，`Sensitive file blocked: "${p}". Do not retry this file. Use .example, placeholders, or ask the user, and continue the task.`（引导走替代路径，不终止任务，为后续 yolo 复用）
+  - `FR-7` fail-closed（`rule===FR-7` 或 `reason` 含 `fail-closed`）→ `terminate:false`，`Command too complex to verify. Do not retry as-is. Split into single steps, avoid $(...), `( )`, and rewrite with simpler tool calls.`（引导拆解复杂读命令）
+  - `FR-8` plan 只读（`mode===plan` 且 `reason` 含 `plan mode`）→ `terminate:true`，`Plan is read-only — writes blocked. Gather info with read-only tools or ask to run /build.`
+  - 兜底 → `terminate:true`，`Permission denied (${rule}). Do not retry the same operation; try a simpler approach.`
+- 同步更新 `test/index.test.ts` 对应断言（`Do not retry` → `Plan is read-only` / `Permission denied` + `try a simpler approach`），全量 137 用例通过。
+
 ## [0.2.6] - 2026-08-20
 
 ### 变更

@@ -158,18 +158,41 @@ export default function (pi: ExtensionAPI) {
 
       if (decision.action === "allow") return undefined;
 
-      // 拒绝反馈（给模型）：明确"已拒绝、勿重试"，避免模型把 deny 当成"可批准，重试等确认"。
-      // 保持极简，不含原因描述/规则编号（原因仅供人/日志）
-      const denyFeedback = (origin: string): { block: true; reason: string; terminate: true } => ({
-        block: true,
-        reason: `[pi-permission] Permission ${origin} denied. Do not retry this operation.`,
-        terminate: true,
-      });
+      // 拒绝反馈（给模型）：按规则分流，可重试的场景 terminate:false 并引导替代/简化
+      const denyFeedback = (decision: Decision, _origin: string): { block: true; reason: string; terminate: boolean } => {
+        if (decision.rule === "FR-1") {
+          const p = decision.details?.[0] ?? "sensitive file";
+          return {
+            block: true,
+            reason: `[pi-permission] Sensitive file blocked: "${p}". Do not retry this file. Use .example, placeholders, or ask the user, and continue the task.`,
+            terminate: false,
+          };
+        }
+        if (decision.rule === "FR-7" || decision.reason.includes("fail-closed")) {
+          return {
+            block: true,
+            reason: `[pi-permission] Command too complex to verify. Do not retry as-is. Split into single steps, avoid $(...), \`( )\`, and rewrite with simpler tool calls.`,
+            terminate: false,
+          };
+        }
+        if (decision.rule === "FR-8" && decision.reason.includes("plan mode")) {
+          return {
+            block: true,
+            reason: `[pi-permission] Plan is read-only — writes blocked. Gather info with read-only tools or ask to run /build.`,
+            terminate: true,
+          };
+        }
+        return {
+          block: true,
+          reason: `[pi-permission] Permission denied (${decision.rule}). Do not retry the same operation; try a simpler approach.`,
+          terminate: true,
+        };
+      };
 
       if (decision.action === "deny") {
         auditor.review({ mode, toolName, rule: decision.rule, action: "deny", reason: decision.reason, details: decision.details, sessionId: key });
         if (ctx.hasUI) ctx.ui.notify(`[pi-permission] denied: ${decision.reason}`, "warning");
-        return denyFeedback("was");
+        return denyFeedback(decision, "was");
       }
 
       // ask：检查会话级批准，未批准则弹窗
@@ -187,7 +210,7 @@ export default function (pi: ExtensionAPI) {
         return undefined;
       }
       auditor.review({ mode, toolName, rule: decision.rule, action: "deny", reason: decision.reason, details: decision.details, sessionId: key });
-      return denyFeedback("by user");
+      return denyFeedback(decision, "by user");
     } catch {
       // FR-7：插件自身异常不拦截，降级为放行
       return undefined;

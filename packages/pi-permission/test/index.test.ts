@@ -156,9 +156,10 @@ describe("index.ts 工厂装配", () => {
       toolName: "write",
       input: { path: path.join(dir, "x.txt"), content: "x" },
     };
-    const result = await pi.emit("tool_call", event, ctx);
+    const result = await pi.emit("tool_call", event, ctx) as { block: boolean; reason: string; terminate?: boolean };
     expect(result).toMatchObject({ block: true });
-    expect(String((result as { reason?: string }).reason)).toMatch(/Do not retry/);
+    expect(result.terminate).toBe(true);
+    expect(result.reason).toMatch(/Plan is read-only/);
   });
 
   it("plan 模式注入只读系统提示", async () => {
@@ -403,7 +404,8 @@ describe("index.ts 工厂装配", () => {
     }, ctx) as { block: boolean; reason: string; terminate?: boolean };
     expect(result.block).toBe(true);
     expect(result.terminate).toBe(true);
-    expect(result.reason).toMatch(/Do not retry this operation/);
+    expect(result.reason).toMatch(/Permission denied/);
+    expect(result.reason).toMatch(/try a simpler approach/);
   });
 
   it("直接 deny 同样带勿重试反馈", async () => {
@@ -420,7 +422,7 @@ describe("index.ts 工厂装配", () => {
       input: { command: "git commit" },
     }, ctx) as { block: boolean; reason: string; terminate?: boolean };
     expect(result.block).toBe(true);
-    expect(result.reason).toMatch(/Permission was denied/);
-    expect(result.reason).toMatch(/Do not retry/);
+    expect(result.terminate).toBe(true);
+    expect(result.reason).toMatch(/Plan is read-only/);
   });
 });
