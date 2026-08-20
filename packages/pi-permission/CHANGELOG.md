@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.1] - 2026-08-20
+
+### 修复
+
+- 同步 `AGENTS.md` 的 `yolo` 优先级/模块/状态栏与 `deny` 分流说明；`decision.ts` 的 `yolo` 分支复用 `resolveSegmentCwds` 缓存，避免每轮重算（145 用例通过）。
+
 ## [0.3.0] - 2026-08-20
 
 ### 新增
