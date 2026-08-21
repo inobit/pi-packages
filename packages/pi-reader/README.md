@@ -1,64 +1,66 @@
 # @inobit/pi-reader
 
-Pi `fullscreen` 的 Vim 风格阅读模式：按 `alt+o` 进入只读并把 `transcript` 工具输出自动展开，`ctrl-u/d/f/b`、`gg/G`、`j/k` 翻页，退出后恢复 `emacs` 编辑与折叠。
+**English** | [中文](./README.zh-CN.md)
 
-- **单键切换 + 自动展开**：`alt+o`（`TUI inputListener` 拦截，可在 `extensions/pi-reader/config.json` 中改 `toggleKey`）→ `READING` 并自动展开工具输出；退出恢复折叠
-- **零侵入编辑**：`INSERT` 态完全透传，`READING` 态才拦截；默认 `ctrl+u = deleteToLineStart` 零回归
-- **精准复刻 Pi 滚动**：`half = viewportHeight/2`、`page = viewportHeight-1`（`OVERLAP=1`），与 `TuiAltScreen` 一致
-- **高可靠事件路由**：按键走 `TUI inputListener` 拦截，阅读态吞键、`INSERT` 透传；`ctx` 在多会话事件中刷新，确保 `resume` 旧会话可用
+Vim-style reading mode for Pi `fullscreen`: press `alt+o` to enter read-only and auto-expand `transcript` tool outputs, `ctrl-u/d/f/b`, `gg/G`, `j/k` to scroll, exit to restore `emacs` editing and collapsed tools.
 
-## 安装
+- **Single-key toggle + auto-expand**: `alt+o` (intercepted via `TUI inputListener`, remappable via `toggleKey` in `extensions/pi-reader/config.json`) → `READING` with auto-expanded tool outputs; collapsed state is restored on exit
+- **Zero-intrusion editing**: fully passthrough in `INSERT`, keys intercepted only in `READING`; `ctrl+u = deleteToLineStart` by default with zero regressions
+- **Pixel-perfect Pi scrolling**: `half = viewportHeight/2`, `page = viewportHeight-1` (`OVERLAP=1`), matching `TuiAltScreen`
+- **Robust event routing**: keys go through `TUI inputListener` — reading mode swallows keys, `INSERT` passes through; `ctx` is refreshed across multi-session events so `resume` on old sessions works
+
+## Installation
 
 ```bash
 pi install npm:@inobit/pi-reader
 ```
 
-本地调试：
+Local dev:
 
 ```bash
 pi --tui-mode fullscreen -e ./packages/pi-reader/src/index.ts
 ```
 
-> 仅 `fullscreen` 可滚动；`regular` 下 `scrollBy` 无视口，扩展静默忽略。
+> Only `fullscreen` is scrollable; in `regular` mode `scrollBy` has no viewport and the extension silently ignores it.
 
-## 按键表
+## Key Bindings
 
-| 作用                   | 按键                                        | 说明                                                                               |
-| ---------------------- | ------------------------------------------- | ---------------------------------------------------------------------------------- |
-| **进入/退出阅读**      | `alt+o` / `/reader` / `/scroll`（复按即退） | 默认 `alt+o`，`config.json` 中 `toggleKey` 可改（如 `ctrl+o`），`?` 弹窗显示生效键 |
-| **退出**               | `esc` / `i` / `ctrl+c`                      | 阅读态 `esc`/`i`/`ctrl+c` 退（`ctrl+c` 不清屏），`i` 不落入输入                    |
-| **帮助**               | `?`                                         | 仅 READING 可用，弹出英文快捷键说明，`esc` 关闭                                    |
-| **半页上 / 下**        | `ctrl+u` / `ctrl+d`                         | `scrollBy(∓half)`；编辑态 `ctrl+u` 仍删行                                          |
-| **整页下 / 上**        | `ctrl+f` / `ctrl+b`                         | `scrollBy(±page)`                                                                  |
-| **行下 / 行上**        | `j` / `k` + `ctrl+n` / `ctrl+p`             | `scrollBy(±1)`                                                                     |
-| **顶部**               | `g g`                                       | 300ms 内双 `g`（含同批连发的 `gg`）→ `scrollToTop()`                               |
-| **底部**               | `G` (`shift+g`)                             | `scrollToBottom()`，跟随输出                                                       |
-| **手动展开（编辑态）** | `alt+o`（`keybindings.json` 可改）          | 因 `ctrl+o` 被阅读占用，`app.tools.expand` 重绑到 `alt+o`                          |
+| Action | Key | Notes |
+| --- | --- | --- |
+| **Toggle reading** | `alt+o` / `/reader` / `/scroll` (toggle) | Default `alt+o`, remappable via `toggleKey` in `config.json` (e.g. `ctrl+o`); effective key is shown in the `?` popup |
+| **Exit** | `esc` / `i` / `ctrl+c` | `esc`/`i`/`ctrl+c` in reading mode (`ctrl+c` does not clear screen), `i` does not leak into input |
+| **Help** | `?` | Only in READING — shows English shortcut reference, `esc` to close |
+| **Half page up / down** | `ctrl+u` / `ctrl+d` | `scrollBy(∓half)`; `ctrl+u` still deletes to line start in edit mode |
+| **Page down / up** | `ctrl+f` / `ctrl+b` | `scrollBy(±page)` |
+| **Line down / up** | `j` / `k` + `ctrl+n` / `ctrl+p` | `scrollBy(±1)` |
+| **Top** | `g g` | Double `g` within 300ms (including batched `gg`) → `scrollToTop()` |
+| **Bottom** | `G` (`shift+g`) | `scrollToBottom()`, follows output |
+| **Manual expand (edit mode)** | `alt+o` (remappable in `keybindings.json`) | Since `ctrl+o` is taken by reading mode, `app.tools.expand` is rebound to `alt+o` |
 
-## 配置
+## Configuration
 
-- 阅读切换：`extensions/pi-reader/config.json`（`config.json` 已 `gitignore`）
+- Reading toggle: `extensions/pi-reader/config.json` (`config.json` is `gitignore`d)
   ```json
   { "toggleKey": "alt+o" }
   ```
-  默认 `alt+o`，与 `app.tools.expand` 错开；`?` 弹窗显示生效键
-- 工具展开：`~/.pi/agent/keybindings.json`
+  Default `alt+o`, kept separate from `app.tools.expand`; `?` popup shows the effective key.
+- Tool expand: `~/.pi/agent/keybindings.json`
   ```json
   { "app.tools.expand": "alt+o" }
   ```
 
-## 行为
+## Behavior
 
-- **只读**：阅读态吞掉可打印键（`INSERT` 透传），输入栏隐藏为居左 `◉ Reading`（无边框，完全覆盖原位置），原输入保留，退出恢复
-- **指示**：`?` 在 READING 弹出英文帮助（`Esc` 关闭，标题非全大写、主题字符边框居中）
-- **恢复**：退出清理 `gg` 缓冲，恢复输入与工具折叠（工具展开/收起 异步，不阻塞首帧）
+- **Read-only**: printable keys are swallowed in reading mode (`INSERT` passes through), the input bar is hidden behind a left-aligned `◉ Reading` overlay (borderless, fully covers the original position), original input is preserved and restored on exit
+- **Indicator**: `?` in READING shows the English help overlay (`Esc` to close, title not uppercased, themed character border, centered)
+- **Restore**: clears the `gg` buffer on exit, restores input and tool collapse state (tool expand/collapse is async and does not block the first frame)
 
-## 兼容与限制
+## Compatibility & Limitations
 
-- **键协议**：兼容传统控制符与 `Kitty` 协议
-- 鼠标滚轮/触板、手选复制、`ctrl+shift+f` 搜索在 fullscreen 下仍透传
+- **Key protocol**: compatible with legacy control sequences and `Kitty` keyboard protocol
+- Mouse wheel / trackpad, text selection + copy, and `ctrl+shift+f` search still pass through in fullscreen
 
-## 开发
+## Development
 
 ```bash
 pnpm --filter @inobit/pi-reader check

@@ -1,34 +1,36 @@
 # @inobit/pi-themes
 
-一套精选的 [Pi coding agent](https://pi.dev) 主题包，内置两族主题，各含**亮色 + 暗色**变体，配合 pi 的 `theme: "亮/暗"` 配对语法可跟随终端配色自动切换（与内置 `light/dark` 同一机制）。
+**English** | [中文](./README.zh-CN.md)
 
-## 主题
+A curated theme pack for [Pi coding agent](https://pi.dev) with two families, each shipping **light + dark** variants. Pair them with Pi's `theme: "light/dark"` syntax to follow the terminal color scheme automatically (same mechanism as the built-in `light/dark`).
 
-| 主题名 | 变体 | 配色来源 |
-| ------ | ---- | -------- |
-| `rosepine` | 暗色（Rosé Pine main） | [rose-pine](https://rosepinetheme.com/palette/) + opencode 内置 rosepine 主题 |
-| `rosepine-dawn` | 亮色（Rosé Pine dawn） | 同上 |
-| `tokyonight` | 暗色（night 变体） | [folke/tokyonight.nvim](https://github.com/folke/tokyonight.nvim) |
-| `tokyonight-day` | 亮色（day 变体） | 同上 |
+## Themes
 
-## 安装
+| Theme | Variant | Palette source |
+| --- | --- | --- |
+| `rosepine` | Dark (Rosé Pine main) | [rose-pine](https://rosepinetheme.com/palette/) + opencode's built-in rosepine theme |
+| `rosepine-dawn` | Light (Rosé Pine dawn) | Same as above |
+| `tokyonight` | Dark (night variant) | [folke/tokyonight.nvim](https://github.com/folke/tokyonight.nvim) |
+| `tokyonight-day` | Light (day variant) | Same as above |
+
+## Installation
 
 ```bash
 pi install npm:@inobit/pi-themes
 ```
 
-安装后四个主题进入 `/settings` 的主题列表，可直接选用。
+After installation, all four themes appear in the `/settings` theme list.
 
-## 启用
+## Usage
 
-**固定使用某个主题**：
+**Pin to a single theme**:
 
 ```bash
-# 在 /settings 里选，或 settings.json 写入
+# Pick in /settings, or write to settings.json
 "theme": "rosepine-dawn"
 ```
 
-**亮/暗自动切换（跟随终端配色）**：把 `theme` 设置成配对字符串，斜杠左侧是亮色、右侧是暗色：
+**Auto-switch with terminal scheme**: set `theme` to a paired string — left of the slash is the light theme, right is the dark theme:
 
 ```jsonc
 // settings.json
@@ -44,14 +46,18 @@ pi install npm:@inobit/pi-themes
 }
 ```
 
-也可在 `/settings` 里直接选择配对项。pi 检测终端为暗色时用右侧主题、亮色时用左侧主题，终端切换配色时实时跟随。
+You can also pick the paired entry directly in `/settings`. Pi uses the right-hand theme when the terminal is dark and the left-hand theme when it is light, updating live as the terminal scheme changes.
 
-> 提示：不想为某个终端配色配定制主题时，可直接对内置主题取用，例如 `"theme": "rosepine-dawn/dark"`。
+> Tip: to avoid customizing a theme for one side, mix with a built-in, e.g. `"theme": "rosepine-dawn/dark"`.
 
-## 调整
+## Customization
 
-编辑主题文件后 pi 自动热重载，所见即所得。主题格式与全部颜色 token 见 pi 官方 [Themes](https://pi.dev/docs/themes) 文档。
+Pi hot-reloads theme files on edit for instant feedback. See Pi's official [Themes](https://pi.dev/docs/themes) docs for the theme format and all color tokens.
 
-## 致谢
+## Credits
 
-- 配色语义遵循 [Rosé Pine](https://rosepinetheme.com/palette/)（dawn/main 变体）与 [folke/tokyonight.nvim](https://github.com/folke/tokyonight.nvim)（day/night 变体）的原生设计。
+- Palette semantics follow the original designs of [Rosé Pine](https://rosepinetheme.com/palette/) (dawn/main) and [folke/tokyonight.nvim](https://github.com/folke/tokyonight.nvim) (day/night).
+
+## License
+
+MIT

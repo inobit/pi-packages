@@ -1,34 +1,36 @@
 # @inobit/pi-packages
 
-Pi coding agent 扩展包的 monorepo（pnpm workspace）。面向 `@earendil-works/pi-coding-agent` 0.84.2+，扩展经 jiti 直载、无需编译。
+**English** | [中文](./README.zh-CN.md)
 
-## 包列表
+A pnpm workspace monorepo of extensions for [Pi coding agent](https://pi.dev). Targets `@earendil-works/pi-coding-agent` 0.84.2+, loaded directly via jiti — no build step.
 
-| 包 | 说明 |
-| -- | ---- |
-| [`@inobit/pi-permission`](packages/pi-permission) | 轻量权限控制扩展：敏感文件保护 / 项目边界读写区分 / 敏感操作确认 / plan-build 只读模式 |
-| [`@inobit/pi-reader`](packages/pi-reader) | 阅读模式扩展：`alt+o` 切换只读、 Vim 风格翻页（`ctrl-u/d/f/b` `gg/G` `j/k`）、`?` 帮助 |
-| [`@inobit/pi-todo`](packages/pi-todo) | 最小侵入任务清单扩展：`todo` 工具 + `/todos` 命令 + 编辑器上方常驻面板，状态存会话分支可重放 |
-| [`@inobit/pi-themes`](packages/pi-themes) | 精选主题包：Rosé Pine / TokyoNight 两族亮暗主题，支持 `theme: "亮/暗"` 配对自动切换 |
+## Packages
 
-各包安装、配置、使用详见其 README（上表链接）。
+| Package | Description |
+| -- | --- |
+| [`@inobit/pi-permission`](packages/pi-permission) | Lightweight permission control: sensitive file protection / project-boundary read-write separation / dangerous operation confirmation / plan-build read-only mode |
+| [`@inobit/pi-reader`](packages/pi-reader) | Reading mode: `alt+o` to toggle read-only, Vim-style paging (`ctrl-u/d/f/b` `gg/G` `j/k`), `?` help |
+| [`@inobit/pi-todo`](packages/pi-todo) | Minimal-intrusion task list: `todo` tool + `/todos` command + persistent panel above the editor, state stored on the session branch and replayable |
+| [`@inobit/pi-themes`](packages/pi-themes) | Curated themes: Rosé Pine / TokyoNight families, each with light & dark variants supporting `theme: "light/dark"` paired auto-switching |
 
-## 环境要求
+See each package's README (links above) for installation, configuration, and usage.
 
-| 项 | 版本 |
-| -- | ---- |
+## Requirements
+
+| Item | Version |
+| -- | --- |
 | Node.js | >=24 |
-| pnpm | 11.22.0（`packageManager` 锁定） |
+| pnpm | 11.22.0 (locked via `packageManager`) |
 | Pi coding agent | 0.84.2+ |
 
-## 开发
+## Development
 
 ```bash
-pnpm install                # 安装依赖
-pnpm check                  # 全仓类型检查（= pnpm -r run check）
-pnpm test                   # 全仓测试（= pnpm -r run test）
-pnpm --filter <pkg> test    # 单包测试（如 --filter @inobit/pi-permission）
-pnpm --filter <pkg> pack:check   # 检查发布 tarball
+pnpm install                # install dependencies
+pnpm check                  # type-check entire workspace (= pnpm -r run check)
+pnpm test                   # run all tests (= pnpm -r run test)
+pnpm --filter <pkg> test    # single package (e.g. --filter @inobit/pi-permission)
+pnpm --filter <pkg> pack:check   # verify publish tarball
 ```
 
 ## License
