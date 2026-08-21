@@ -2,108 +2,108 @@
 
 ## [0.3.1] - 2026-08-20
 
-### 修复
+### Fixed
 
-- 同步 `AGENTS.md` 的 `yolo` 优先级/模块/状态栏与 `deny` 分流说明；`decision.ts` 的 `yolo` 分支复用 `resolveSegmentCwds` 缓存，避免每轮重算（145 用例通过）。
+- Sync `AGENTS.md` for `yolo` priority/module/status bar and deny routing docs; reuse `resolveSegmentCwds` cache in `decision.ts` yolo branch to avoid per-turn recomputation (145 tests passing).
 
 ## [0.3.0] - 2026-08-20
 
-### 新增
+### Added
 
-- **yolo 模式**：新增 `/yolo` 命令（`yolo` = 彻底放行但敏感文件仍拦）。需 UI 二次确认 `y: confirm yolo`，无快捷键，会话级不持久化。
-  - 判定：`yolo` 下敏感文件 `FR-1` 仍 `deny`（`terminate:false`，复用 0.2.7 的 `Sensitive file blocked` 引导，不终止任务），其余 `FR-3/FR-4/FR-5/FR-7/FR-8/FR-9` 及 `fail-closed` 全部 `allow rule:"yolo"`（含 `$(...)`/subshell/`curl|sh` 等）。
-  - 注入（方案 B）：`plan` 每轮注入 `PLAN_SYSTEM_PROMPT`；`yolo` 仅切入首轮注入 `YOLO_SWITCH_NOTICE`（`Yolo on: prompts bypassed, sensitive files still blocked...`），驻留零注入；`build` 首轮零注入，`plan->build` 与 `yolo->build` 统一 `BUILD_SWITCH_NOTICE`（精简为 `Plan mode off. Normal permission checks restored.`）。
-  - 状态栏：`Yolo` 橙色 `warning`（`Build` 红 / `Plan` 绿），键 `pi-permission-mode`。
-  - `ModeStore` 将 `yolo` 视为与 `build` 同组，`plan<->yolo` 自动恢复/保存写工具。
-- **提示词精简**：`PLAN_SYSTEM_PROMPT` 精简为 `You are in PLAN mode — read-only...`，`BUILD_SWITCH_NOTICE` 精简为 `Plan mode off...`，`deny` 分流已在 0.2.7 完成。
+- **Yolo mode**: new `/yolo` command (`yolo` = fully permissive except sensitive files still blocked). Requires second confirmation `y: confirm yolo` in UI, no shortcut, session-scoped and non-persistent.
+  - Decision: under `yolo`, sensitive files `FR-1` still `deny` (`terminate:false`, reuses `Sensitive file blocked` guidance from 0.2.7 without terminating the task), all other `FR-3/FR-4/FR-5/FR-7/FR-8/FR-9` and `fail-closed` are `allow rule:"yolo"` (including `$(...)`/subshell/`curl|sh` etc.).
+  - Injection (Option B): `plan` injects `PLAN_SYSTEM_PROMPT` every turn; `yolo` injects `YOLO_SWITCH_NOTICE` (`Yolo on: prompts bypassed, sensitive files still blocked...`) only on entry, zero injection while resident; `build` has zero injection on first turn, both `plan->build` and `yolo->build` unify to `BUILD_SWITCH_NOTICE` (trimmed to `Plan mode off. Normal permission checks restored.`).
+  - Status bar: `Yolo` orange `warning` (`Build` red / `Plan` green), key `pi-permission-mode`.
+  - `ModeStore` treats `yolo` as same group as `build`, auto save/restore write tools on `plan<->yolo`.
+- **Prompt trimming**: `PLAN_SYSTEM_PROMPT` trimmed to `You are in PLAN mode — read-only...`, `BUILD_SWITCH_NOTICE` trimmed to `Plan mode off...`, deny routing completed in 0.2.7.
 
 ## [0.2.7] - 2026-08-20
 
-### 优化
+### Improved
 
-- **deny 提示词分流**：`src/index.ts` 的 `denyFeedback` 由统一 `Permission was/by user denied. Do not retry this operation.`（`terminate:true`）改为按规则分流，正确性优先、精简次之：
-  - `FR-1` 敏感文件 → `terminate:false`，`Sensitive file blocked: "${p}". Do not retry this file. Use .example, placeholders, or ask the user, and continue the task.`（引导走替代路径，不终止任务，为后续 yolo 复用）
-  - `FR-7` fail-closed（`rule===FR-7` 或 `reason` 含 `fail-closed`）→ `terminate:false`，`Command too complex to verify. Do not retry as-is. Split into single steps, avoid $(...), `( )`, and rewrite with simpler tool calls.`（引导拆解复杂读命令）
-  - `FR-8` plan 只读（`mode===plan` 且 `reason` 含 `plan mode`）→ `terminate:true`，`Plan is read-only — writes blocked. Gather info with read-only tools or ask to run /build.`
-  - 兜底 → `terminate:true`，`Permission denied (${rule}). Do not retry the same operation; try a simpler approach.`
-- 同步更新 `test/index.test.ts` 对应断言（`Do not retry` → `Plan is read-only` / `Permission denied` + `try a simpler approach`），全量 137 用例通过。
+- **Deny feedback routing**: `src/index.ts` `denyFeedback` changed from unified `Permission was/by user denied. Do not retry this operation.` (`terminate:true`) to rule-based routing, correctness first, brevity second:
+  - `FR-1` sensitive file → `terminate:false`, `Sensitive file blocked: "${p}". Do not retry this file. Use .example, placeholders, or ask the user, and continue the task.` (guides to alternative path without terminating the task, reusable for yolo)
+  - `FR-7` fail-closed (`rule===FR-7` or `reason` contains `fail-closed`) → `terminate:false`, `Command too complex to verify. Do not retry as-is. Split into single steps, avoid $(...), `( )`, and rewrite with simpler tool calls.` (guides to split complex reads)
+  - `FR-8` plan read-only (`mode===plan` and `reason` contains `plan mode`) → `terminate:true`, `Plan is read-only — writes blocked. Gather info with read-only tools or ask to run /build.`
+  - Fallback → `terminate:true`, `Permission denied (${rule}). Do not retry the same operation; try a simpler approach.`
+- Update corresponding assertions in `test/index.test.ts` (`Do not retry` → `Plan is read-only` / `Permission denied` + `try a simpler approach`), all 137 tests passing.
 
 ## [0.2.6] - 2026-08-20
 
-### 变更
+### Changed
 
-- **日志目录更规范**：默认日志目录由 `~/.pi/agent/extensions/pi-permission/logs/<project>/` 调整为 `~/.pi/agent/logs/pi-permission/<project>/`（更规范，与 `pi-debug.log` 同级，扩展目录仅放 `config.json`），`logDir` 默认值由 `"logs"` 改为 `"logs/pi-permission"`（相对 `~/.pi/agent`），支持绝对路径与 `~/` 前缀。
-- `config.ts` 导出 `getAgentDir()`（对齐 pi 核心），`index.ts`/`loadConfig` 的全局配置与日志根均跟随 `PI_CODING_AGENT_DIR`；`audit.ts` 新增 `~/` 展开，`logDir` 为绝对路径时覆盖 `base`。
-- 更新 `config/default.json`、`README.md`、`AGENTS.md` 及测试。
+- **More conventional log directory**: default log directory changed from `~/.pi/agent/extensions/pi-permission/logs/<project>/` to `~/.pi/agent/logs/pi-permission/<project>/` (more conventional, co-located with `pi-debug.log`, extension dir holds only `config.json`), `logDir` default changed from `"logs"` to `"logs/pi-permission"` (relative to `~/.pi/agent`), supports absolute paths and `~/` prefix.
+- `config.ts` now exports `getAgentDir()` (aligned with pi core), global config and log root in `index.ts`/`loadConfig` both follow `PI_CODING_AGENT_DIR`; `audit.ts` adds `~/` expansion, absolute `logDir` overrides `base`.
+- Update `config/default.json`, `README.md`, `AGENTS.md` and tests.
 
 ## [0.2.4] - 2026-08-19
 
-### 修复
+### Fixed
 
-- 修复 `$(` 命令替换的括号深度 off-by-one：`splitTopLevel` 中 `$` 分支先 `parenDepth++`，随后 `(` 分支又 `parenDepth++`，而匹配的 `)` 只 `-1`，导致任何合法闭合的 `$(...)` 结束后深度残留 1 → 误报 `parseError` → fail-closed 提示始终为「unparseable command syntax」。现改为 `$(` 一次性跳过两个字符（深度只 +1），平衡的 `$(...)` 深度归零，命中「command substitution / subshell / complex syntax」分支（决策不变，仍 fail-closed：build=ask、plan=deny）
-- 补充回归测试：`$(...)` 及嵌套 `$(...)` 不再误报 parseError；决策层 reason 断言命中的是复杂语法分支
+- Fix off-by-one paren depth for `$()` command substitution: `splitTopLevel` `$` branch did `parenDepth++` then `(` branch did another `++`, while matching `)` only did `-1`, so any properly closed `$(...)` ended with depth 1 → false `parseError` → fail-closed always reported as "unparseable command syntax". Now `$(` skips both chars at once (depth +1 only), balanced `$(...)` returns to 0 and hits the "command substitution / subshell / complex syntax" branch (decision unchanged, still fail-closed: build=ask, plan=deny).
+- Add regression tests: `$(...)` and nested `$(...)` no longer falsely report parseError; decision-layer reason assertions hit the complex syntax branch.
 
 ## [0.2.3] - 2026-08-19
 
-### 新增
+### Added
 
-- trusted 外部路径赎免（FR-9）：新增配置项 `trustedExternalPaths`（默认 `["/tmp"]`，运行时并入 `os.tmpdir()`）；落在前缀下的外部读写直接放行（临时验证计算场景，普通用户不能删除整个 /tmp：sticky 1777），并入 ARRAY_FIELDS 走 default ∪ global ∪ project 并集。
-  - plan 模式：sensitive 操作 deny → 非赎免写 deny（含敏感文件名写，如 /tmp/.env / .env）→ 敏感文件读 ask → trusted 读写 allow（FR-9）→ read 白名单 → other ask/deny
-  - build 模式：sensitive ask → trusted 赎免（过滤后 externalRefs/externalTargets 为空则放行）→ 剩余外部写 ask → 剩余外部读 read 白名单/ask
-  - realpath 双形态 + 段 cwd 解析防软链逃逸；敏感/危险判定始终优先于 trusted 赎免
+- Trusted external path exemption (FR-9): new config `trustedExternalPaths` (default `["/tmp"]`, merged with `os.tmpdir()` at runtime); reads/writes under the prefix are auto-allowed (for temporary computation validation; normal users cannot delete entire /tmp: sticky 1777), merged via ARRAY_FIELDS as default ∪ global ∪ project union.
+  - Plan mode: dangerous deny → non-exempt write deny (including sensitive file writes like /tmp/.env / .env) → sensitive file read ask → trusted read/write allow (FR-9) → read whitelist → other ask/deny
+  - Build mode: sensitive ask → trusted exemption (allow if filtered externalRefs/externalTargets empty) → remaining external write ask → remaining external read whitelist/ask
+  - Realpath dual-form + segment cwd resolution prevents symlink escapes; sensitive/dangerous checks always precede trusted exemption.
 
 ## [0.2.2] - 2026-08-19
 
-### 新增
+### Added
 
-- plan→build 切换后模型感知修复：`before_agent_start` 记录上次 agent 启动时的模式，从 plan 切到 build 后的首个 turn 注入一次 build 公告（`Plan mode is now disabled. Full tool access is restored; you may modify files and run state-changing commands.`），显式撤销 plan 只读约束，避免模型延续只读行为；build 常态零注入、无上下文累积（参考 @narumiruna/pi-plan-mode 的 handoff 通知模式）
+- Fix model awareness after plan→build switch: `before_agent_start` records the mode at last agent start, and injects a one-time build notice on the first turn after plan→build (`Plan mode is now disabled. Full tool access is restored; you may modify files and run state-changing commands.`), explicitly lifting the plan read-only constraint to prevent the model from staying read-only; build mode has zero injection and no context accumulation (pattern follows @narumiruna/pi-plan-mode handoff notice).
 
 ## [0.2.1] - 2026-08-19
 
-### 修复
+### Fixed
 
-- 修正 FR-3/FR-5 外部路径提示文案歧义：原「not in read whitelist」易被误解为存在路径白名单（实际只有命令/工具级白名单）；改为「\`external path referenced by a non-whitelisted command/tool\`」，FR-5 明确为「\`read-only command/tool whitelist, external path allowed\`」
-- ask 弹窗统一带触发主体展示行：bash 层所有 ask（FR-1 敏感文件 / FR-3 外部读写 / FR-4 危险 / FR-7 fail-closed / FR-8.3 plan 未知）details 尾部追加 \`bash:<command>\` 行，tool 层所有 ask 追加 \`tool:<tool_name>\` 行（空白归一化单行 + 120 字符截断，替换原 \`command: …\` 格式）；路径类详情保持首位，`s` 会话批准仍按路径记忆的粒度
+- Fix FR-3/FR-5 external path messaging ambiguity: original "not in read whitelist" was mistaken for a path whitelist (actual whitelist is only at command/tool level); now "`external path referenced by a non-whitelisted command/tool`", FR-5 clarified as "`read-only command/tool whitelist, external path allowed`".
+- Unify trigger line for all ask dialogs: bash layer appends `bash:<command>` (single-line normalized + 120-char truncation, replaces `command: …` format) to the end of details for all asks (FR-1 sensitive / FR-3 external read-write / FR-4 dangerous / FR-7 fail-closed / FR-8.3 plan unknown), tool layer appends `tool:<tool_name>`; path details stay first, `s` session approval still remembered at path granularity.
 
 ## [0.2.0] - 2026-08-19
 
-### 新增
+### Added
 
-- plan/build 切换快捷键：默认 `Alt+P`，在只读规划模式与正常模式之间循环切换（`registerShortcut` 实现，不占用 TUI 输入键位）
-- 新增配置项 `toggleModeShortcut`（全局 `config.json`）：可自定义快捷键或空字符串禁用，键位格式与 pi 内置键位一致
+- Plan/build toggle shortcut: default `Alt+P` to cycle between read-only planning and normal mode (`registerShortcut`, does not occupy TUI input keys).
+- New config `toggleModeShortcut` (global `config.json`): customizable shortcut or empty string to disable, format follows pi's built-in key bindings.
 
 ## [0.1.2] - 2026-08-19
 
-### 修复
+### Fixed
 
-- 无副作用重定向不再误判为外部写入：`2>/dev/null`、`&>/dev/null`、`2>&1`、`>&2`、`> /dev/null` 及 `tee /dev/null` 等不再触发「writing outside project」确认（纯读命令 `ls ... 2>/dev/null` 曾错误弹窗并列出 `/dev/null`）
-- 位置参数/输入重定向的 `/dev/null` 不再视为外部读引用（`cat < /dev/null`、`tee /dev/null`）
-- 真实外部写入（如 `> /tmp/x`、`2>~/err.log`）仍按 FR-3 拦截，行为不变
-- 补充重定向豁免单元测试与 bash 决策集成回归用例（117 个用例全部通过）
+- Side-effect-free redirects no longer misjudged as external writes: `2>/dev/null`, `&>/dev/null`, `2>&1`, `>&2`, `> /dev/null` and `tee /dev/null` etc. no longer trigger "writing outside project" confirmation (pure reads like `ls ... 2>/dev/null` previously showed a false popup listing `/dev/null`).
+- Positional arg / input redirect `/dev/null` no longer treated as external read refs (`cat < /dev/null`, `tee /dev/null`).
+- Real external writes (e.g. `> /tmp/x`, `2>~/err.log`) still intercepted via FR-3, behavior unchanged.
+- Add redirect exemption unit tests and bash decision integration regression cases (all 117 tests passing).
 
 ## [0.1.1] - 2026-08-19
 
-### 修复
+### Fixed
 
-- 审查日志不再写入项目目录，改到全局扩展目录 `~/.pi/agent/extensions/pi-permission/logs/<project>/`，按项目分目录隔离
-- 对齐 pi 生态日志实践：debug/review 双流分离、字段宽度上限、大小轮转、`extension`/`stream`/`sessionId` 上下文
-- 新增 `debugLog` 配置（默认关），审查日志开关仍为 `reviewLog`
+- Review log no longer written to project directory, moved to global extension directory `~/.pi/agent/extensions/pi-permission/logs/<project>/`, isolated per project.
+- Align with pi ecosystem logging: debug/review dual streams, field width caps, size rotation, `extension`/`stream`/`sessionId` context.
+- Add `debugLog` config (off by default), review log toggle remains `reviewLog`.
 
 ## [0.1.0] - 2026-08-18
 
-### 新增
+### Added
 
-- 轻量权限控制扩展（`@inobit/pi-permission`），pi 0.84.2+，jiti 直载免编译
-- 敏感文件保护（FR-1）：`.env`/`.ssh/*`/`*.pem` 等任何通道读写 ask，realpath 双形态防 symlink 绕过，`.env.example` 读取豁免
-- 项目边界（FR-3）：cwd 外读取走 read 白名单（命中放行、其余 ask），写操作外部 ask
-- 敏感操作确认（FR-4）：`dangerousBashCommands` 统一清单（`git <子命令>` + 危险 shell），wrapper/管道恒敏感
-- plan/build 模式（FR-8）：`/plan` `/build` 命令、状态栏（`Plan` 绿/`Build` 红主题色）、系统提示注入、写工具隐藏
-- `/readonly-tools` 命令：空格多选 readonly tools，session/global 两级，锁定内置工具与 bash/write/edit
-- 自研简化 bash 解析器（引号感知、重定向、git 子命令、wrapper、cd 跟踪、fail-closed）
-- 审查日志（FR-6）：JSONL 0600，敏感键脱敏
-- 106 个 vitest 用例
+- Lightweight permission control extension (`@inobit/pi-permission`), pi 0.84.2+, loaded via jiti without build.
+- Sensitive file protection (FR-1): `.env`/`.ssh/*`/`*.pem` etc. ask on any channel read/write, realpath dual-form prevents symlink bypass, `.env.example` read exempted.
+- Project boundary (FR-3): reads outside cwd go through read whitelist (allow if matched, otherwise ask), external writes ask.
+- Dangerous operation confirmation (FR-4): unified `dangerousBashCommands` list (`git <subcommand>` + dangerous shell), wrappers/pipes always sensitive.
+- Plan/build modes (FR-8): `/plan` `/build` commands, status bar (`Plan` green / `Build` red, theme-aware), system prompt injection, write tool hiding.
+- `/readonly-tools` command: multi-select readonly tools with Space, session/global levels, locks built-ins and bash/write/edit.
+- Custom simplified bash parser (quote-aware, redirects, git subcommands, wrappers, cd tracking, fail-closed).
+- Review log (FR-6): JSONL 0600, sensitive key redaction.
+- 106 vitest cases.
 
-### 配置
+### Config
 
 - `sensitivePatterns` / `envExampleReadAllowed` / `readonlyBashCommands` / `dangerousBashCommands` / `readonlyTools` / `strictPlanMode` / `reviewLog` / `logDir`
-- 全局 `~/.pi/agent/extensions/pi-permission/config.json` 与项目 `.pi/extensions/pi-permission/config.json` 合并
+- Merge global `~/.pi/agent/extensions/pi-permission/config.json` and project `.pi/extensions/pi-permission/config.json`.

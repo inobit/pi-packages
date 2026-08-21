@@ -2,7 +2,7 @@
 
 ## [0.1.0] - 2026-08-19
 
-- 新增两族主题四套：Rosé Pine（`rosepine` 暗 / `rosepine-dawn` 亮）、TokyoNight（`tokyonight` 暗 / `tokyonight-day` 亮）
-- 全部通过 `pi.themes` 声明分发，安装即注册进 `/settings` 主题列表
-- 每族内置一暗一亮，支持 `theme: "亮/暗"` 配对自动切换
-- 配色语义对齐官方：rosepine 取 love/gold/rose/pine/foam/iris 原生色板；tokyonight day/night 取官方 palette 与 treesitter/base highlight 映射
+- Add two families with four themes: Rosé Pine (`rosepine` dark / `rosepine-dawn` light), TokyoNight (`tokyonight` dark / `tokyonight-day` light)
+- Distributed via `pi.themes` declaration, auto-registered in `/settings` theme list after install
+- Each family ships dark + light, supports paired `theme: "light/dark"` auto-switching
+- Palette semantics aligned with upstream: rosepine uses love/gold/rose/pine/foam/iris native palette; tokyonight day/night follows official palette and treesitter/base highlight mapping
