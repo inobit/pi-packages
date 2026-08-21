@@ -54,6 +54,13 @@ pi install npm:@inobit/pi-themes
 
 编辑主题文件后 pi 自动热重载，所见即所得。主题格式与全部颜色 token 见 pi 官方 [Themes](https://pi.dev/docs/themes) 文档。
 
+## 开发
+
+```bash
+pnpm --filter @inobit/pi-themes pack:check   # 检查发布 tarball
+pi -ne -e ./packages/pi-themes
+```
+
 ## 致谢
 
 - 配色语义遵循 [Rosé Pine](https://rosepinetheme.com/palette/)（dawn/main 变体）与 [folke/tokyonight.nvim](https://github.com/folke/tokyonight.nvim)（day/night 变体）的原生设计。

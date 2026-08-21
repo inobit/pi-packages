@@ -25,15 +25,6 @@ Pi coding agent 的最小侵入任务清单扩展。
 
 依赖方向：`index → todo → {schema, state, store, overlay, render}`；状态模块不 import pi 运行时类型（结构类型注入，便于单测）。
 
-## 常用命令
-
-```bash
-pnpm --filter @inobit/pi-todo check   # tsc --noEmit
-pnpm --filter @inobit/pi-todo test    # vitest（state/replay/schema/overlay/render/index）
-pnpm --filter @inobit/pi-todo pack:check  # 发布 tarball 检查
-pi -e ./packages/pi-todo/src/index.ts # 一次性冒烟（免编译直载，不落盘）
-```
-
 ## 包特有约束（改动前必读）
 
 - **侵入性预算**：`promptSnippet` ≤ 60 chars、`promptGuidelines` ≤ 3 条且每条 ≤ 140 chars、`description` ≤ 600 chars、schema 参数 description 合计 ≤ 270 chars（每轮提示词总开销 ≤ ~1.1KB）；新增提示词文案先核算

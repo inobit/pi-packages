@@ -25,15 +25,6 @@
 
 依赖方向：`index.ts → {CustomEditor, ExtensionAPI, ExtensionContext} from pi-coding-agent` + `{Key, matchesKey, truncateToWidth, type TUI} from pi-tui`；无本地子模块。
 
-## 常用命令
-
-```bash
-pnpm --filter @inobit/pi-reader check
-pnpm --filter @inobit/pi-reader test   # parseReadingKey/halfPage/pageStep/GgSequence
-pnpm --filter @inobit/pi-reader pack:check
-pi --tui-mode fullscreen -e ./packages/pi-reader/src/index.ts  # 冒烟：alt+o 进阅读→自动展开，ctrl-u/d/f/b、gg/G、j/k 滚动，? 帮助，esc/i 退
-```
-
 ## 包特有约束（改动前必读）
 
 - **不注册 `pi.registerShortcut`**：阅读切换走 `inputListener`/`onTerminalInput`，避免与 `app.tools.expand` 冲突报 warning

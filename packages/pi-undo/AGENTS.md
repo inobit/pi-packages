@@ -20,15 +20,6 @@ Pi 撤销扩展：把最近一次发送的输入撤回到输入框并从对话�
 
 依赖方向：`index → history`；`history` 不依赖 pi 运行时类型。
 
-## 常用命令
-
-```bash
-pnpm --filter @inobit/pi-undo check   # tsc --noEmit
-pnpm --filter @inobit/pi-undo test    # vitest（history/config/undo）
-pnpm --filter @inobit/pi-undo pack:check
-pi -e ./packages/pi-undo/src/index.ts # 冒烟：发一句后 /undo 回填，队列时 undo 撤尾，执行中先 abort
-```
-
 ## 包特有约束（改动前必读）
 
 - **单次/轮**：每轮仅可撤销一次，队列撤销也计一次，下次发送后重置

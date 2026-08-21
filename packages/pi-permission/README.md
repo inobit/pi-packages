@@ -132,6 +132,15 @@ Built-in tools (`read`/`grep`/`find`/`ls`), `bash`, and `write`/`edit` are alway
 }
 ```
 
+## Development
+
+```bash
+pnpm --filter @inobit/pi-permission check   # tsc --noEmit
+pnpm --filter @inobit/pi-permission test    # vitest
+pnpm --filter @inobit/pi-permission pack:check
+pi -ne -e ./packages/pi-permission
+```
+
 ## License
 
 MIT

@@ -6,13 +6,6 @@
 
 - `themes/*.json`：4 个 pi 主题文件（`rosepine`/`rosepine-dawn`/`tokyonight`/`tokyonight-day`），通过 package.json 的 `pi.themes` 声明分发，无扩展代码
 
-## 常用命令
-
-```bash
-pnpm --filter @inobit/pi-themes pack:check   # 检查发布 tarball（无 check/test 脚本，纯主题包）
-pi -e ./packages/pi-themes                   # 临时加载本包含主题试用
-```
-
 ## 本包特有约束（改主题前必读）
 
 - **name 全局唯一**，且不能含 `/`（`/` 被 pi 保留作自动亮/暗配对语法）；新增/改名后同步 README 主题表与 CHANGELOG

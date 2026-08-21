@@ -32,6 +32,8 @@ Task states `pending → in_progress → completed`; `completed` is only set exp
 ```bash
 pnpm --filter @inobit/pi-todo check   # tsc --noEmit
 pnpm --filter @inobit/pi-todo test    # vitest
+pnpm --filter @inobit/pi-todo pack:check
+pi -ne -e ./packages/pi-todo
 ```
 
 ## License

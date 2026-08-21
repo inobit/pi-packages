@@ -16,10 +16,10 @@ pi install npm:@inobit/pi-undo
 
 Restart Pi or run `/reload`.
 
-Local dev:
+Local dev (isolated, --no-extensions excludes installed old version):
 
 ```bash
-pi -e ./packages/pi-undo/src/index.ts
+pi -ne -e ./packages/pi-undo
 # send a message, then /undo or alt+u
 ```
 
@@ -58,6 +58,7 @@ Default `alt+u`. When trusted, project config at `.pi/extensions/pi-undo/config.
 pnpm --filter @inobit/pi-undo check   # tsc --noEmit
 pnpm --filter @inobit/pi-undo test    # vitest
 pnpm --filter @inobit/pi-undo pack:check
+pi -ne -e ./packages/pi-undo
 ```
 
 ## License

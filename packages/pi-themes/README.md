@@ -58,6 +58,13 @@ Pi hot-reloads theme files on edit for instant feedback. See Pi's official [Them
 
 - Palette semantics follow the original designs of [Rosé Pine](https://rosepinetheme.com/palette/) (dawn/main) and [folke/tokyonight.nvim](https://github.com/folke/tokyonight.nvim) (day/night).
 
+## Development
+
+```bash
+pnpm --filter @inobit/pi-themes pack:check   # verify publish tarball
+pi -ne -e ./packages/pi-themes
+```
+
 ## License
 
 MIT

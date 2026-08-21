@@ -32,6 +32,7 @@ pnpm check                  # 全仓类型检查（= pnpm -r run check）
 pnpm test                   # 全仓测试（= pnpm -r run test）
 pnpm --filter <pkg> test    # 单包测试（如 --filter @inobit/pi-permission）
 pnpm --filter <pkg> pack:check   # 检查发布 tarball
+pi -ne -e ./packages/<pkg>   # 本地冒烟（jiti 直载，--no-extensions 屏蔽已安装旧版）
 ```
 
 ## License

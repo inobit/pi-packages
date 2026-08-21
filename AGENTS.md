@@ -22,7 +22,7 @@ pnpm install                              # 安装依赖
 pnpm check / pnpm test                    # 全仓类型检查 / 测试
 pnpm --filter @inobit/<pkg> check/test    # 单包检查/测试
 pnpm --filter @inobit/<pkg> pack:check    # 检查发布 tarball
-pi -e ./packages/<pkg>/src/index.ts       # 本地冒烟（免编译直载）
+pi -ne -e ./packages/<pkg>   # 本地冒烟（免编译直载，--no-extensions 屏蔽已安装旧版，仅加载开发版）
 ```
 
 ## 包约定

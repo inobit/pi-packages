@@ -32,6 +32,7 @@ pnpm check                  # type-check entire workspace (= pnpm -r run check)
 pnpm test                   # run all tests (= pnpm -r run test)
 pnpm --filter <pkg> test    # single package (e.g. --filter @inobit/pi-permission)
 pnpm --filter <pkg> pack:check   # verify publish tarball
+pi -ne -e ./packages/<pkg>   # local smoke (jiti direct load, --no-extensions excludes installed old version)
 ```
 
 ## License

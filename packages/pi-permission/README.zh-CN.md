@@ -132,6 +132,15 @@ ask → 选择 [y/s/n/r]
 }
 ```
 
+## 开发
+
+```bash
+pnpm --filter @inobit/pi-permission check   # tsc --noEmit
+pnpm --filter @inobit/pi-permission test    # vitest
+pnpm --filter @inobit/pi-permission pack:check
+pi -ne -e ./packages/pi-permission
+```
+
 ## License
 
 MIT

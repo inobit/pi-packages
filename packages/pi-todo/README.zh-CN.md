@@ -32,4 +32,6 @@ pi install npm:@inobit/pi-todo
 ```bash
 pnpm --filter @inobit/pi-todo check   # tsc --noEmit
 pnpm --filter @inobit/pi-todo test    # vitest
+pnpm --filter @inobit/pi-todo pack:check
+pi -ne -e ./packages/pi-todo
 ```

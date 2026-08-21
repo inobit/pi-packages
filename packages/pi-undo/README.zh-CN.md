@@ -14,10 +14,10 @@ Pi 撤销扩展：把最近一次发送的输入撤回到输入框并从对话�
 pi install npm:@inobit/pi-undo
 ```
 
-重启或 `/reload` 生效。本地调试：
+重启或 `/reload` 生效。本地调试（隔离，--no-extensions 屏蔽已安装旧版）：
 
 ```bash
-pi -e ./packages/pi-undo/src/index.ts
+pi -ne -e ./packages/pi-undo
 # 发一句后 /undo 或 alt+u
 ```
 
@@ -58,6 +58,7 @@ pi -e ./packages/pi-undo/src/index.ts
 pnpm --filter @inobit/pi-undo check
 pnpm --filter @inobit/pi-undo test
 pnpm --filter @inobit/pi-undo pack:check
+pi -ne -e ./packages/pi-undo
 ```
 
 ## License
