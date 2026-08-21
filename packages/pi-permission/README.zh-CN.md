@@ -79,6 +79,31 @@ pi install npm:@inobit/pi-permission
 > 命中敏感文件名的写入（如 `/tmp/.env`、cwd 恰在 `/tmp` 下写 `.env`）plan 下仍 deny、build 下仍 ask；
 > 危险命令（`sudo rm -rf /tmp` 等）与路径无关，始终先于 trusted 拦截；realpath 双形态防软链逃逸。
 
+## 询问弹窗（Ask Dialog）
+
+`ask`（需确认）为 4 选项选择器 + 可选 emacs 输入。`terminate` 与 `reason` 文本解耦，按规则决定（`FR-1`/`FR-7` 为 `false`，其余 `true`），`Esc` 硬终止除外强制 `true`。
+
+| 按键 | 动作 | terminate | 审计 |
+| --- | --- | --- | --- |
+| `y` | 允许本次 | — | `allow-after-ask` |
+| `s` | 允许本会话（记忆为 `<session>:<approvalKey>`） | — | `allow-after-ask` + `sessionApprovals` |
+| `n` | 拒绝（默认） | 按规则（`denyFeedback`） | `deny` |
+| `r` | 拒绝并给出理由 → emacs 输入 | 按规则（完全替换 `denyFeedback` 文本） | `deny` + `customReason`（截断、脱敏） |
+| `Esc`（选择器上） | 硬终止 — 拒绝并停止 | `true`（强制） | `deny` + `terminatedByEsc`（`reason="[pi-permission] Denied by user — stopping."`） |
+
+**`r` 第二层**（`ctx.ui.input`，继承 `tui.input.*` 的 emacs 键位 `C-a/e/k/u/f/b`）：标题 `Deny reason — emacs keys, Enter submit, Esc to go back`，占位符 `e.g. use .env.example instead`。空输入（`trim()===""`）提示 `reason cannot be empty` 并停留；`Esc`（`input===undefined`）回到 4 选项选择器；`Enter` 非空返回 `{kind:"reason", customReason}`，文本完全替换为 `[pi-permission] User denied: <custom>`。无 UI（`rpc`/`print`）降级为 `notify` + 默认 `deny`。
+
+```
+ask → 选择 [y/s/n/r]
+  ├─ y/s → 允许（s 会话记忆）
+  ├─ n   → 拒绝（默认，terminate 按规则）
+  ├─ r   → 输入（emacs）
+  │        ├─ 非空回车 → 拒绝并替换理由
+  │        ├─ 空回车   → 停留（提示）
+  │        └─ Esc     → 回到选择器
+  └─ Esc  → 拒绝并硬终止（强制 true）
+```
+
 ## /readonly-tools 交互
 
 空格选中/取消选中、`↑`/`↓`/`j`/`k` 移动、`Enter` 完成、`Esc`/`q` 取消。先选编辑目标（**每层只改自己，其他层锁定**）：

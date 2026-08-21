@@ -17,6 +17,10 @@ export interface ReviewEntry {
   action: "ask" | "deny" | "allow-after-ask";
   reason: string;
   details?: unknown;
+  /** 用户自定义拒绝理由（deny with reason，完全替换）。 */
+  customReason?: string;
+  /** 硬终止标记（第一层 Esc）。 */
+  terminatedByEsc?: boolean;
 }
 
 const SENSITIVE_KEY_RE = /token|secret|password|credential|api[_-]?key|auth|passwd|private[-_]?key/i;
@@ -168,6 +172,7 @@ export function createAuditor(options: AuditorOptions): Auditor {
         project: options.project,
         details: entry.details === undefined ? undefined : capFieldWidths(entry.details, maxFieldWidth),
         reason: capFieldWidths(entry.reason, maxFieldWidth),
+        customReason: entry.customReason === undefined ? undefined : capFieldWidths(entry.customReason, maxFieldWidth),
       });
     },
     debug(event, details = {}) {

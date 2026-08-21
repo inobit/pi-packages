@@ -79,6 +79,31 @@ Merged by layer (array fields are **union**-deduplicated across layers, non-arra
 > writes matching a sensitive filename (e.g. `/tmp/.env`, or writing `.env` while cwd is `/tmp`) are still deny in plan and ask in build;
 > dangerous commands (`sudo rm -rf /tmp` etc.) are path-independent and always intercepted before trusted checks; dual-form realpath guards against symlink escapes.
 
+## Ask Dialog
+
+`ask` (= confirmation required) shows a 4-option selector + optional emacs input. `terminate` is decoupled from `reason` text and decided by rule (`FR-1`/`FR-7` `false`, otherwise `true`), except `Esc` hard terminate forces `true`.
+
+| Key | Action | terminate | Audit |
+| --- | --- | --- | --- |
+| `y` | allow once | — | `allow-after-ask` |
+| `s` | allow session (remembered as `<session>:<approvalKey>`) | — | `allow-after-ask` + `sessionApprovals` |
+| `n` | deny (default) | by rule (`denyFeedback`) | `deny` |
+| `r` | deny with reason → emacs input | by rule (fully replaces `denyFeedback` text) | `deny` + `customReason` (truncated, redacted) |
+| `Esc` (on select) | hard terminate — deny and stop | `true` (force) | `deny` + `terminatedByEsc` (`reason="[pi-permission] Denied by user — stopping."`) |
+
+**`r` second layer** (`ctx.ui.input`, inherits `tui.input.*` emacs keys `C-a/e/k/u/f/b`): title `Deny reason — emacs keys, Enter submit, Esc to go back`, placeholder `e.g. use .env.example instead`. Empty (`trim()===""`) notifies `reason cannot be empty` and stays; `Esc` (`input===undefined`) returns to the 4-option select; `Enter` non-empty returns `{kind:"reason", customReason}` fully replacing the default reason as `[pi-permission] User denied: <custom>`. No UI (`rpc`/`print`) degrades to `notify` + `deny` with default.
+
+```
+ask → select [y/s/n/r]
+  ├─ y/s → allow (+ s remembered)
+  ├─ n   → deny (default, terminate by rule)
+  ├─ r   → input (emacs)
+  │        ├─ non-empty Enter → deny with reason (fully replaces)
+  │        ├─ empty Enter     → stay (notify)
+  │        └─ Esc             → back to select
+  └─ Esc  → deny + hard terminate (force true)
+```
+
 ## /readonly-tools Interaction
 
 `Space` to select/deselect, `↑`/`↓`/`j`/`k` to move, `Enter` to confirm, `Esc`/`q` to cancel. Pick the edit target first (**each layer edits only itself, other layers are locked**):

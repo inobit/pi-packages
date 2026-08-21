@@ -209,6 +209,36 @@ export default function (pi: ExtensionAPI) {
         auditor.review({ mode, toolName, rule: decision.rule, action: "allow-after-ask", reason: decision.reason, details: decision.details, sessionId: key });
         return undefined;
       }
+      // 硬终止：第一层 Esc（deny + terminate:true，无视 rule）
+      if (choice === "terminate") {
+        auditor.review({
+          mode,
+          toolName,
+          rule: decision.rule,
+          action: "deny",
+          reason: decision.reason,
+          details: decision.details,
+          sessionId: key,
+          terminatedByEsc: true,
+        });
+        return { block: true, reason: "[pi-permission] Denied by user — stopping.", terminate: true };
+      }
+      // deny with reason：完全替换（terminate 仍按原 rule，与文本解耦）
+      if (typeof choice === "object" && choice !== null && (choice as { kind: string }).kind === "reason") {
+        const customReason = (choice as { kind: "reason"; customReason: string }).customReason;
+        const originalTerminate = denyFeedback(decision, "by user").terminate;
+        auditor.review({
+          mode,
+          toolName,
+          rule: decision.rule,
+          action: "deny",
+          reason: decision.reason,
+          details: decision.details,
+          sessionId: key,
+          customReason,
+        });
+        return { block: true, reason: `[pi-permission] User denied: ${customReason}`, terminate: originalTerminate };
+      }
       auditor.review({ mode, toolName, rule: decision.rule, action: "deny", reason: decision.reason, details: decision.details, sessionId: key });
       return denyFeedback(decision, "by user");
     } catch {

@@ -506,3 +506,189 @@ describe("index.ts 工厂装配", () => {
     expect(statuses.get("pi-permission-mode")).toBe("Plan");
   });
 });
+
+describe("deny with reason 交互（ask 扩展）", () => {
+  it("r: deny with reason 正常提交（FR-3 外部写，terminate:true）", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-reason-"));
+    const pi = makePi(dir);
+    factory(pi as never);
+    const ctx = makeCtx(dir, {
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        select: async () => "r: deny with reason",
+        input: async () => "use placeholder",
+        setStatus: () => {},
+      },
+    });
+    // FR-3 外部写 ask
+    const result = (await pi.emit(
+      "tool_call",
+      { type: "tool_call", toolCallId: "r1", toolName: "write", input: { path: "/outside/a.txt", content: "x" } },
+      ctx,
+    )) as { block: boolean; reason: string; terminate: boolean };
+    expect(result.block).toBe(true);
+    expect(result.reason).toBe("[pi-permission] User denied: use placeholder");
+    expect(result.terminate).toBe(true);
+  });
+
+  it("r: deny with reason 完全替换但 terminate 按 FR-1 保持 false", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-reason-"));
+    fs.writeFileSync(path.join(dir, ".env"), "KEY=1");
+    const pi = makePi(dir);
+    factory(pi as never);
+    const ctx = makeCtx(dir, {
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        select: async () => "r: deny with reason",
+        input: async () => "do not use this file",
+        setStatus: () => {},
+      },
+    });
+    const result = (await pi.emit(
+      "tool_call",
+      { type: "tool_call", toolCallId: "r2", toolName: "read", input: { path: ".env" } },
+      ctx,
+    )) as { block: boolean; reason: string; terminate: boolean };
+    expect(result.reason).toBe("[pi-permission] User denied: do not use this file");
+    expect(result.terminate).toBe(false);
+  });
+
+  it("空输入不提交循环并提示，最终提交有效", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-reason-"));
+    const pi = makePi(dir);
+    factory(pi as never);
+    const notifies: string[] = [];
+    let inputCalls = 0;
+    const ctx = makeCtx(dir, {
+      hasUI: true,
+      ui: {
+        notify: (msg: string) => notifies.push(msg),
+        select: async () => "r: deny with reason",
+        input: async () => {
+          inputCalls++;
+          return inputCalls === 1 ? "" : "valid reason";
+        },
+        setStatus: () => {},
+      },
+    });
+    const result = (await pi.emit(
+      "tool_call",
+      { type: "tool_call", toolCallId: "r3", toolName: "bash", input: { command: "git push" } },
+      ctx,
+    )) as { block: boolean; reason: string };
+    expect(notifies.some((m) => m.includes("reason cannot be empty"))).toBe(true);
+    expect(result.reason).toBe("[pi-permission] User denied: valid reason");
+    expect(inputCalls).toBe(2);
+  });
+
+  it("input Esc 回到 select：r → Esc → n，最终 deny with default", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-reason-"));
+    const pi = makePi(dir);
+    factory(pi as never);
+    let selectCalls = 0;
+    const ctx = makeCtx(dir, {
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        select: async () => {
+          selectCalls++;
+          return selectCalls === 1 ? "r: deny with reason" : "n: deny";
+        },
+        input: async () => undefined,
+        setStatus: () => {},
+      },
+    });
+    const result = (await pi.emit(
+      "tool_call",
+      { type: "tool_call", toolCallId: "r4", toolName: "bash", input: { command: "git push" } },
+      ctx,
+    )) as { block: boolean; reason: string; terminate: boolean };
+    expect(selectCalls).toBe(2);
+    expect(result.reason).toMatch(/Permission denied/);
+    expect(result.terminate).toBe(true);
+  });
+
+  it("select Esc 硬终止：返回 Denied by user — stopping 且 terminate:true", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-reason-"));
+    fs.writeFileSync(path.join(dir, ".env"), "KEY=1");
+    const pi = makePi(dir);
+    factory(pi as never);
+    const ctx = makeCtx(dir, {
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        select: async () => undefined,
+        input: async () => "should not be called",
+        setStatus: () => {},
+      },
+    });
+    // FR-1 默认 terminate:false，但 Esc 硬终止应强制 true
+    const result = (await pi.emit(
+      "tool_call",
+      { type: "tool_call", toolCallId: "r5", toolName: "read", input: { path: ".env" } },
+      ctx,
+    )) as { block: boolean; reason: string; terminate: boolean };
+    expect(result.reason).toBe("[pi-permission] Denied by user — stopping.");
+    expect(result.terminate).toBe(true);
+  });
+
+  it("hasUI=false 降级：直接 deny with default，不弹 input", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-reason-"));
+    const pi = makePi(dir);
+    factory(pi as never);
+    let inputCalled = false;
+    const ctx = makeCtx(dir, {
+      hasUI: false,
+      ui: {
+        notify: () => {},
+        select: async () => {
+          throw new Error("select should not be called without UI");
+        },
+        input: async () => {
+          inputCalled = true;
+          return "ignored";
+        },
+        setStatus: () => {},
+      },
+    });
+    const result = (await pi.emit(
+      "tool_call",
+      { type: "tool_call", toolCallId: "r6", toolName: "bash", input: { command: "git push" } },
+      ctx,
+    )) as { block: boolean; reason: string };
+    expect(result.block).toBe(true);
+    expect(inputCalled).toBe(false);
+    expect(result.reason).toMatch(/Permission denied/);
+  });
+
+  it("审计截断：超长 customReason 被 capFieldWidths 截断", async () => {
+    const { createAuditor } = await import("../src/audit.ts");
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-audit-"));
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-audit-cwd-"));
+    const auditor = createAuditor({
+      base,
+      logDir: "logs/pi-permission",
+      project: cwd,
+      reviewEnabled: true,
+      debugEnabled: false,
+      maxFieldWidth: 20,
+    });
+    const long = "a".repeat(100);
+    auditor.review({
+      mode: "build",
+      toolName: "bash",
+      rule: "FR-4",
+      action: "deny",
+      reason: "test",
+      sessionId: "s",
+      customReason: long,
+    });
+    const files = fs.readdirSync(path.join(base, "logs/pi-permission", path.basename(cwd)));
+    const content = fs.readFileSync(path.join(base, "logs/pi-permission", path.basename(cwd), files[0]!), "utf8");
+    const entry = JSON.parse(content.trim().split("\n").at(-1)!);
+    expect(entry.customReason.length).toBeLessThan(long.length);
+    expect(entry.customReason).toMatch(/\[truncated\]/);
+  });
+});

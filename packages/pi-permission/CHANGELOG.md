@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0] - 2026-08-21
+
+### Added
+
+- **Ask dialog (4 options)**: `y: allow once / s: allow session / n: deny / r: deny with reason` (`src/ui.ts: `ctx.ui.select` loop). `r` opens `ctx.ui.input` (emacs, title `Deny reason — emacs keys, Enter submit, Esc to go back`, placeholder `e.g. use .env.example instead`) with full replacement (`[pi-permission] User denied: <custom>`), empty input stays and notifies, `Esc` returns to select; `select Esc` hard-terminates (`deny + terminate:true`, `reason="[pi-permission] Denied by user — stopping."`, audit `terminatedByEsc`).
+- **Hard terminate**: `select Esc` hard terminate (`audit.ts: ReviewEntry.terminatedByEsc`, `index.ts: terminate:true` regardless of rule, vs `FR-1/FR-7` default `false`).
+- **Audit**: `ReviewEntry.customReason` with `capFieldWidths` truncation and redact awareness (152 tests passing, +7).
+
 ## [0.3.1] - 2026-08-20
 
 ### Fixed
