@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.1] - 2026-08-21
+
+### Fixed
+
+- **Deny 不再终止任务**：`src/index.ts:denyFeedback` 全部改为 `terminate:false`（含 `FR-8 plan 只读` 与 `fallback`，原 `true` 导致 `ask` 拒绝后模型收不到 `reason` 需手动再输入）。`r: deny with reason` 恒为 `false`（完全替换文本后立即回传 `LLM`，仅 `Esc` 硬终止保持 `true`）。修复 `rm -rf` 等 `FR-4` 在 `r` 输入“现在告诉我你的进展”后无响应的 bug。
+
 ## [0.4.0] - 2026-08-21
 
 ### Added

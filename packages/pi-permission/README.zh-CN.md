@@ -81,14 +81,14 @@ pi install npm:@inobit/pi-permission
 
 ## 询问弹窗（Ask Dialog）
 
-`ask`（需确认）为 4 选项选择器 + 可选 emacs 输入。`terminate` 与 `reason` 文本解耦，按规则决定（`FR-1`/`FR-7` 为 `false`，其余 `true`），`Esc` 硬终止除外强制 `true`。
+`ask`（需确认）为 4 选项选择器 + 可选 emacs 输入。所有拒绝均为 `terminate:false` 让模型立即看到 `reason` 并继续，仅 `Esc` 硬终止为 `true`。
 
 | 按键 | 动作 | terminate | 审计 |
 | --- | --- | --- | --- |
 | `y` | 允许本次 | — | `allow-after-ask` |
 | `s` | 允许本会话（记忆为 `<session>:<approvalKey>`） | — | `allow-after-ask` + `sessionApprovals` |
-| `n` | 拒绝（默认） | 按规则（`denyFeedback`） | `deny` |
-| `r` | 拒绝并给出理由 → emacs 输入 | 按规则（完全替换 `denyFeedback` 文本） | `deny` + `customReason`（截断、脱敏） |
+| `n` | 拒绝（默认） | `false`（模型继续） | `deny` |
+| `r` | 拒绝并给出理由 → emacs 输入 | `false`（完全替换 `denyFeedback` 文本，模型继续） | `deny` + `customReason`（截断、脱敏） |
 | `Esc`（选择器上） | 硬终止 — 拒绝并停止 | `true`（强制） | `deny` + `terminatedByEsc`（`reason="[pi-permission] Denied by user — stopping."`） |
 
 **`r` 第二层**（`ctx.ui.input`，继承 `tui.input.*` 的 emacs 键位 `C-a/e/k/u/f/b`）：标题 `Deny reason — emacs keys, Enter submit, Esc to go back`，占位符 `e.g. use .env.example instead`。空输入（`trim()===""`）提示 `reason cannot be empty` 并停留；`Esc`（`input===undefined`）回到 4 选项选择器；`Enter` 非空返回 `{kind:"reason", customReason}`，文本完全替换为 `[pi-permission] User denied: <custom>`。无 UI（`rpc`/`print`）降级为 `notify` + 默认 `deny`。
@@ -96,9 +96,9 @@ pi install npm:@inobit/pi-permission
 ```
 ask → 选择 [y/s/n/r]
   ├─ y/s → 允许（s 会话记忆）
-  ├─ n   → 拒绝（默认，terminate 按规则）
+  ├─ n   → 拒绝（默认，terminate:false 模型继续）
   ├─ r   → 输入（emacs）
-  │        ├─ 非空回车 → 拒绝并替换理由
+  │        ├─ 非空回车 → 拒绝并替换理由（terminate:false）
   │        ├─ 空回车   → 停留（提示）
   │        └─ Esc     → 回到选择器
   └─ Esc  → 拒绝并硬终止（强制 true）

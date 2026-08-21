@@ -158,7 +158,7 @@ export default function (pi: ExtensionAPI) {
 
       if (decision.action === "allow") return undefined;
 
-      // 拒绝反馈（给模型）：按规则分流，可重试的场景 terminate:false 并引导替代/简化
+      // 拒绝反馈（给模型）：所有 deny 均 terminate:false，让模型立即看到 reason 并继续处理（FR-1/FR-7 已是 false，FR-8/fallback 同步改为 false）
       const denyFeedback = (decision: Decision, _origin: string): { block: true; reason: string; terminate: boolean } => {
         if (decision.rule === "FR-1") {
           const p = decision.details?.[0] ?? "sensitive file";
@@ -179,13 +179,13 @@ export default function (pi: ExtensionAPI) {
           return {
             block: true,
             reason: `[pi-permission] Plan is read-only — writes blocked. Gather info with read-only tools or ask to run /build.`,
-            terminate: true,
+            terminate: false,
           };
         }
         return {
           block: true,
           reason: `[pi-permission] Permission denied (${decision.rule}). Do not retry the same operation; try a simpler approach.`,
-          terminate: true,
+          terminate: false,
         };
       };
 
@@ -223,10 +223,9 @@ export default function (pi: ExtensionAPI) {
         });
         return { block: true, reason: "[pi-permission] Denied by user — stopping.", terminate: true };
       }
-      // deny with reason：完全替换（terminate 仍按原 rule，与文本解耦）
+      // deny with reason：完全替换 reason 文本，始终 terminate:false 让模型立即消化 customReason 并继续（仅 Esc 硬终止为 true）
       if (typeof choice === "object" && choice !== null && (choice as { kind: string }).kind === "reason") {
         const customReason = (choice as { kind: "reason"; customReason: string }).customReason;
-        const originalTerminate = denyFeedback(decision, "by user").terminate;
         auditor.review({
           mode,
           toolName,
@@ -237,7 +236,7 @@ export default function (pi: ExtensionAPI) {
           sessionId: key,
           customReason,
         });
-        return { block: true, reason: `[pi-permission] User denied: ${customReason}`, terminate: originalTerminate };
+        return { block: true, reason: `[pi-permission] User denied: ${customReason}`, terminate: false };
       }
       auditor.review({ mode, toolName, rule: decision.rule, action: "deny", reason: decision.reason, details: decision.details, sessionId: key });
       return denyFeedback(decision, "by user");

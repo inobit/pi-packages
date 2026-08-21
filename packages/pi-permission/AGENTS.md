@@ -16,7 +16,7 @@ build：敏感操作 ask → 敏感文件 ask →（cwd 内 allow | cwd 外 read
   `cd -`/无法解析时相对路径保守按外部处理
 - fail-closed：解析失败 / `$(...)` / 子 shell / `curl|sh` → build=ask、plan=deny，绝不静默放行
 - 插件自身异常降级为不拦截（不拖垮 pi 启动）
-- **deny/拒绝反馈**：按规则分流（0.2.7）：`FR-1`/`FR-7` → `terminate:false`（`Sensitive file blocked` / `Command too complex` 引导替代/拆解，不终止任务，供 yolo 敏感拒绝复用）；`FR-8 plan 只读`/`兜底` → `terminate:true`（`Plan is read-only` / `Permission denied`）
+- **deny/拒绝反馈**：所有拒绝 `terminate:false`（0.4.1 修复：`FR-8 plan 只读`/`兜底` 原 `true` 导致 `ask` 拒绝后模型收不到 `reason`；现统一 `false` 让模型立即消化 `reason` 并继续，仅 `Esc` 硬终止为 `true`）；`FR-1`/`FR-7` 文案 `Sensitive file blocked` / `Command too complex` 引导替代/拆解，供 yolo 敏感拒绝复用
 
 ## 配置（config.ts 定义默认清单；全局/项目 config.json 覆盖）
 

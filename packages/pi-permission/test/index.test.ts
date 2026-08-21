@@ -158,7 +158,7 @@ describe("index.ts 工厂装配", () => {
     };
     const result = await pi.emit("tool_call", event, ctx) as { block: boolean; reason: string; terminate?: boolean };
     expect(result).toMatchObject({ block: true });
-    expect(result.terminate).toBe(true);
+    expect(result.terminate).toBe(false);
     expect(result.reason).toMatch(/Plan is read-only/);
   });
 
@@ -391,7 +391,7 @@ describe("index.ts 工厂装配", () => {
     expect(fs.existsSync(globalPath)).toBe(false);
   });
 
-  it("ask 弹窗被拒后给模型明确「已拒绝、勿重试」反馈（含 terminate）", async () => {
+  it("ask 弹窗被拒后给模型明确「已拒绝、勿重试」反馈（terminate:false 让模型继续）", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-factory-"));
     const pi = makePi(dir);
     factory(pi as never);
@@ -403,7 +403,7 @@ describe("index.ts 工厂装配", () => {
       input: { command: "git push" },
     }, ctx) as { block: boolean; reason: string; terminate?: boolean };
     expect(result.block).toBe(true);
-    expect(result.terminate).toBe(true);
+    expect(result.terminate).toBe(false);
     expect(result.reason).toMatch(/Permission denied/);
     expect(result.reason).toMatch(/try a simpler approach/);
   });
@@ -422,7 +422,7 @@ describe("index.ts 工厂装配", () => {
       input: { command: "git commit" },
     }, ctx) as { block: boolean; reason: string; terminate?: boolean };
     expect(result.block).toBe(true);
-    expect(result.terminate).toBe(true);
+    expect(result.terminate).toBe(false);
     expect(result.reason).toMatch(/Plan is read-only/);
   });
 
@@ -508,7 +508,7 @@ describe("index.ts 工厂装配", () => {
 });
 
 describe("deny with reason 交互（ask 扩展）", () => {
-  it("r: deny with reason 正常提交（FR-3 外部写，terminate:true）", async () => {
+  it("r: deny with reason 正常提交（FR-3 外部写，terminate:false 让模型继续）", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-reason-"));
     const pi = makePi(dir);
     factory(pi as never);
@@ -529,7 +529,7 @@ describe("deny with reason 交互（ask 扩展）", () => {
     )) as { block: boolean; reason: string; terminate: boolean };
     expect(result.block).toBe(true);
     expect(result.reason).toBe("[pi-permission] User denied: use placeholder");
-    expect(result.terminate).toBe(true);
+    expect(result.terminate).toBe(false);
   });
 
   it("r: deny with reason 完全替换但 terminate 按 FR-1 保持 false", async () => {
@@ -607,7 +607,7 @@ describe("deny with reason 交互（ask 扩展）", () => {
     )) as { block: boolean; reason: string; terminate: boolean };
     expect(selectCalls).toBe(2);
     expect(result.reason).toMatch(/Permission denied/);
-    expect(result.terminate).toBe(true);
+    expect(result.terminate).toBe(false);
   });
 
   it("select Esc 硬终止：返回 Denied by user — stopping 且 terminate:true", async () => {
