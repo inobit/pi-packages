@@ -35,7 +35,15 @@ pi -e ./packages/pi-undo/src/index.ts
 
 ## 配置
 
-无配置文件，快捷键固定 `alt+u`。
+快捷键可配，配置文件 `~/.pi/agent/extensions/pi-undo/config.json`（改后需 `/reload`）：
+
+```json
+{
+  "shortcut": "alt+u"
+}
+```
+
+默认 `alt+u`，受信任项目下 `.pi/extensions/pi-undo/config.json` 可覆盖全局。
 
 ## 兼容与限制
 

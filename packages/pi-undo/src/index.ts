@@ -5,9 +5,10 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { findLastUserEntry } from "./history.ts";
+import { loadConfig, SHORTCUT as DEFAULT_SHORTCUT } from "./config.ts";
 
 type SessionId = string;
-const SHORTCUT = "alt+u" as const;
+const SHORTCUT = DEFAULT_SHORTCUT;
 
 // abort 后等 idle 的总预算与轮询节拍（原 50*200ms=10s 魔法数收敛）
 const WAIT_MS = 3000;
@@ -200,17 +201,24 @@ export default function (pi: ExtensionAPI) {
     pendingBySid.delete(sid);
   });
 
+  // 快捷键可配：~/.pi/agent/extensions/pi-undo/config.json {"shortcut":"alt+u"}，需 /reload
+  let shortcut: string = SHORTCUT;
+  try {
+    const cfg = loadConfig(process.cwd());
+    if (cfg.shortcut) shortcut = cfg.shortcut;
+  } catch {}
+
   pi.registerCommand("undo", {
-    description: 'Undo last prompt to editor (hard revert, single per turn, queue-aware). Shortcut: alt+u',
+    description: `Undo last prompt to editor (hard revert, single per turn, queue-aware). Shortcut: ${shortcut}`,
     handler: async (_a, ctx) => { await doUndo(ctx); },
   });
 
   try {
-    pi.registerShortcut(SHORTCUT as unknown as import("@earendil-works/pi-tui").KeyId, {
+    pi.registerShortcut(shortcut as unknown as import("@earendil-works/pi-tui").KeyId, {
       description: "Undo last prompt to editor (hard)",
       handler: async (ctx) => { await doUndo(ctx); },
     });
   } catch (e) {
-    try { console.warn(`[pi-undo] shortcut ${SHORTCUT} failed: ${String(e)}`); } catch {}
+    try { console.warn(`[pi-undo] shortcut ${shortcut} failed: ${String(e)}`); } catch {}
   }
 }

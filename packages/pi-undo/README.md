@@ -36,7 +36,15 @@ Behavior:
 
 ## Configuration
 
-No config file. Shortcut is fixed to `alt+u`.
+Shortcut is configurable via `~/.pi/agent/extensions/pi-undo/config.json` (requires `/reload`):
+
+```json
+{
+  "shortcut": "alt+u"
+}
+```
+
+Default `alt+u`. When trusted, project config at `.pi/extensions/pi-undo/config.json` overrides global.
 
 ## Compatibility & Limitations
 

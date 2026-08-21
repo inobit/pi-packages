@@ -7,5 +7,5 @@
   - Queue-aware: `a sent + b,c queued` → `undo` pops `c` to editor once (mirror `steer|followUp`, cap 20); next undo goes to history; draft check atomic before abort
   - Abort-then-undo: `!isIdle` → `abort()` → `waitUntilIdle` (event + 3s timeout / poll) before revert; draft re-checked after wait
   - Single per turn: `canUndo` per `sessionId`, reset on `before_agent_start`, set false after undo, `session_start` clears mirror; pending mutex prevents concurrent double-undo
-  - No config file, shortcut fixed to `alt+u`; no redo; editor has draft → "Editor has draft, clear it first" and do not overwrite
+  - Shortcut configurable via `~/.pi/agent/extensions/pi-undo/config.json` (`{"shortcut":"alt+u"}`), default `alt+u` (project override when trusted); no redo; editor has draft → "Editor has draft, clear it first" and do not overwrite
 - test: history/config/undo state machine (extractText, findLastUserEntry, canUndo, mirror) + integration tests for `doUndo` (hasUI/draft/mirror/abort/hard revert/concurrency)
