@@ -48,4 +48,5 @@ pi -ne -e ./packages/<pkg>   # 本地冒烟（免编译直载，--no-extensions 
 | `@inobit/pi-reader` | 阅读模式：`alt+o` 切换、`ctrl-u/d` 半页、`ctrl-f/b` 整页、`gg/G` 顶底、`?` 帮助 |
 | `@inobit/pi-todo` | 最小侵入任务清单：`todo` 工具 + `/todos` 命令 + 编辑器上方常驻面板，状态存会话分支可重放 |
 | `@inobit/pi-undo` | 撤销扩展：`/undo` + `alt+u`，单次/轮、队列感知、原子 abort 再撤 |
+| `@inobit/pi-retry` | 手动透明重试：`/retry` + `alt+r`，原样重新发起失败 turn，零提示词注入 |
 | `@inobit/pi-themes` | 精选主题包：Rosé Pine / TokyoNight / Catppuccin / Solarized 四族亮暗主题，支持 `theme: "亮/暗"` 配对自动切换 |
