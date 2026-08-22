@@ -80,4 +80,17 @@ describe("findLastUserEntry", () => {
     ];
     expect(findLastUserEntry(branch)?.entryId).toBe("4");
   });
+
+  it("undo 哨兵（custom）为分支末条时仍能定位到其前的 user 消息", () => {
+    // pi-undo-pin 落盘后成为分支末条，findLastUserEntry 必须跳过它找到真正的 user 消息
+    const branch: BranchEntryLike[] = [
+      mk("1", null, "user", "a"),
+      mk("2", "1", "assistant", "hi"),
+      { type: "custom", id: "pin-1", parentId: "1", customType: "pi-undo-pin" } as unknown as BranchEntryLike,
+    ];
+    const r = findLastUserEntry(branch);
+    expect(r?.entryId).toBe("1");
+    expect(r?.parentId).toBeNull();
+    expect(r?.text).toBe("a");
+  });
 });

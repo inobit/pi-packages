@@ -1,6 +1,6 @@
 {
   "name": "@inobit/pi-undo",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Undo the last user submission in Pi coding agent",
   "type": "module",
   "exports": {

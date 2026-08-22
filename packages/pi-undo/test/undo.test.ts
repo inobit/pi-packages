@@ -105,6 +105,9 @@ describe("doUndo integration (via mock pi)", () => {
       registerShortcut: vi.fn((_key: string, opts: any) => {
         shortcutHandler = opts.handler;
       }),
+      // 哨兵落盘与快捷键委托所需的顶层 API
+      appendEntry: vi.fn(),
+      sendUserMessage: vi.fn(),
     };
     return { mockPi, handlers, commandHandlers, getShortcut: () => shortcutHandler };
   }
@@ -183,14 +186,11 @@ describe("doUndo integration (via mock pi)", () => {
     await commandHandlers["undo"]!({}, ctx);
     expect(ctx.ui.notify).toHaveBeenCalledWith("Editor has draft, clear it first", "warning");
 
-    // 清空草稿后应能继续 undo（验证未被锁）
+    // 清空草稿后应能继续 undo（验证未被锁）：有 navigateTree 时走 entryId 导航
     ctx.ui.getEditorText.mockReturnValue("");
     ctx.sessionManager.getBranch.mockReturnValue([branchWithUser("1", null, "hello")]);
-    ctx.sessionManager.resetLeaf = vi.fn();
-    // 需要把 navigateTree 删掉以走 resetLeaf 首条路径
-    delete ctx.navigateTree;
     await commandHandlers["undo"]!({}, ctx);
-    expect(ctx.sessionManager.resetLeaf).toHaveBeenCalled();
+    expect(ctx.navigateTree).toHaveBeenCalledWith("1", { summarize: false });
   });
 
   it("队列镜像：pop tail 单次，第二次转 Already undone", async () => {
@@ -237,18 +237,16 @@ describe("doUndo integration (via mock pi)", () => {
     const beforeHandler = handlers["before_agent_start"]!;
     await beforeHandler({ prompt: "b" }, ctx);
 
-    // 重置后应可再次撤销（此时 mirror 剩余 b 已被清理，应走历史）
+    // 重置后应可再次撤销（此时 mirror 剩余 b 已被清理，应走历史导航）
     ctx.ui.notify.mockClear();
     ctx.ui.setEditorText.mockClear();
     ctx.sessionManager.getBranch.mockReturnValue([branchWithUser("1", null, "history-msg")]);
-    delete ctx.navigateTree;
-    ctx.sessionManager.resetLeaf = vi.fn();
     await commandHandlers["undo"]!({}, ctx);
-    // 由于 mirror 已被 before_agent_start 清理（b 被移除），应走 resetLeaf
-    expect(ctx.sessionManager.resetLeaf).toHaveBeenCalled();
+    // 由于 mirror 已被 before_agent_start 清理（b 被移除），应走 navigateTree(entryId)
+    expect(ctx.navigateTree).toHaveBeenCalledWith("1", { summarize: false });
   });
 
-  it("历史撤销：navigateTree 使用 parentId 而非 entryId", async () => {
+  it("历史撤销：navigateTree 使用 entryId 并落哨兵", async () => {
     const { mockPi, commandHandlers } = createMockPi();
     const mod = await import("../src/index.ts");
     (mod.default as any)(mockPi);
@@ -273,12 +271,14 @@ describe("doUndo integration (via mock pi)", () => {
       navigateTree: vi.fn(async () => {}),
     });
     await commandHandlers["undo"]!({}, ctx);
-    // 应回到 parentId "2"，而非 entryId "3"
-    expect(ctx.navigateTree).toHaveBeenCalledWith("2", { summarize: false });
+    // 应回到 user 消息自身 entryId "3"（宿主特判 leaf=parentId="2"），并落哨兵固定终点
+    expect(ctx.navigateTree).toHaveBeenCalledWith("3", { summarize: false });
     expect(ctx.ui.setEditorText).toHaveBeenCalledWith("second");
+    expect(mockPi.appendEntry).toHaveBeenCalledTimes(1);
+    expect(mockPi.appendEntry).toHaveBeenCalledWith("pi-undo-pin", { v: 1, at: "2" });
   });
 
-  it("首条消息 parentId null 走 resetLeaf", async () => {
+  it("受限上下文无 navigateTree 时显式失败，不再静默降级", async () => {
     const { mockPi, commandHandlers } = createMockPi();
     const mod = await import("../src/index.ts");
     (mod.default as any)(mockPi);
@@ -297,14 +297,21 @@ describe("doUndo integration (via mock pi)", () => {
         notify: vi.fn(),
       },
     });
-    // 删除 navigateTree 以测试 resetLeaf 分支
+    // 删除 navigateTree 模拟受限上下文：应显式失败而非静默降级 sm.branch()
     delete ctx.navigateTree;
     await commandHandlers["undo"]!({}, ctx);
-    expect(ctx.sessionManager.resetLeaf).toHaveBeenCalled();
-    expect(ctx.ui.setEditorText).toHaveBeenCalledWith("only");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "Hard undo unavailable here — use /undo instead",
+      "warning",
+    );
+    expect(ctx.sessionManager.resetLeaf).not.toHaveBeenCalled();
+    expect(ctx.sessionManager.branch).not.toHaveBeenCalled();
+    expect(ctx.ui.setEditorText).not.toHaveBeenCalled();
+    // 未消耗单次/轮，也未落哨兵
+    expect(mockPi.appendEntry).not.toHaveBeenCalled();
   });
 
-  it("首条有 navigateTree 时也优先 resetLeaf（M3）", async () => {
+  it("首条消息统一走 navigateTree(entryId)，宿主自动落到 root", async () => {
     const { mockPi, commandHandlers } = createMockPi();
     const mod = await import("../src/index.ts");
     (mod.default as any)(mockPi);
@@ -319,8 +326,10 @@ describe("doUndo integration (via mock pi)", () => {
       navigateTree: vi.fn(async () => {}),
     });
     await commandHandlers["undo"]!({}, ctx);
-    expect(ctx.sessionManager.resetLeaf).toHaveBeenCalled();
-    expect(ctx.navigateTree).not.toHaveBeenCalled();
+    // 扩展侧不再特判首条：统一传 entryId，宿主对 user 目标自动 leaf=parentId(null)=root
+    expect(ctx.navigateTree).toHaveBeenCalledWith("1", { summarize: false });
+    expect(ctx.sessionManager.resetLeaf).not.toHaveBeenCalled();
+    expect(mockPi.appendEntry).toHaveBeenCalledWith("pi-undo-pin", { v: 1, at: null });
   });
 
   it("无消息时提示 No message 且不消耗 canUndo", async () => {
@@ -423,9 +432,9 @@ describe("doUndo integration (via mock pi)", () => {
     ctx.sessionManager.getBranch.mockReturnValue(branch);
     delete ctx.waitForIdle;
     ctx.navigateTree = vi.fn(async () => {});
-    // 现在 isIdle true，直接走历史（首条走 resetLeaf）
+    // 现在 isIdle true，直接走历史（首条统一走 navigateTree(entryId)）
     await commandHandlers["undo"]!({}, ctx);
-    expect(ctx.sessionManager.resetLeaf).toHaveBeenCalled();
+    expect(ctx.navigateTree).toHaveBeenCalledWith("1", { summarize: false });
   });
 
   it("并发二次 undo 仅一次成功（B4）", async () => {
@@ -482,31 +491,129 @@ describe("doUndo integration (via mock pi)", () => {
     expect(true).toBe(true);
   });
 
-  it("alt+u 快捷键与 /undo 共用同一逻辑", async () => {
-    const { mockPi, commandHandlers } = createMockPi();
+  it("alt+u 快捷键委托 /undo 命令管道，行为一致性由构造保证", async () => {
+    const { mockPi } = createMockPi();
     const mod = await import("../src/index.ts");
     (mod.default as any)(mockPi);
     const shortcut = mockPi.registerShortcut.mock.calls[0]?.[0];
     expect(shortcut).toBe("alt+u");
-    const shortcutHandler = mockPi.registerShortcut.mock.calls[0]?.[1]?.handler as (ctx: unknown) => Promise<unknown>;
+    const shortcutHandler = mockPi.registerShortcut.mock.calls[0]?.[1]?.handler as () => Promise<unknown>;
     expect(typeof shortcutHandler).toBe("function");
-    // 两者应都指向 doUndo：通过 mock ctx 验证行为一致
+    // 委托命令派发：expandPromptTemplates 必须显式 true（宿主默认 false），命中扩展命令后不触发 LLM turn
+    await shortcutHandler();
+    expect(mockPi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(mockPi.sendUserMessage).toHaveBeenCalledWith("/undo", { expandPromptTemplates: true });
+  });
+
+  it("no-op 陷阱：目标恰为当前 leaf 时改以 parent 为导航目标", async () => {
+    const { mockPi, commandHandlers } = createMockPi();
+    const mod = await import("../src/index.ts");
+    (mod.default as any)(mockPi);
     const branch = [
       branchWithUser("1", null, "first"),
       { type: "message", id: "2", parentId: "1", timestamp: new Date().toISOString(), message: { role: "assistant", content: "hi" } },
-      branchWithUser("3", "2", "via-shortcut"),
+      branchWithUser("3", "2", "second"),
+    ];
+    const leafState = { id: "3" as string | null }; // 模拟崩溃 resume 后文件末条即 user 消息
+    const ctx = createMockCtx({
+      sessionManager: {
+        getSessionId: vi.fn(() => "sid-noop"),
+        getBranch: vi.fn(() => branch),
+        getLeafId: vi.fn(() => leafState.id),
+        branch: vi.fn(),
+        resetLeaf: vi.fn(),
+      },
+      navigateTree: vi.fn(async (_id: string) => {
+        // 模拟宿主导航成功后推进 leaf（非 user 目标 → leaf=目标本身）
+        leafState.id = "2";
+        return {};
+      }),
+    });
+    await commandHandlers["undo"]!({}, ctx);
+    // 若直接传 entryId "3" 会命中宿主 no-op 早退；应改以 parent "2" 为目标
+    expect(ctx.navigateTree).toHaveBeenCalledWith("2", { summarize: false });
+    expect(ctx.ui.setEditorText).toHaveBeenCalledWith("second");
+    expect(mockPi.appendEntry).toHaveBeenCalledWith("pi-undo-pin", { v: 1, at: "2" });
+  });
+
+  it("导航被取消时不回填、不消耗 canUndo、不落哨兵", async () => {
+    const { mockPi, commandHandlers } = createMockPi();
+    const mod = await import("../src/index.ts");
+    (mod.default as any)(mockPi);
+    const branch = [
+      branchWithUser("1", null, "first"),
+      { type: "message", id: "2", parentId: "1", timestamp: new Date().toISOString(), message: { role: "assistant", content: "hi" } },
+      branchWithUser("3", "2", "msg"),
     ];
     const ctx = createMockCtx({
       sessionManager: {
-        getSessionId: vi.fn(() => "sid-shortcut"),
+        getSessionId: vi.fn(() => "sid-cancelled"),
         getBranch: vi.fn(() => branch),
+        branch: vi.fn(),
+        resetLeaf: vi.fn(),
+      },
+      navigateTree: vi.fn(async () => ({ cancelled: true })),
+    });
+    await commandHandlers["undo"]!({}, ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Undo did not take effect, try again", "warning");
+    expect(ctx.ui.setEditorText).not.toHaveBeenCalled();
+    expect(mockPi.appendEntry).not.toHaveBeenCalled();
+    // canUndo 未消耗：再次触发仍是同一失败提示而非 Already undone
+    ctx.ui.notify.mockClear();
+    await commandHandlers["undo"]!({}, ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Undo did not take effect, try again", "warning");
+  });
+
+  it("leaf 未实际移动时视为失败且不落哨兵", async () => {
+    const { mockPi, commandHandlers } = createMockPi();
+    const mod = await import("../src/index.ts");
+    (mod.default as any)(mockPi);
+    const branch = [
+      branchWithUser("1", null, "first"),
+      { type: "message", id: "2", parentId: "1", timestamp: new Date().toISOString(), message: { role: "assistant", content: "hi" } },
+      branchWithUser("3", "2", "msg"),
+    ];
+    // getLeafId 恒返回同值：navigateTree resolve 成功但 leaf 指针未变 → 判定未生效
+    const ctx = createMockCtx({
+      sessionManager: {
+        getSessionId: vi.fn(() => "sid-unmoved"),
+        getBranch: vi.fn(() => branch),
+        getLeafId: vi.fn(() => "9"),
+        branch: vi.fn(),
+        resetLeaf: vi.fn(),
+      },
+      navigateTree: vi.fn(async () => ({})),
+    });
+    await commandHandlers["undo"]!({}, ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Undo did not take effect, try again", "warning");
+    expect(mockPi.appendEntry).not.toHaveBeenCalled();
+    expect(ctx.ui.setEditorText).not.toHaveBeenCalled();
+  });
+
+  it("特例：首条消息本身是 leaf 时 resetLeaf + 根级哨兵 + 显式告知视图未刷新", async () => {
+    const { mockPi, commandHandlers } = createMockPi();
+    const mod = await import("../src/index.ts");
+    (mod.default as any)(mockPi);
+    const branch = [branchWithUser("1", null, "only")];
+    const ctx = createMockCtx({
+      sessionManager: {
+        getSessionId: vi.fn(() => "sid-root-leaf"),
+        getBranch: vi.fn(() => branch),
+        getLeafId: vi.fn(() => "1"),
         branch: vi.fn(),
         resetLeaf: vi.fn(),
       },
       navigateTree: vi.fn(async () => {}),
     });
-    // shortcut path uses navigateTree with parentId
-    await shortcutHandler!(ctx);
-    expect(ctx.navigateTree).toHaveBeenCalled();
+    await commandHandlers["undo"]!({}, ctx);
+    expect(ctx.sessionManager.resetLeaf).toHaveBeenCalled();
+    expect(mockPi.appendEntry).toHaveBeenCalledWith("pi-undo-pin", { v: 1, at: null });
+    expect(ctx.ui.setEditorText).toHaveBeenCalledWith("only");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("In-memory view not refreshed"),
+      "warning",
+    );
+    // navigateTree 不应被调用（无 entry 可作目标，走 resetLeaf 特例）
+    expect(ctx.navigateTree).not.toHaveBeenCalled();
   });
 });
