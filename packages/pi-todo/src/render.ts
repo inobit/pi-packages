@@ -6,7 +6,10 @@
  */
 
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, visibleWidth as displayWidth } from "@earendil-works/pi-tui";
+
+/** 显示宽度测量（ANSI-aware）；re-export 供纯函数模块（overlay）间接使用，不引入 pi 运行时依赖 */
+export { displayWidth };
 import type { TaskStatus } from "./state.ts";
 import type { TodoDetails } from "./store.ts";
 
@@ -21,10 +24,20 @@ export function glyphFor(status: TaskStatus): string {
 	return status === "deleted" ? " " : GLYPHS[status];
 }
 
-/** 行格式：标题截断（默认 80 字符，超限截断加省略号） */
+/** 行格式：标题截断（按显示宽度，默认 80 列；CJK 等宽字符按 2 列计），超限截断加省略号 */
 export function truncateSubject(subject: string, max = 80): string {
-	if (subject.length <= max) return subject;
-	return subject.slice(0, Math.max(0, max - 1)) + "…";
+	if (max <= 0) return "";
+	if (displayWidth(subject) <= max) return subject;
+	const limit = max - displayWidth("…"); // 预留省略号列数
+	let out = "";
+	let width = 0;
+	for (const ch of subject) {
+		const w = displayWidth(ch);
+		if (width + w > limit) break;
+		out += ch;
+		width += w;
+	}
+	return `${out}…`;
 }
 
 /** 折叠行：todo <action> <subject/#id>。args 未完整（streaming 早期）时只显示占位 … */

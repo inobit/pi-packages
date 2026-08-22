@@ -108,11 +108,13 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.on("tool_execution_end", async (event, ctx) => {
-		if (event.toolName !== "todo" || event.isError) return;
-		const details = (event.result as { details?: unknown } | undefined)?.details;
-		if (!isTodoDetails(details)) return;
+		if (event.toolName !== "todo") return;
+		// 先清理配对记录再走后续分支（isError / details 非法时也不泄漏条目）
 		const args = todoStartArgs.get(event.toolCallId);
 		todoStartArgs.delete(event.toolCallId);
+		if (event.isError) return;
+		const details = (event.result as { details?: unknown } | undefined)?.details;
+		if (!isTodoDetails(details)) return;
 		// 仅当本次调用把某任务 update 到 completed 时才揭示该 id（避免无关调用点亮已完成行）
 		if (args?.status === "completed" && args.id !== undefined) {
 			revealedCompleted = new Set(revealedCompleted).add(args.id);

@@ -56,6 +56,13 @@ describe("replayFromBranch", () => {
 		expect(state?.nextId).toBe(2);
 	});
 
+	it("加固：快照 nextId 异常（≤ 最大 id）时钳到 maxId+1；正常更大值保留", () => {
+		const tampered = [toolResult(snapshot("create", [{ id: 5, subject: "a", status: "pending" }], 5))];
+		expect(replayFromBranch(tampered)?.nextId).toBe(6);
+		const healthy = [toolResult(snapshot("create", [{ id: 5, subject: "a", status: "pending" }], 9))];
+		expect(replayFromBranch(healthy)?.nextId).toBe(9);
+	});
+
 	it("clear 后快照为空态 → 重放得到空态且 nextId=1", () => {
 		const branch: BranchEntryLike[] = [
 			toolResult(snapshot("create", [{ id: 1, subject: "a", status: "pending" }], 2)),

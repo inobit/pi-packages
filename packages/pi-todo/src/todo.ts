@@ -86,13 +86,18 @@ function successDetails(action: string, state: TaskState) {
  * 注意：读取 store → applyTodoAction → store.set 之间不得插入 await，
  * 否则并行工具调用下会发生读旧态覆盖（丢失更新）。
  */
-function runAction(params: TodoParamsType, state: TaskState): { result: TaskState; error?: string } {
+function runAction(
+	params: TodoParamsType,
+	state: TaskState,
+): { result: TaskState; changed?: Task; error?: string } {
 	let result = state;
+	let changed: Task | undefined;
 	let error: string | undefined;
 	switch (params.action) {
 		case "create": {
 			const applied = applyTodoAction(result, { action: "create", subject: params.subject ?? "", description: params.description });
 			result = applied.state;
+			changed = applied.changed;
 			error = applied.error;
 			break;
 		}
@@ -107,6 +112,7 @@ function runAction(params: TodoParamsType, state: TaskState): { result: TaskStat
 				activeForm: params.activeForm,
 			});
 			result = applied.state;
+			changed = applied.changed;
 			error = applied.error;
 			break;
 		}
@@ -114,6 +120,7 @@ function runAction(params: TodoParamsType, state: TaskState): { result: TaskStat
 			if (params.id === undefined) return { result, error: "id is required for delete" };
 			const applied = applyTodoAction(result, { action: "delete", id: params.id });
 			result = applied.state;
+			changed = applied.changed;
 			error = applied.error;
 			break;
 		}
@@ -126,7 +133,7 @@ function runAction(params: TodoParamsType, state: TaskState): { result: TaskStat
 		default:
 			break;
 	}
-	return { result, error };
+	return { result, changed, error };
 }
 
 export function registerTodoTool(pi: ExtensionAPI, deps: TodoDeps): void {
@@ -168,10 +175,10 @@ export function registerTodoTool(pi: ExtensionAPI, deps: TodoDeps): void {
 			}
 
 			// —— 变更动作：同步读-算-写（无 await，保并行原子性）——
-			const { result, error } = runAction(params, state);
+			// changed 由 applyTodoAction 成功路径保证返回（不再按 id 反查，误传无关参数也不崩溃）
+			const { result, changed, error } = runAction(params, state);
 			if (error) return errorResult(params.action, error);
 			if (result !== state) store.set(sid, result);
-			const changed = params.action === "clear" ? undefined : result.tasks.find((t) => t.id === (params.id ?? result.nextId - 1));
 			return {
 				content: [
 					{

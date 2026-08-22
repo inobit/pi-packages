@@ -8,7 +8,7 @@
 
 import type { Task, TaskState } from "./state.ts";
 import { countByStatus } from "./state.ts";
-import { glyphFor, truncateSubject } from "./render.ts";
+import { displayWidth, glyphFor, truncateSubject } from "./render.ts";
 
 /** 行段：一段带样式的文本（fg 为主题色名，bold 加粗，strikethrough 删除线） */
 export interface OverlaySegment {
@@ -39,17 +39,28 @@ function segment(text: string, fg?: string, bold?: boolean, strikethrough?: bool
 	return seg;
 }
 
-/** 单任务行：glyph + 标题（不显示数字序号；in_progress 行附 activeForm 标签）；completed 整行灰 + 标题删除线 */
+/** 内容区列预算（不含 glyph 段的 3 列）；超长时优先压缩标题，activeForm 独立上限 */
+export const ROW_CONTENT_COLS = 80;
+const GLYPH_SEGMENT_COLS = 3;
+const ACTIVE_FORM_MAX_COLS = 40;
+
+/** 单任务行：glyph + 标题（不显示数字序号；in_progress 行附 activeForm 标签）；completed 整行灰 + 标题删除线。
+ * 按显示宽度预算整行（CJK 宽字符按 2 列计），避免窄终端折行撑高面板。 */
 export function taskRow(task: Task): OverlayLine {
 	const isCompleted = task.status === "completed";
 	const glyphFg = isCompleted ? "muted" : task.status === "pending" ? "dim" : "accent";
 	const subjectFg = isCompleted ? "muted" : "text";
+	const suffix =
+		task.status === "in_progress" && task.activeForm
+			? ` — ${truncateSubject(task.activeForm, ACTIVE_FORM_MAX_COLS)}`
+			: "";
+	const subjectBudget = Math.max(1, ROW_CONTENT_COLS - GLYPH_SEGMENT_COLS - displayWidth(suffix));
 	const row: OverlayLine = [
 		segment(` ${glyphFor(task.status)} `, glyphFg),
-		segment(truncateSubject(task.subject), subjectFg, false, isCompleted),
+		segment(truncateSubject(task.subject, subjectBudget), subjectFg, false, isCompleted),
 	];
-	if (task.status === "in_progress" && task.activeForm) {
-		row.push(segment(` — ${task.activeForm}`, "muted"));
+	if (suffix) {
+		row.push(segment(suffix, "muted"));
 	}
 	return row;
 }

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1] - 2026-08-22
+
+- fix: create with a stray `id` param no longer crashes — `runAction` forwards the `changed` task returned by `applyTodoAction` instead of re-finding by id (regression test included)
+- fix: release `tool_execution_start` arg records even when a todo call errors, so failed calls no longer leak Map entries
+- fix: clamp snapshot `nextId` to `maxId + 1` on branch replay (hardening against tampered/corrupt session snapshots)
+- fix: width-aware truncation in panel rows — CJK titles and activeForm are measured in display columns (subject compressed first, activeForm capped at 40 cols), so rows fold less on narrow terminals
+- test: regression cases for all four fixes; prompt budgets unchanged
+
 ## [0.1.0] - 2026-08-19
 
 - feat: first usable release — core tools and UI (as reviewed)

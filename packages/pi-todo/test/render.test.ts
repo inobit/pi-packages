@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, visibleWidth } from "@earendil-works/pi-tui";
 import { GLYPHS, glyphFor, renderTodoCall, renderTodoResult, truncateSubject } from "../src/render.ts";
 import type { TodoDetails } from "../src/store.ts";
 
@@ -32,6 +32,15 @@ describe("行格式工具", () => {
 		const long = truncateSubject("y".repeat(100), 10);
 		expect(long.length).toBeLessThanOrEqual(11);
 		expect(long.endsWith("…")).toBe(true);
+	});
+
+	it("truncateSubject：CJK 等宽字符按显示宽度截断（回归 P4）", () => {
+		// 50 个 CJK = 100 显示列，超 80 列预算
+		const t = truncateSubject("中".repeat(50), 80);
+		expect(visibleWidth(t)).toBeLessThanOrEqual(80);
+		expect(t.endsWith("…")).toBe(true);
+		// ASCII 行为不变（宽度=字符数）
+		expect(truncateSubject("a".repeat(79), 80)).toBe("a".repeat(79));
 	});
 });
 

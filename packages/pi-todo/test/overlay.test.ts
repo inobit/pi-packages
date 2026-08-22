@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { buildOverlayLines, taskRow, type OverlayLine } from "../src/overlay.ts";
 import { createEmptyState, type Task, type TaskState } from "../src/state.ts";
 
@@ -106,5 +107,13 @@ describe("buildOverlayLines", () => {
 		const row = plain([taskRow(pending(1, long))]);
 		expect(row[0]!.length).toBeLessThan(100 + 20);
 		expect(row[0]).toContain("…");
+	});
+
+	it("taskRow：CJK 标题 + 超长 activeForm 整行不超列预算（回归 P4）", () => {
+		const row = taskRow(inProgress(1, "中".repeat(60), "写".repeat(60)));
+		const width = visibleWidth(row.map((s) => s.text).join(""));
+		// 内容区 80 列 + glyph 段 3 列
+		expect(width).toBeLessThanOrEqual(83);
+		expect(width).toBeGreaterThan(40); // 确有内容而非空行退化
 	});
 });

@@ -1,6 +1,6 @@
 {
   "name": "@inobit/pi-todo",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Minimal-intrusion task list extension for the Pi coding agent: a `todo` tool, a `/todos` command, and a live panel above the editor. State is replayed from the session branch, so it survives /reload and compaction.",
   "type": "module",
   "exports": {

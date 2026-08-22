@@ -122,6 +122,23 @@ describe("index.ts 工厂装配", () => {
 		expect(lines?.join("\n")).not.toContain("#"); // 无数字序号
 	});
 
+	it("create 误传无关 id：忽略该参数不崩溃（回归 P1）", async () => {
+		const pi = makePi();
+		factory(pi as never);
+		const tool = pi.tools.get("todo")! as unknown as {
+			execute(
+				id: string,
+				params: Record<string, unknown>,
+				signal: undefined,
+				onUpdate: undefined,
+				ctx: unknown,
+			): Promise<{ content: { type: string; text: string }[]; details: TodoDetails }>;
+		};
+		const res = await tool.execute("c1", { action: "create", subject: "x", id: 99 }, undefined, undefined, makeCtx());
+		expect(res.content[0]?.text).toBe("Added #1: x");
+		expect(res.details.tasks).toEqual([{ id: 1, subject: "x", status: "pending" }]);
+	});
+
 	it("session_start 无快照 → 卸载 widget", async () => {
 		const pi = makePi();
 		factory(pi as never);

@@ -67,6 +67,7 @@ export function isTodoDetails(value: unknown): value is TodoDetails {
  * 扫描分支中本工具的 toolResult，取最新一个成功快照重建内存态。
  * 错误路径的 details 只有 error、无 tasks，天然被跳过；
  * 无任何成功快照（如 fork 到早期点）返回 undefined（调用方按空态处理）。
+ * 加固：nextId 钳制到 maxId+1（防御被篡改/异常快照导致 create 分配撞车 id）。
  */
 export function replayFromBranch(branch: readonly BranchEntryLike[]): TaskState | undefined {
 	let latest: TodoDetails | undefined;
@@ -76,5 +77,7 @@ export function replayFromBranch(branch: readonly BranchEntryLike[]): TaskState 
 		if (!m || m.role !== "toolResult" || m.toolName !== "todo") continue;
 		if (isTodoDetails(m.details)) latest = m.details;
 	}
-	return latest ? fromSnapshot(latest.tasks, latest.nextId) : undefined;
+	if (!latest) return undefined;
+	const maxId = latest.tasks.reduce((max, t) => Math.max(max, t.id), 0);
+	return fromSnapshot(latest.tasks, Math.max(latest.nextId, maxId + 1));
 }
