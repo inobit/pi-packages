@@ -1,6 +1,6 @@
 {
   "name": "@inobit/pi-retry",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Manual transparent retry for Pi coding agent: re-issue the last failed turn without injecting any prompt into the LLM context",
   "type": "module",
   "exports": {

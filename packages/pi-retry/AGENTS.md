@@ -7,7 +7,7 @@ Pi coding agent 的手动透明重试扩展：`/retry` + 快捷键（默认 `alt
 ## 目标
 
 - `/retry` 与快捷键共用同一条执行路径（仅依赖基础 ctx 的 `isIdle` + `pi.sendMessage`，行为一致性由构造保证）
-- 扳机为隐藏哨兵消息（`customType: "pi-retry"`、`display:false`），成功受理后 notify `Retry started — re-issuing last turn`
+- 扳机为隐藏哨兵消息（`customType: "pi-retry"`、`display:false`），成功受理后 notify `Retry submitted`
 - 常驻 `context` 过滤保证哨兵在任何后续 turn / resume 后都出不去；其余消息（含失败半截 assistant）原样透传——prefill 式续写
 - 仅 idle 时可重试；streaming 中显式拒绝并 notify（streaming 中 sendMessage 会变义为 steer/followUp 注入）
 

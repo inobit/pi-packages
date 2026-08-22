@@ -67,7 +67,7 @@ export default function (pi: ExtensionAPI) {
       try {
         ctx.ui.notify(
           stop === undefined ? "Nothing to retry yet" : `Nothing to retry — last turn ended normally (${stop})`,
-          "info",
+          "warning",
         );
       } catch {}
       return;
