@@ -12,7 +12,7 @@ A pnpm workspace monorepo of extensions for [Pi coding agent](https://pi.dev). T
 | [`@inobit/pi-reader`](packages/pi-reader) | Reading mode: `alt+o` to toggle read-only, Vim-style paging (`ctrl-u/d/f/b` `gg/G` `j/k`), `?` help |
 | [`@inobit/pi-todo`](packages/pi-todo) | Minimal-intrusion task list: `todo` tool + `/todos` command + persistent panel above the editor, state stored on the session branch and replayable |
 | [`@inobit/pi-undo`](packages/pi-undo) | Undo last prompt: `/undo` + `alt+u`, single-per-turn, queue-aware, abort-then-undo |
-| [`@inobit/pi-themes`](packages/pi-themes) | Curated themes: Rosé Pine / TokyoNight families, each with light & dark variants supporting `theme: "light/dark"` paired auto-switching |
+| [`@inobit/pi-themes`](packages/pi-themes) | Curated themes: Rosé Pine, Tokyonight, Catppuccin and Solarized families with light & dark variants supporting `theme: "light/dark"` paired auto-switching |
 
 See each package's README (links above) for installation, configuration, and usage.
 

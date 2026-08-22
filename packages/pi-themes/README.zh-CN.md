@@ -2,7 +2,7 @@
 
 [English](./README.md) | **中文**
 
-一套精选的 [Pi coding agent](https://pi.dev) 主题包，内置两族主题，各含**亮色 + 暗色**变体，配合 pi 的 `theme: "亮/暗"` 配对语法可跟随终端配色自动切换（与内置 `light/dark` 同一机制）。
+一套精选的 [Pi coding agent](https://pi.dev) 主题包，内置四族主题，含**亮色 + 暗色**变体，配合 pi 的 `theme: "亮/暗"` 配对语法可跟随终端配色自动切换（与内置 `light/dark` 同一机制）。
 
 ## 主题
 
@@ -12,6 +12,12 @@
 | `rosepine-dawn` | 亮色（Rosé Pine dawn） | 同上 |
 | `tokyonight` | 暗色（night 变体） | [folke/tokyonight.nvim](https://github.com/folke/tokyonight.nvim) |
 | `tokyonight-day` | 亮色（day 变体） | 同上 |
+| `catppuccin-latte` | 亮色（Latte flavor） | [Catppuccin palette](https://catppuccin.com/palette/) |
+| `catppuccin-frappe` | 暗色（Frappé flavor） | 同上 |
+| `catppuccin-macchiato` | 暗色（Macchiato flavor） | 同上 |
+| `catppuccin-mocha` | 暗色（Mocha flavor） | 同上 |
+| `solarized-light` | 亮色（Solarized light） | [Solarized](https://ethanschoonover.com/solarized/) |
+| `solarized-dark` | 暗色（Solarized dark） | 同上 |
 
 ## 安装
 
@@ -19,7 +25,7 @@
 pi install npm:@inobit/pi-themes
 ```
 
-安装后四个主题进入 `/settings` 的主题列表，可直接选用。
+安装后十个主题进入 `/settings` 的主题列表，可直接选用。
 
 ## 启用
 
@@ -46,6 +52,20 @@ pi install npm:@inobit/pi-themes
 }
 ```
 
+```jsonc
+// settings.json
+{
+  "theme": "catppuccin-latte/catppuccin-mocha"
+}
+```
+
+```jsonc
+// settings.json
+{
+  "theme": "solarized-light/solarized-dark"
+}
+```
+
 也可在 `/settings` 里直接选择配对项。pi 检测终端为暗色时用右侧主题、亮色时用左侧主题，终端切换配色时实时跟随。
 
 > 提示：不想为某个终端配色配定制主题时，可直接对内置主题取用，例如 `"theme": "rosepine-dawn/dark"`。
@@ -63,4 +83,4 @@ pi -ne -e ./packages/pi-themes
 
 ## 致谢
 
-- 配色语义遵循 [Rosé Pine](https://rosepinetheme.com/palette/)（dawn/main 变体）与 [folke/tokyonight.nvim](https://github.com/folke/tokyonight.nvim)（day/night 变体）的原生设计。
+- 配色语义遵循 [Rosé Pine](https://rosepinetheme.com/palette/)（dawn/main 变体）、[folke/tokyonight.nvim](https://github.com/folke/tokyonight.nvim)（day/night 变体）、[Catppuccin palette](https://catppuccin.com/palette/)（latte/frappé/macchiato/mocha 四 flavor）与 [Solarized](https://ethanschoonover.com/solarized/)（light/dark）的原生设计。

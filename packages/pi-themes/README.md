@@ -2,7 +2,7 @@
 
 **English** | [中文](./README.zh-CN.md)
 
-A curated theme pack for [Pi coding agent](https://pi.dev) with two families, each shipping **light + dark** variants. Pair them with Pi's `theme: "light/dark"` syntax to follow the terminal color scheme automatically (same mechanism as the built-in `light/dark`).
+A curated theme pack for [Pi coding agent](https://pi.dev) with four families of **light + dark** variants. Pair them with Pi's `theme: "light/dark"` syntax to follow the terminal color scheme automatically (same mechanism as the built-in `light/dark`).
 
 ## Themes
 
@@ -12,6 +12,12 @@ A curated theme pack for [Pi coding agent](https://pi.dev) with two families, ea
 | `rosepine-dawn` | Light (Rosé Pine dawn) | Same as above |
 | `tokyonight` | Dark (night variant) | [folke/tokyonight.nvim](https://github.com/folke/tokyonight.nvim) |
 | `tokyonight-day` | Light (day variant) | Same as above |
+| `catppuccin-latte` | Light (Latte flavor) | [Catppuccin palette](https://catppuccin.com/palette/) |
+| `catppuccin-frappe` | Dark (Frappé flavor) | Same as above |
+| `catppuccin-macchiato` | Dark (Macchiato flavor) | Same as above |
+| `catppuccin-mocha` | Dark (Mocha flavor) | Same as above |
+| `solarized-light` | Light (Solarized light) | [Solarized](https://ethanschoonover.com/solarized/) |
+| `solarized-dark` | Dark (Solarized dark) | Same as above |
 
 ## Installation
 
@@ -19,7 +25,7 @@ A curated theme pack for [Pi coding agent](https://pi.dev) with two families, ea
 pi install npm:@inobit/pi-themes
 ```
 
-After installation, all four themes appear in the `/settings` theme list.
+After installation, all ten themes appear in the `/settings` theme list.
 
 ## Usage
 
@@ -46,6 +52,20 @@ After installation, all four themes appear in the `/settings` theme list.
 }
 ```
 
+```jsonc
+// settings.json
+{
+  "theme": "catppuccin-latte/catppuccin-mocha"
+}
+```
+
+```jsonc
+// settings.json
+{
+  "theme": "solarized-light/solarized-dark"
+}
+```
+
 You can also pick the paired entry directly in `/settings`. Pi uses the right-hand theme when the terminal is dark and the left-hand theme when it is light, updating live as the terminal scheme changes.
 
 > Tip: to avoid customizing a theme for one side, mix with a built-in, e.g. `"theme": "rosepine-dawn/dark"`.
@@ -56,7 +76,7 @@ Pi hot-reloads theme files on edit for instant feedback. See Pi's official [Them
 
 ## Credits
 
-- Palette semantics follow the original designs of [Rosé Pine](https://rosepinetheme.com/palette/) (dawn/main) and [folke/tokyonight.nvim](https://github.com/folke/tokyonight.nvim) (day/night).
+- Palette semantics follow the original designs of [Rosé Pine](https://rosepinetheme.com/palette/) (dawn/main), [folke/tokyonight.nvim](https://github.com/folke/tokyonight.nvim) (day/night), the [Catppuccin palette](https://catppuccin.com/palette/) (latte/frappé/macchiato/mocha), and [Solarized](https://ethanschoonover.com/solarized/) (light/dark).
 
 ## Development
 

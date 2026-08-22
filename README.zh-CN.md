@@ -12,7 +12,7 @@ Pi coding agent 扩展包的 monorepo（pnpm workspace）。面向 `@earendil-wo
 | [`@inobit/pi-reader`](packages/pi-reader) | 阅读模式扩展：`alt+o` 切换只读、 Vim 风格翻页（`ctrl-u/d/f/b` `gg/G` `j/k`）、`?` 帮助 |
 | [`@inobit/pi-todo`](packages/pi-todo) | 最小侵入任务清单扩展：`todo` 工具 + `/todos` 命令 + 编辑器上方常驻面板，状态存会话分支可重放 |
 | [`@inobit/pi-undo`](packages/pi-undo) | 撤销扩展：`/undo` + `alt+u`，单次/轮、队列感知、原子 abort 再撤 |
-| [`@inobit/pi-themes`](packages/pi-themes) | 精选主题包：Rosé Pine / TokyoNight 两族亮暗主题，支持 `theme: "亮/暗"` 配对自动切换 |
+| [`@inobit/pi-themes`](packages/pi-themes) | 精选主题包：Rosé Pine / TokyoNight / Catppuccin / Solarized 四族亮暗主题，支持 `theme: "亮/暗"` 配对自动切换 |
 
 各包安装、配置、使用详见其 README（上表链接）。
 

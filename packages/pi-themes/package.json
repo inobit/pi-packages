@@ -1,7 +1,7 @@
 {
   "name": "@inobit/pi-themes",
-  "version": "0.1.0",
-  "description": "Curated themes for the Pi coding agent: Rosé Pine (dawn/main) and Tokyonight (day/night) — each pair ships a light & dark variant ready for automatic terminal-following switching.",
+  "version": "0.2.0",
+  "description": "Curated themes for the Pi coding agent: Rosé Pine (dawn/main), Tokyonight (day/night), Catppuccin (latte/frappé/macchiato/mocha) and Solarized (light/dark) — light & dark variants ready for automatic terminal-following switching.",
   "type": "module",
   "files": [
     "themes",
@@ -16,7 +16,9 @@
     "pi-coding-agent",
     "theme",
     "rosepine",
-    "tokyonight"
+    "tokyonight",
+    "catppuccin",
+    "solarized"
   ],
   "license": "MIT",
   "repository": {
