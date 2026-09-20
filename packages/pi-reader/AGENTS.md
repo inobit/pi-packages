@@ -23,11 +23,22 @@
 
 | 文件           | 职责                                                                                                                                                                                                                                                                                                |
 | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/index.ts` | 纯逻辑导出 `parseReadingKey`/`halfPage`/`pageStep`/`GgSequence`；`ScrollReaderEditor`/`ReadonlyEditor`（左显 `◉ Reading`）；`factory` + `onTerminalInput` 双通道；`applyReaderUI` 隐藏输入（保留原输入）+ `Promise` 异步工具；`?` 帮助（`custom` overlay）；`getActiveToggleLabel` 读 `config.json` |
+| `src/index.ts` | 纯逻辑导出 `parseReadingKey`/`halfPage`/`pageStep`/`GgSequence`；原生私有面兼容层 `NativeTuiSurface`/`nativeTuiSurface`/`openNativeSearch`/`readNativeSearchSnapshot`/`hideNativeSearchOverlay`；`ScrollReaderEditor`/`ReadonlyEditor`（左显 `◉ Reading`）；`factory` + `onTerminalInput` 双通道；`applyReaderUI` 隐藏输入（保留原输入）+ `Promise` 异步工具；`?` 帮助（`custom` overlay）；`getActiveToggleLabel` 读 `config.json` |
 
 依赖方向：`index.ts → {CustomEditor, ExtensionAPI, ExtensionContext} from pi-coding-agent` + `{Key, matchesKey, truncateToWidth, type TUI} from pi-tui`；无本地子模块。
 
 ## 包特有约束（设计层面，改动前必读）
+
+**核心私有面（跨版本风险最高）**
+
+- 搜索/滚动/提示系列成员（`activeSearch`、`closeSearch`、`navigateSearch`、`getPrimaryScrollView`、`scrollBy`、`scrollToTop/Bottom`、`flash`）**都不在 pi-tui 公开 `TUI` 接口里**，是 `TuiAltScreen` 的类私有字段，`tsc` 看不见——0.86.0 把 `openSearch` 改名 `toggleSearch` 时无任何编译错误，搜索功能直接静默失效（`/` 无响应、`n`/`N` 一并失效）
+- 一律经 `NativeTuiSurface` + `nativeTuiSurface()` + `openNativeSearch()` 收窄，禁止新增 `(tui as any)?.xxx` 式探测；探测项必须保持可选（全部可选才能让真实 `TUI` 仍可赋值）
+- 开启搜索是**跨版本唯一分叉点**：0.86.0 `toggleSearch()` 是开关（已开则关），0.84.x `openSearch()` 幂等；因 reader 开启后立即隐藏 overlay 且 `activeSearch` 存续到 esc，已存在搜索态时必须跳过调用
+- `test/router.test.ts` 有原型链契约测试，但**只覆盖 `TuiAltScreen` 原型链上的方法**。下列不在覆盖内，每次升级核心必须人工核对（证据源：核心 dist 的 `tui-alt-screen.js` / `alt-screen-search.js`）：
+  - 实例字段 `activeSearch`——改名会让 `openNativeSearch` 恒返回 `opened`（toggle 反噬：第二次 `/` 关掉刚开的搜索）且快照恒 `null`（enter 即关搜索）；`focusedComponent`——改名会让 `dialogOpen()` 恒 `false`，复活弹窗悬挂 Bug B
+  - `activeSearch.component.handleInput`、`component.input.getValue`、`activeSearch.overlay.hide`（属 `AltScreenSearchComponent` / `OverlayHandle`）
+  - viewport 内省仍是裸 `any` 直探（`currentLayout.primaryScrollView` / `scrollContentLines` / `isFollowingEnd` / `scrollTo`），与搜索面同属私有面风险，尚未收敛
+- 升级核心后先跑 `pnpm check` + `pnpm test` 再动逻辑；契约测试变红时先查读者侧探测是否仍可用，再同步名单（核心把方法改成实例箭头函数字段属合法重构，会假阳性）
 
 **分层模型：焦点栈即按键归属**
 
