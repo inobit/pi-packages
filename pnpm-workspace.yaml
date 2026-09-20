@@ -20,4 +20,16 @@ catalog:
 
 allowBuilds:
   '@google/genai': true
+  # 保持既有行为：esbuild 的构建脚本不执行（平台二进制由 optionalDependencies 提供）
+  esbuild: false
   protobufjs: true
+
+# pnpm 11 安装时自动写入：0.86.0 系列早于 pnpm 内置发布龄策略（本项目未显式配置 minimumReleaseAge）。
+# 保留以保证换机器/CI 安装结果一致；若未来无需再装这些版本，可整段删除。
+minimumReleaseAgeExclude:
+  - '@earendil-works/chord@0.86.0'
+  - '@earendil-works/pi-agent-core@0.86.0'
+  - '@earendil-works/pi-ai@0.86.0'
+  - '@earendil-works/pi-coding-agent@0.86.0'
+  - '@earendil-works/pi-telemetry@0.86.0'
+  - '@earendil-works/pi-tui@0.86.0'
