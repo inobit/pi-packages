@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.3] - 2026-09-20
+
+- fix: search (`/` plus `n`/`N`) silently did nothing after upgrading to pi 0.86.0
+  - Root cause: pi-tui renamed the private `TuiAltScreen.openSearch()` to `toggleSearch()` (`openSearch` no longer exists anywhere in `pi-tui/dist`); the reader probed it via untyped `(tui as any)` duck typing, so the lookup yielded `undefined`, `proxySearchOpen` bailed out and the state machine never left `INACTIVE` — and since the `n`/`N` guards read that same state, the whole search surface died with no error and no effect
+  - Fix: all private-TUI probing for search now funnels through one typed compat layer (`NativeTuiSurface` + `nativeTuiSurface()` + `openNativeSearch()`), which prefers `toggleSearch()` and falls back to `openSearch()`; every other member the reader relies on (`closeSearch`, `navigateSearch`, `activeSearch.{component,query,matches,selectedIndex,overlay}`, `getPrimaryScrollView`, `scrollBy`, `scrollToTop`/`scrollToBottom`, `flash`) was verified present in 0.86.0
+  - Semantic difference handled: 0.86.0 `toggleSearch()` closes an already-open search whereas 0.84.x `openSearch()` only re-focused it. The reader hides the native overlay right after opening and keeps `activeSearch` alive until Esc, so opening is now skipped when a native search already exists — otherwise a second `/` would have closed the search it just opened
+  - Re-opening the search while one is already open (NAV then `/`) no longer shows an empty `Search: ` bar while the transcript still highlights the previous query: the bar is backfilled from the native query/progress, since typing there keeps editing that query instead of starting a fresh one (behaviour itself unchanged — only the display now matches the state)
+  - Type hygiene: the search path, the router IO contract and the scroll plumbing no longer use `any` (`tui` handles are `unknown`, narrowed through the structural surface); `pi.on(...)` registrations dropped their `as any` casts so a future event rename fails at compile time instead of silently
+  - Tests: +16 (`test/router.test.ts`) — both opener shapes, the `already-open` guard, snapshot/overlay helpers, plus a prototype-chain contract test that fails when `@earendil-works/pi-tui` renames or drops a `TuiAltScreen` method the reader depends on; instance fields (`activeSearch`, `focusedComponent`) and the search component/overlay members are outside its reach and need the manual checklist in the package AGENTS.md on every core upgrade
+  - deps: devDependencies for `@earendil-works/pi-{ai,coding-agent,tui}` bumped 0.84.2 → 0.86.0 (the release that exposed the breakage, so `pnpm check` sees the same API the user runs); `peerDependencies` stay `>=0.84.2` because both opener names are now supported
+
 ## [0.3.2] - 2026-08-24
 
 - fix: extension dialogs (e.g. a permission ask via `ctx.ui.select`) were frozen while READING was active, and toggling reading mode away made the dialog vanish without resolving its promise — the pending tool call hung forever (agent stuck on "Working...")

@@ -1,6 +1,6 @@
 {
   "name": "@inobit/pi-reader",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Vim-style reading mode for Pi fullscreen: toggle-once half/page scroll (ctrl-u/d/f/b, gg/G, j/k) with emacs-safe modal editor.",
   "type": "module",
   "exports": {
