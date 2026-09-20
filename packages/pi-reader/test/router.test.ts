@@ -8,6 +8,7 @@ import {
   nativeTuiSurface,
   openNativeSearch,
   readNativeSearchSnapshot,
+  searchUiOnOpen,
   SearchMode,
   type ReadingRouterIO,
 } from "../src/index.ts";
@@ -400,6 +401,33 @@ describe("nativeTuiSurface / 原生搜索快照读取", () => {
     expect(hide).toHaveBeenCalledTimes(1);
     expect(() => hideNativeSearchOverlay({ activeSearch: { overlay: {} } })).not.toThrow();
     expect(() => hideNativeSearchOverlay({ activeSearch: { overlay: { hide() { throw new Error("x"); } } } })).not.toThrow();
+  });
+});
+
+describe("searchUiOnOpen（按 / 时底部栏的初始显示）", () => {
+  const nativeState = {
+    activeSearch: {
+      query: "tokyo",
+      selectedIndex: 1,
+      matches: [{}, {}, {}],
+      component: { input: { getValue: () => "tokyo" } },
+    },
+  };
+
+  it("首次开启：输入态、查询为空", () => {
+    expect(searchUiOnOpen("opened", {})).toEqual({ mode: true, query: "", idx: -1, total: 0 });
+  });
+
+  it("复用既有原生搜索：回填 query 与进度（否则显示为空、实际在改旧查询）", () => {
+    expect(searchUiOnOpen("already-open", nativeState)).toEqual({ mode: true, query: "tokyo", idx: 1, total: 3 });
+  });
+
+  it("already-open 但原生暂无查询：仍是空输入栏", () => {
+    expect(searchUiOnOpen("already-open", { activeSearch: {} })).toEqual({ mode: true, query: "", idx: -1, total: 0 });
+  });
+
+  it("unavailable 不回填（调用方直接返回 false，不进输入态）", () => {
+    expect(searchUiOnOpen("unavailable", nativeState)).toEqual({ mode: true, query: "", idx: -1, total: 0 });
   });
 });
 

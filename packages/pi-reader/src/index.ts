@@ -209,6 +209,32 @@ export function hideNativeSearchOverlay(tui: unknown): void {
   try { nativeTuiSurface(tui).activeSearch?.overlay?.hide?.(); } catch {}
 }
 
+/** 底部 Search 栏的显示状态（reader 自有镜像，非原生状态） */
+export interface SearchBarState {
+  /** true=输入态（`Search: <q>`）；false=已提交态（`Search "<q>" (n/m)`） */
+  mode: boolean;
+  query: string;
+  idx: number;
+  total: number;
+}
+
+/**
+ * 按 `/` 打开搜索时底部栏的初始显示状态。
+ *
+ * 复用既有原生搜索（outcome=already-open，例如 NAV 态再按 `/`）必须先回填原生 query 与进度：
+ * reader 开启后立即隐藏 overlay，原生 activeSearch 会一直存活到 esc，后续按键继续追加到
+ * 旧查询上；此时若栏内显示空查询，就会出现「显示为空、实际在改旧查询」的错位。
+ */
+export function searchUiOnOpen(outcome: NativeSearchOpenOutcome, tui: unknown): SearchBarState {
+  const existing = outcome === "already-open" ? readNativeSearchSnapshot(tui) : null;
+  return {
+    mode: true,
+    query: existing?.query ?? "",
+    idx: existing?.idx ?? -1,
+    total: existing?.total ?? 0,
+  };
+}
+
 // ---------- 按键路由（双渠道共用核心，依赖注入可单测；见 plan-dialog-interaction-fix §4.1.2） ----------
 
 /** 判断 TUI 是否处于原生搜索态（activeSearch 存在即视为有搜索栏） */
@@ -1086,8 +1112,8 @@ export class ScrollReaderEditor extends CustomEditor {
  *  搜索输入态时同位置显示 Search: <query> (n/m)，替换式常驻、不堆叠。 */
 export class ReadonlyEditor extends CustomEditor {
   private readonly accent: (s: string) => string;
-  private readonly searchUiRef?: { mode: boolean; query: string; idx: number; total: number };
-  constructor(tui: TUI, theme: any, keybindings: any, style: { accent: (s: string) => string }, searchUiRef?: any) {
+  private readonly searchUiRef?: SearchBarState;
+  constructor(tui: TUI, theme: any, keybindings: any, style: { accent: (s: string) => string }, searchUiRef?: SearchBarState) {
     super(tui, theme, keybindings);
     this.accent = style.accent;
     this.searchUiRef = searchUiRef;
@@ -1215,7 +1241,7 @@ export default function (pi: ExtensionAPI) {
 
   // 搜索进度显示在底部输入栏（ReadonlyEditor）固定位置替换，不用 flash。
   // 搜索阶段常驻显示 Search，直到 esc 取消，不做节流切回 Reading。
-  const searchUi = { mode: false, query: "", idx: -1, total: 0 };
+  const searchUi: SearchBarState = { mode: false, query: "", idx: -1, total: 0 };
 
   const clearSearchUi = (): void => {
     searchUi.mode = false;
@@ -1245,11 +1271,8 @@ export default function (pi: ExtensionAPI) {
     // 仍保留原生匹配逻辑（refreshSearch）用于高亮，仅隐藏视觉
     hideNativeSearchOverlay(tui);
     searchMode = SearchMode.INPUT;
-    // 初始化底部栏为输入态
-    searchUi.mode = true;
-    searchUi.query = "";
-    searchUi.idx = -1;
-    searchUi.total = 0;
+    // 初始化底部栏为输入态；already-open 时回填既有原生查询与进度，避免显示与实际错位
+    Object.assign(searchUi, searchUiOnOpen(outcome, tui));
     try { nativeTuiSurface(tui).requestRender?.(); } catch {}
     return true;
   };
