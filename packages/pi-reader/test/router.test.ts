@@ -1,8 +1,13 @@
 import { describe, it, expect, vi } from "vitest";
+import { TuiAltScreen } from "@earendil-works/pi-tui";
 import {
   createReadingKeyRouter,
   hasActiveSearch,
+  hideNativeSearchOverlay,
   isForeignFocus,
+  nativeTuiSurface,
+  openNativeSearch,
+  readNativeSearchSnapshot,
   SearchMode,
   type ReadingRouterIO,
 } from "../src/index.ts";
@@ -316,5 +321,116 @@ describe("isForeignFocus（dialogOpen 判定本体，fake tui 注入 focusedComp
     expect(isForeignFocus({ id: "reader-editor" }, own)).toBe(true); // 结构相同但引用不同
     expect(isForeignFocus(help, {})).toBe(true); // 未登记豁免则视为外部
     expect(isForeignFocus(searchComp, { editor })).toBe(true);
+  });
+});
+
+describe("openNativeSearch（开启原生搜索：跨 pi-tui 版本的唯一分叉点）", () => {
+  it("0.86.0 形态（只有 toggleSearch）：调用一次即开启，且 this 绑定到 TUI 本体", () => {
+    const seen: unknown[] = [];
+    const tui = { toggleSearch(this: unknown) { seen.push(this); } };
+    expect(openNativeSearch(tui)).toBe("opened");
+    // 类方法内部读 this.activeSearch，丢 this 会直接抛错
+    expect(seen).toEqual([tui]);
+  });
+
+  it("0.84.x 形态（只有 openSearch）：回落旧名", () => {
+    const openSearch = vi.fn();
+    expect(openNativeSearch({ openSearch })).toBe("opened");
+    expect(openSearch).toHaveBeenCalledTimes(1);
+  });
+
+  it("两代 API 都不存在 → unavailable（调用方据此提示 Search unavailable）", () => {
+    expect(openNativeSearch({})).toBe("unavailable");
+    expect(openNativeSearch(null)).toBe("unavailable");
+    expect(openNativeSearch(undefined)).toBe("unavailable");
+  });
+
+  it("已存在 activeSearch 时不再调用：0.86.0 的 toggleSearch 是开关，重复调用会把搜索关掉", () => {
+    const toggleSearch = vi.fn();
+    expect(openNativeSearch({ toggleSearch, activeSearch: { query: "x" } })).toBe("already-open");
+    expect(toggleSearch).not.toHaveBeenCalled();
+    // 0.84.2 路径同样跳过：reader 开启后立即隐藏 overlay，无需重新聚焦
+    const openSearch = vi.fn();
+    expect(openNativeSearch({ openSearch, activeSearch: { query: "x" } })).toBe("already-open");
+    expect(openSearch).not.toHaveBeenCalled();
+  });
+
+  it("两代 API 并存时优先新名", () => {
+    const toggleSearch = vi.fn();
+    const openSearch = vi.fn();
+    expect(openNativeSearch({ toggleSearch, openSearch })).toBe("opened");
+    expect(toggleSearch).toHaveBeenCalledTimes(1);
+    expect(openSearch).not.toHaveBeenCalled();
+  });
+
+  it("核心抛错时向上冒泡，由调用方统一降级，不静默吞掉", () => {
+    expect(() => openNativeSearch({ toggleSearch() { throw new Error("boom"); } })).toThrow("boom");
+  });
+});
+
+describe("nativeTuiSurface / 原生搜索快照读取", () => {
+  it("非对象句柄一律降级为空面且不抛错", () => {
+    for (const v of [null, undefined, 0, "", "tui", true]) {
+      expect(nativeTuiSurface(v)).toEqual({});
+      expect(hasActiveSearch(v)).toBe(false);
+      expect(readNativeSearchSnapshot(v)).toBeNull();
+      expect(() => hideNativeSearchOverlay(v)).not.toThrow();
+    }
+  });
+
+  it("快照优先取输入组件当前值（去空白），并带上匹配进度", () => {
+    const tui = {
+      activeSearch: {
+        query: "stale",
+        selectedIndex: 1,
+        matches: [{}, {}, {}],
+        component: { input: { getValue: () => "  fresh  " } },
+      },
+    };
+    expect(readNativeSearchSnapshot(tui)).toEqual({ query: "fresh", idx: 1, total: 3 });
+  });
+
+  it("查询为空时仍返回快照（由调用方决定清栏还是显示输入态）", () => {
+    expect(readNativeSearchSnapshot({ activeSearch: {} })).toEqual({ query: "", idx: -1, total: 0 });
+  });
+
+  it("hideNativeSearchOverlay 调 overlay.hide；缺失或抛错均不冒泡", () => {
+    const hide = vi.fn();
+    hideNativeSearchOverlay({ activeSearch: { overlay: { hide } } });
+    expect(hide).toHaveBeenCalledTimes(1);
+    expect(() => hideNativeSearchOverlay({ activeSearch: { overlay: {} } })).not.toThrow();
+    expect(() => hideNativeSearchOverlay({ activeSearch: { overlay: { hide() { throw new Error("x"); } } } })).not.toThrow();
+  });
+});
+
+describe("核心私有面契约（对真实 @earendil-works/pi-tui 原型方法探测）", () => {
+  // reader 依赖的搜索/滚动成员是类私有成员，tsc 看不见；此处按运行时原型链断言：
+  // 核心一旦再次改名/删除，本用例失败，而不是让功能在升级后静默失效
+  // （0.86.0 把 openSearch 改成 toggleSearch 即此类变更，当时无任何测试拦得住）。
+  //
+  // 覆盖边界（勿高估）：只能覆盖 **TuiAltScreen 原型链上的方法**（含 TuiBase 继承项）。
+  // 看不见的：实例字段 activeSearch / focusedComponent，以及 activeSearch 下的
+  // component / overlay 成员（属 AltScreenSearchComponent / OverlayHandle）——
+  // 这些每次升级核心必须人工核对，清单见包 AGENTS.md「核心私有面」。
+  //
+  // 已知假阳性：核心若把某方法改成实例箭头函数字段（合法重构），`in` 会失败而 reader
+  // 仍可工作——请人工确认 reader 侧探测可用后同步更新本名单。
+  const proto = TuiAltScreen.prototype as unknown as Record<string, unknown>;
+
+  it("搜索/滚动/提示相关私有方法仍存在，且仍是函数", () => {
+    for (const name of [
+      "toggleSearch", "closeSearch", "navigateSearch",
+      "getPrimaryScrollView", "scrollBy", "scrollToTop", "scrollToBottom",
+      "flash", "requestRender",
+    ]) {
+      expect(name in proto, `@earendil-works/pi-tui 不再提供 ${name}`).toBe(true);
+      // 只断言存在不够：成员降级成非函数会让 reader 静默走降级分支
+      expect(typeof proto[name], `${name} 不再是函数`).toBe("function");
+    }
+  });
+
+  it("开启搜索至少有一代可用名（0.84.x openSearch / 0.86.0+ toggleSearch）", () => {
+    const names = ["toggleSearch", "openSearch"];
+    expect(names.some((n) => typeof proto[n] === "function"), `两代开启 API 都缺失：${names.join(" / ")}`).toBe(true);
   });
 });

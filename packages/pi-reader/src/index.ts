@@ -108,11 +108,112 @@ export function isEscKey(d: string): boolean {
   return false;
 }
 
+// ---------- 原生搜索 API 兼容层（pi-tui 私有面，跨版本差异的唯一收敛点） ----------
+//
+// 下列成员均**不在 pi-tui 的公开 `TUI` 接口**里（`openSearch`/`toggleSearch` 是类私有字段），
+// 只能按结构探测：一律声明为可选，缺失即视为不支持，读取方负责降级，不做多余假设。
+// 版本差异：0.84.2 为 `openSearch()`（幂等开启）；0.86.0 起改名 `toggleSearch()` 且改为开关语义。
+
+/** 原生搜索输入组件（pi-tui AltScreenSearchComponent 中 reader 依赖的部分） */
+export interface NativeSearchComponent {
+  handleInput?(data: string): void;
+  input?: { getValue?(): string } | null;
+}
+
+/** 原生 overlay 句柄（pi-tui OverlayHandle 中 reader 依赖的部分） */
+export interface NativeSearchOverlay {
+  hide?(): void;
+  focus?(): void;
+  isFocused?(): boolean;
+}
+
+/** 原生搜索态（pi-tui activeSearch 中 reader 依赖的部分；0.86.0 起多出内部 index 字段，reader 不使用） */
+export interface NativeSearchState {
+  component?: NativeSearchComponent | null;
+  query?: string;
+  matches?: readonly unknown[] | null;
+  selectedIndex?: number;
+  overlay?: NativeSearchOverlay | null;
+}
+
+/** 主滚动视图（pi-tui ScrollView 中 reader 依赖的部分） */
+export interface NativeScrollView {
+  viewportHeight?: number;
+}
+
+/** reader 依赖的 TUI 私有面；新增探测项一律保持可选，保证 `TUI` 仍可赋值给本类型 */
+export interface NativeTuiSurface {
+  activeSearch?: NativeSearchState | null;
+  /** 当前持焦组件（public `TUI` 接口未声明，位于 TuiBase）；dialogOpen 焦点比对用 */
+  focusedComponent?: unknown;
+  /** 0.86.0+：开关切换（已开时再调用会关闭搜索） */
+  toggleSearch?(): void;
+  /** 0.84.x：幂等开启（已开时仅重新聚焦 overlay） */
+  openSearch?(): void;
+  closeSearch?(): void;
+  navigateSearch?(direction: number): void;
+  getPrimaryScrollView?(): NativeScrollView | null | undefined;
+  /** 视口滚动（public `TUI` 接口未声明） */
+  scrollBy?(lines: number): void;
+  scrollToTop?(): void;
+  scrollToBottom?(): void;
+  flash?(message: string): void;
+  requestRender?(force?: boolean): void;
+}
+
+/** 将任意 TUI 句柄收窄到结构面；非对象（含 undefined/null）一律视为空面，探测不抛错 */
+export function nativeTuiSurface(tui: unknown): NativeTuiSurface {
+  return (typeof tui === "object" && tui !== null ? tui : {}) as NativeTuiSurface;
+}
+
+/** 原生搜索开启结果 */
+export type NativeSearchOpenOutcome = "opened" | "already-open" | "unavailable";
+
+/**
+ * 兼容开启原生搜索栏（跨 pi-tui 版本的唯一分叉点）。
+ *
+ * 已存在 activeSearch 时必须跳过调用：0.86.0 的 `toggleSearch()` 是开关，重复调用会把搜索关掉；
+ * 0.84.2 的 `openSearch()` 虽然幂等（仅重新聚焦 overlay），但 reader 开启后立即隐藏 overlay，
+ * 原生 activeSearch 会一直保留到 esc 关闭，两条版本路径下都无需重复开启。
+ *
+ * @returns opened=本次开启；already-open=沿用既有原生搜索态；unavailable=两代 API 都不存在
+ */
+export function openNativeSearch(tui: unknown): NativeSearchOpenOutcome {
+  const t = nativeTuiSurface(tui);
+  const openCompat: (() => void) | undefined =
+    typeof t.toggleSearch === "function" ? t.toggleSearch
+      : typeof t.openSearch === "function" ? t.openSearch
+        : undefined;
+  if (!openCompat) return "unavailable";
+  if (t.activeSearch) return "already-open";
+  openCompat.call(t);
+  return "opened";
+}
+
+/**
+ * 读取原生搜索进度快照：查询串优先取输入组件当前值（0.86.0 下与 activeSearch.query 同步）。
+ * 无原生搜索态返回 null；查询为空仍返回快照，由调用方决定是清栏还是显示输入态。
+ */
+export function readNativeSearchSnapshot(tui: unknown): { query: string; idx: number; total: number } | null {
+  const search = nativeTuiSurface(tui).activeSearch;
+  if (!search) return null;
+  return {
+    query: String(search.component?.input?.getValue?.() ?? search.query ?? "").trim(),
+    idx: search.selectedIndex ?? -1,
+    total: search.matches?.length ?? 0,
+  };
+}
+
+/** 隐藏原生右上角 overlay（保留原生 refreshSearch 高亮，视觉上只留底部 Search 栏） */
+export function hideNativeSearchOverlay(tui: unknown): void {
+  try { nativeTuiSurface(tui).activeSearch?.overlay?.hide?.(); } catch {}
+}
+
 // ---------- 按键路由（双渠道共用核心，依赖注入可单测；见 plan-dialog-interaction-fix §4.1.2） ----------
 
 /** 判断 TUI 是否处于原生搜索态（activeSearch 存在即视为有搜索栏） */
-export function hasActiveSearch(tui: any): boolean {
-  try { return !!(tui as any)?.activeSearch; } catch { return false; }
+export function hasActiveSearch(tui: unknown): boolean {
+  try { return !!nativeTuiSurface(tui).activeSearch; } catch { return false; }
 }
 
 /** reader 自有组件引用集合（焦点豁免用） */
@@ -151,16 +252,16 @@ export interface ReadingRouterIO {
   helpOpen(): boolean;
   /** 外部组件夺焦探测（扩展弹窗/ui.input 等一切夺焦场景）；为真时除渠道 1 的 toggle 外全量透传 */
   dialogOpen(): boolean;
-  /** 当前 TUI 引用 */
-  getTui(): any;
+  /** 当前 TUI 引用（结构探测，调用方各自收窄） */
+  getTui(): unknown;
   /** 双通道去重（terminal 对极短时间内重复投递抑制） */
   isDuplicateNav(data: string, source: "input" | "terminal"): boolean;
   /** 搜索输入处理（INPUT 态全量接收直到 enter/esc）；返回 undefined 表示未消费 */
-  handleSearchInput(data: string, tui: any, source: "input" | "terminal"): boolean | undefined;
+  handleSearchInput(data: string, tui: unknown, source: "input" | "terminal"): boolean | undefined;
   /** esc 二义处理：有搜索栏就关搜索取消高亮，否则退出阅读 */
-  handleEsc(tui: any): void;
+  handleEsc(tui: unknown): void;
   /** 清搜索栏并取消高亮，重置状态机，留在 READING */
-  closeSearch(tui: any): void;
+  closeSearch(tui: unknown): void;
   /** 切换阅读模式 */
   toggle(): void;
   /** 打开帮助弹窗 */
@@ -172,9 +273,9 @@ export interface ReadingRouterIO {
   /** 工具展开切换（app.tools.expand 命中时调用，含锚点保位） */
   toggleToolsExpanded(): void;
   /** 语义导航（/ n N {} 与 [q/a/t 序列）；返回 true 表示已消费 */
-  trySemanticNav(data: string, tui: any): boolean;
+  trySemanticNav(data: string, tui: unknown): boolean;
   /** 视口高度读取（异常时兜底 20） */
-  getViewportHeight(tui: any): number;
+  getViewportHeight(tui: unknown): number;
   /** gg 双击判定 */
   ggPress(): boolean;
   ggReset(): void;
@@ -184,7 +285,7 @@ export interface ReadingRouterIO {
   resetModifiers(): void;
   /** 记录上次语义跳目标 */
   updateLastSemantic(row: number): void;
-  requestRender(tui: any): void;
+  requestRender(tui: unknown): void;
 }
 
 /**
@@ -199,6 +300,7 @@ export interface ReadingRouterIO {
 export function createReadingKeyRouter(io: ReadingRouterIO, source: "input" | "terminal"): (data: string) => RouteResult {
   return (data: string): RouteResult => {
     const tui = io.getTui();
+    const nativeTui = nativeTuiSurface(tui);
     const reading = io.isReading();
 
     // ─── 外部弹窗/帮助并存期的按键接管（设计约束，勿改语义）─────
@@ -317,21 +419,21 @@ export function createReadingKeyRouter(io: ReadingRouterIO, source: "input" | "t
     const page = pageStep(vh);
     const lineCnt = io.countPeek() ?? 1;
     switch (key) {
-      case "halfUp": tui?.scrollBy?.(-half * lineCnt); io.countReset(); break;
-      case "halfDown": tui?.scrollBy?.(half * lineCnt); io.countReset(); break;
-      case "pageDown": tui?.scrollBy?.(page * lineCnt); io.countReset(); break;
-      case "pageUp": tui?.scrollBy?.(-page * lineCnt); io.countReset(); break;
-      case "lineUp": tui?.scrollBy?.(-lineCnt); io.countReset(); break;
-      case "lineDown": tui?.scrollBy?.(lineCnt); io.countReset(); break;
-      case "bottom": tui?.scrollToBottom?.(); io.countReset(); break;
+      case "halfUp": nativeTui.scrollBy?.(-half * lineCnt); io.countReset(); break;
+      case "halfDown": nativeTui.scrollBy?.(half * lineCnt); io.countReset(); break;
+      case "pageDown": nativeTui.scrollBy?.(page * lineCnt); io.countReset(); break;
+      case "pageUp": nativeTui.scrollBy?.(-page * lineCnt); io.countReset(); break;
+      case "lineUp": nativeTui.scrollBy?.(-lineCnt); io.countReset(); break;
+      case "lineDown": nativeTui.scrollBy?.(lineCnt); io.countReset(); break;
+      case "bottom": nativeTui.scrollToBottom?.(); io.countReset(); break;
       case "top":
         if (data === "gg") {
           io.ggReset();
-          tui?.scrollToTop?.();
+          nativeTui.scrollToTop?.();
           io.countReset();
           io.updateLastSemantic(0);
         } else if (io.ggPress()) {
-          tui?.scrollToTop?.();
+          nativeTui.scrollToTop?.();
           io.countReset();
           io.updateLastSemantic(0);
         } else {
@@ -1082,8 +1184,15 @@ export default function (pi: ExtensionAPI) {
     return false;
   };
 
-  const flash = (tui: any, msg: string): void => {
-    try { (tui as any)?.flash?.(msg); return; } catch {}
+  /**
+   * 原生 flash（pi-tui `TuiBase.flash`）提示。
+   * 降级语义与改前逐字一致：可选调用后立即 return，因此只有「flash 存在但调用抛错」
+   * 才会回落到 `ui.notify`，核心无 flash 时保持静默（不改变现有可观测行为）。
+   */
+  const flash = (tui: unknown, msg: string): void => {
+    const native = nativeTuiSurface(tui);
+    if (typeof native.flash !== "function") return;
+    try { native.flash.call(native, msg); return; } catch {}
     try { currentCtx?.ui?.notify?.(msg, "info"); } catch {}
   };
 
@@ -1095,11 +1204,11 @@ export default function (pi: ExtensionAPI) {
    */
   const dialogOpen = (): boolean => {
     try {
-      const tui: any = latestTui;
-      return isForeignFocus(tui?.focusedComponent, {
+      const native = nativeTuiSurface(latestTui);
+      return isForeignFocus(native.focusedComponent, {
         editor: currentReaderEditor,
         help: currentHelpComponent,
-        searchComponent: tui?.activeSearch?.component,
+        searchComponent: native.activeSearch?.component,
       });
     } catch { return false; }
   };
@@ -1116,34 +1225,33 @@ export default function (pi: ExtensionAPI) {
   };
 
   /** 关闭搜索栏并取消高亮，重置状态机，留在 READING */
-  const closeSearchAndReset = (tui: any): void => {
-    try { (tui as any)?.closeSearch?.(); } catch {}
+  const closeSearchAndReset = (tui: unknown): void => {
+    try { nativeTuiSurface(tui).closeSearch?.(); } catch {}
     searchMode = SearchMode.INACTIVE;
     clearSearchUi();
-    try { (tui as any)?.requestRender?.(); } catch {}
+    try { nativeTuiSurface(tui).requestRender?.(); } catch {}
   };
 
-  const proxySearchOpen = (tui: any): boolean => {
+  const proxySearchOpen = (tui: unknown): boolean => {
     clearSearchUi();
-    try {
-      const fn: any = (tui as any)?.openSearch;
-      if (typeof fn === "function") {
-        fn.call(tui);
-        // 隐藏原生右上角 overlay，仅保留底部 ReadonlyEditor 的 Search 栏（单入口，避免双重 Search）
-        try { (tui as any)?.activeSearch?.overlay?.hide?.(); } catch {}
-        // 仍保留原生匹配逻辑（refreshSearch）用于高亮，仅隐藏视觉
-        searchMode = SearchMode.INPUT;
-        // 初始化底部栏为输入态
-        searchUi.mode = true;
-        searchUi.query = "";
-        searchUi.idx = -1;
-        searchUi.total = 0;
-        tui?.requestRender?.();
-        return true;
-      }
-    } catch {}
-    flash(tui, "Search unavailable");
-    return false;
+    // 私有面结构探测：跨版本差异或核心内部异常统一降级为「不可用」，不让异常冒泡到按键路由
+    let outcome: NativeSearchOpenOutcome = "unavailable";
+    try { outcome = openNativeSearch(tui); } catch { outcome = "unavailable"; }
+    if (outcome === "unavailable") {
+      flash(tui, "Search unavailable");
+      return false;
+    }
+    // 隐藏原生右上角 overlay，仅保留底部 ReadonlyEditor 的 Search 栏（单入口，避免双重 Search）
+    // 仍保留原生匹配逻辑（refreshSearch）用于高亮，仅隐藏视觉
+    hideNativeSearchOverlay(tui);
+    searchMode = SearchMode.INPUT;
+    // 初始化底部栏为输入态
+    searchUi.mode = true;
+    searchUi.query = "";
+    searchUi.idx = -1;
+    searchUi.total = 0;
+    try { nativeTuiSurface(tui).requestRender?.(); } catch {}
+    return true;
   };
 
   /**
@@ -1153,37 +1261,32 @@ export default function (pi: ExtensionAPI) {
    * - 其他: 全部喂给官方 Input（含 j/k、退格、粘贴等）
    * 返回 true 表示已消费
    */
-  const handleSearchInput = (d: string, tui: any, source: "input" | "terminal"): boolean | undefined => {
+  const handleSearchInput = (d: string, tui: unknown, source: "input" | "terminal"): boolean | undefined => {
     if (searchMode !== SearchMode.INPUT) return undefined;
     if (isDuplicateNav(d, source)) return true;
     if (isEnterKey(d)) {
       // enter 切状态：有查询则进入 NAV，高亮保留；空查询则关闭
       try {
-        const q = String((tui as any)?.activeSearch?.component?.input?.getValue?.() ?? (tui as any)?.activeSearch?.query ?? "").trim();
-        if (!q) {
+        const snapshot = readNativeSearchSnapshot(tui);
+        if (!snapshot || !snapshot.query) {
           closeSearchAndReset(tui);
           return true;
         }
-        try { (tui as any)?.navigateSearch?.(1); } catch {}
-        try {
-          const ov: any = (tui as any)?.activeSearch?.overlay;
-          if (ov && typeof ov.hide === "function") ov.hide();
-        } catch {}
+        try { nativeTuiSurface(tui).navigateSearch?.(1); } catch {}
+        hideNativeSearchOverlay(tui);
         searchMode = SearchMode.NAV;
-        // 同步底部栏显示
+        // 同步底部栏显示（原生 matches 由 refreshSearch 在下一帧才更新，故延后取快照）
         setTimeout(() => {
           try {
-            const a2: any = (tui as any)?.activeSearch;
-            if (!a2) { clearSearchUi(); return; }
-            const q2 = String(a2?.query ?? "").trim();
-            if (!q2) { clearSearchUi(); return; }
+            const p = readNativeSearchSnapshot(tui);
+            if (!p || !p.query) { clearSearchUi(); return; }
             // hide 后可能因 render 重现 overlay，再次隐藏保留高亮
-            try { const ov2: any = a2?.overlay; if (ov2 && typeof ov2.hide === "function") ov2.hide(); } catch {}
+            hideNativeSearchOverlay(tui);
             searchUi.mode = false;
-            searchUi.query = q2;
-            searchUi.idx = a2?.selectedIndex ?? -1;
-            searchUi.total = a2?.matches?.length ?? 0;
-            (tui as any)?.requestRender?.();
+            searchUi.query = p.query;
+            searchUi.idx = p.idx;
+            searchUi.total = p.total;
+            nativeTuiSurface(tui).requestRender?.();
           } catch {}
         }, 30);
       } catch {}
@@ -1194,30 +1297,30 @@ export default function (pi: ExtensionAPI) {
       closeSearchAndReset(tui);
       return true;
     }
-    const comp: any = (tui as any)?.activeSearch?.component;
+    const comp = nativeTuiSurface(tui).activeSearch?.component;
     if (comp && typeof comp.handleInput === "function") {
       try { comp.handleInput(d); } catch {}
       // 同步底部栏：实时反映 query 与匹配数（单入口，避免右上角重复）
       try {
-        const curQ = String(comp.input?.getValue?.() ?? (tui as any)?.activeSearch?.query ?? "").trim();
+        const curQ = readNativeSearchSnapshot(tui)?.query ?? "";
         // 下一帧 refreshSearch 才会更新 matches，先用当前 activeSearch 的值
         setTimeout(() => {
           try {
-            const a: any = (tui as any)?.activeSearch;
-            if (!a) return;
+            const p = readNativeSearchSnapshot(tui);
+            if (!p) return;
             // 确保原生 overlay 保持隐藏（仅底部栏）
-            try { a.overlay?.hide?.(); } catch {}
+            hideNativeSearchOverlay(tui);
             searchUi.mode = true;
             searchUi.query = curQ;
-            searchUi.idx = a.selectedIndex ?? -1;
-            searchUi.total = a.matches?.length ?? 0;
-            try { (tui as any)?.requestRender?.(); } catch {}
+            searchUi.idx = p.idx;
+            searchUi.total = p.total;
+            nativeTuiSurface(tui).requestRender?.();
           } catch {}
         }, 15);
         if (curQ) {
           searchUi.mode = true;
           searchUi.query = curQ;
-          try { (tui as any)?.requestRender?.(); } catch {}
+          try { nativeTuiSurface(tui).requestRender?.(); } catch {}
         } else {
           searchUi.query = "";
           searchUi.idx = -1;
@@ -1230,30 +1333,26 @@ export default function (pi: ExtensionAPI) {
     return true;
   };
 
-  const proxySearchNavigate = (tui: any, dir: number): boolean => {
+  const proxySearchNavigate = (tui: unknown, dir: number): boolean => {
     try {
-      const as: any = (tui as any)?.activeSearch;
-      const fn: any = (tui as any)?.navigateSearch;
-      if (as && typeof fn === "function") {
-        fn.call(tui, dir);
-        setTimeout(() => {
-          try {
-            const a2: any = (tui as any)?.activeSearch;
-            try {
-              const ov2: any = a2?.overlay;
-              if (ov2 && typeof ov2.hide === "function") ov2.hide();
-            } catch {}
-            const q = String(a2?.query ?? "").trim();
-            if (!q) { clearSearchUi(); return; }
-            searchUi.mode = false;
-            searchUi.query = q;
-            searchUi.idx = a2?.selectedIndex ?? -1;
-            searchUi.total = a2?.matches?.length ?? 0;
-            (tui as any)?.requestRender?.();
-          } catch {}
-        }, 30);
-        return true;
-      }
+      const native = nativeTuiSurface(tui);
+      const navigate = native.navigateSearch;
+      if (!native.activeSearch || typeof navigate !== "function") return false;
+      navigate.call(native, dir);
+      setTimeout(() => {
+        try {
+          const p = readNativeSearchSnapshot(tui);
+          // 确保原生 overlay 保持隐藏（仅底部栏）
+          hideNativeSearchOverlay(tui);
+          if (!p || !p.query) { clearSearchUi(); return; }
+          searchUi.mode = false;
+          searchUi.query = p.query;
+          searchUi.idx = p.idx;
+          searchUi.total = p.total;
+          nativeTuiSurface(tui).requestRender?.();
+        } catch {}
+      }, 30);
+      return true;
     } catch {}
     return false;
   };
@@ -1662,7 +1761,7 @@ export default function (pi: ExtensionAPI) {
       bracketSeq.reset();
       helpOpen = false;
       // 退出 reading 时若搜索还开着，一并关闭恢复视图
-      try { (latestTui as any)?.closeSearch?.(); } catch {}
+      try { nativeTuiSurface(latestTui).closeSearch?.(); } catch {}
       searchMode = SearchMode.INACTIVE;
       clearSearchUi();
     } else {
@@ -1676,13 +1775,13 @@ export default function (pi: ExtensionAPI) {
   };
 
   /** esc 统一处理：有搜索栏就关闭取消高亮，留在 READING；无搜索才退出 READING */
-  const handleEsc = (tui: any): boolean => {
+  const handleEsc = (tui: unknown): boolean => {
     if (searchMode === SearchMode.INPUT || searchMode === SearchMode.NAV || hasActiveSearch(tui)) {
       closeSearchAndReset(tui);
       return true;
     }
     toggle();
-    try { (latestTui as any)?.requestRender?.(); } catch {}
+    try { nativeTuiSurface(latestTui).requestRender?.(); } catch {}
     return true;
   };
 
@@ -1710,7 +1809,10 @@ export default function (pi: ExtensionAPI) {
     trySemanticNav: (d, tui) => tryHandleReadingNav(d, tui),
     getViewportHeight: (tui) => {
       try {
-        return tui?.getPrimaryScrollView?.().viewportHeight ?? (latestTui as any)?.getPrimaryScrollView?.().viewportHeight ?? 20;
+        // 保留原有优先级：主通道缺失时才回落到最近一次 factory 收到的 TUI
+        return nativeTuiSurface(tui).getPrimaryScrollView?.()?.viewportHeight
+          ?? nativeTuiSurface(latestTui).getPrimaryScrollView?.()?.viewportHeight
+          ?? 20;
       } catch { return 20; }
     },
     ggPress: () => gg.press(),
@@ -1719,21 +1821,20 @@ export default function (pi: ExtensionAPI) {
     countReset: () => countBuf.reset(),
     resetModifiers: () => { countBuf.reset(); bracketSeq.reset(); },
     updateLastSemantic,
-    requestRender: (tui) => { try { tui?.requestRender?.(); } catch {} },
+    requestRender: (tui) => { try { nativeTuiSurface(tui).requestRender?.(); } catch {} },
   };
   const inputRoute = createReadingKeyRouter(routerIO, "input");
   const terminalRoute = createReadingKeyRouter(routerIO, "terminal");
 
   // TUI inputListener 高可靠拦截（不依赖 editor focus）
   const factory = (tui: TUI, theme: any, kb: any) => {
-    const tt: any = tui;
     let ed: ScrollReaderEditor;
     try {
       ed = new ScrollReaderEditor(tui, theme, kb);
     } catch {
       ed = new ScrollReaderEditor(tui, theme ?? {}, kb ?? {});
     }
-    try { latestTui = tui as any; } catch {}
+    try { latestTui = tui; } catch {}
     // dialogOpen 焦点比对基准：登记 reader 自己创建的最新编辑器实例
     currentReaderEditor = ed;
     // 需求 B：terminal 通道无 kb 入参，在此记账（仿 latestTui 先例，plan §9.2）
@@ -1741,7 +1842,7 @@ export default function (pi: ExtensionAPI) {
     try {
       if (listenerInstalled) return ed;
       listenerInstalled = true;
-      tt.addInputListener?.((d: string) => inputRoute(d));
+      tui.addInputListener?.((d: string) => inputRoute(d));
     } catch {}
     return ed;
   };
@@ -1776,10 +1877,10 @@ export default function (pi: ExtensionAPI) {
   const installTerminalListener = (ctx: ExtensionContext) => {
     try { offTerminalInput?.(); } catch {}
     try {
-      offTerminalInput = ctx.ui.onTerminalInput?.((data: string) => terminalRoute(data)) as any;
+      offTerminalInput = ctx.ui.onTerminalInput?.((data: string) => terminalRoute(data));
     } catch {}
   };
-  const handleSession = async (_event: any, ctx: ExtensionContext) => {
+  const handleSession = async (_event: unknown, ctx: ExtensionContext) => {
     refreshCtx(ctx);
     isReading = false;
     helpOpen = false;
@@ -1808,15 +1909,17 @@ export default function (pi: ExtensionAPI) {
     } catch {}
     installTerminalListener(ctx);
   };
-  pi.on("session_start", handleSession as any);
-  pi.on("session_info_changed" as any, async (_e: any, ctx: ExtensionContext) => refreshCtx(ctx));
-  pi.on("session_before_switch" as any, async (_e: any, ctx: ExtensionContext) => refreshCtx(ctx));
-  pi.on("session_before_fork" as any, async (_e: any, ctx: ExtensionContext) => refreshCtx(ctx));
-  pi.on("session_before_compact" as any, async (_e: any, ctx: ExtensionContext) => refreshCtx(ctx));
-  pi.on("session_compact" as any, async (_e: any, ctx: ExtensionContext) => refreshCtx(ctx));
-  pi.on("session_before_tree" as any, async (_e: any, ctx: ExtensionContext) => refreshCtx(ctx));
-  pi.on("session_tree" as any, async (_e: any, ctx: ExtensionContext) => refreshCtx(ctx));
-  pi.on("session_shutdown" as any, async (_e: any, ctx: ExtensionContext) => refreshCtx(ctx));
+  // 事件名与处理器签名一律交给 ExtensionAPI 的 overload 校验：
+  // 旧写法用 `as any` 掩盖类型，核心一旦改名/改签名会静默失效（与 openSearch 同一类隐患）
+  pi.on("session_start", handleSession);
+  pi.on("session_info_changed", async (_e, ctx) => refreshCtx(ctx));
+  pi.on("session_before_switch", async (_e, ctx) => refreshCtx(ctx));
+  pi.on("session_before_fork", async (_e, ctx) => refreshCtx(ctx));
+  pi.on("session_before_compact", async (_e, ctx) => refreshCtx(ctx));
+  pi.on("session_compact", async (_e, ctx) => refreshCtx(ctx));
+  pi.on("session_before_tree", async (_e, ctx) => refreshCtx(ctx));
+  pi.on("session_tree", async (_e, ctx) => refreshCtx(ctx));
+  pi.on("session_shutdown", async (_e, ctx) => refreshCtx(ctx));
 
   const cmdHandler = async (_args: string, ctx: ExtensionContext) => {
     const applied = toggle(ctx);
