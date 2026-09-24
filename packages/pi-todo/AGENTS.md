@@ -8,7 +8,7 @@ Pi coding agent 的最小侵入任务清单扩展。
 
 - `todo` 工具：模型可 create/update/list/get/delete/clear 任务，`pending → in_progress → completed` 状态机推进
 - `/todos` 命令：当前会话全部任务的分组列表（TUI 全屏，Escape 关闭）
-- 编辑器上方面板（widget）：`Todos (done/total)` 标题 + glyph 行 + activeForm 标签，折叠（`ctrl+shift+t`）、溢出截断、完成项下轮自动隐藏
+- 编辑器上方面板（widget）：`Todos (done/total)` 标题 + glyph 行 + activeForm 标签，折叠（主 `alt+t`、别名 `ctrl+shift+t`，折叠为带 ✓/◐/○ 明细的单行）、硬上限 7 行溢出截断、已完成按软目标 5 + 3s 延迟清理（上一轮优先，未完成必留，量少跨轮保留）
 - 状态存会话分支：成功快照写入 tool result `details`，`session_start`/`session_compact`/`session_tree` 重放恢复
 
 ## 源码结构（src/）
@@ -20,7 +20,8 @@ Pi coding agent 的最小侵入任务清单扩展。
 | `schema.ts`  | TypeBox 参数 schema（6 参数，description 即 prompt copy）                  |
 | `state.ts`   | Task/TaskState 类型 + 纯函数 reducer（迁移校验、id 分配）；不依赖 pi 类型  |
 | `store.ts`   | `Map<sid, TaskState>` 会话隔离 + commit + `replayFromBranch`               |
-| `overlay.ts` | 面板行构建（折叠/溢出/完成项隐藏）；纯函数                                 |
+| `overlay.ts` | 面板行构建（折叠/预算/完成项隐藏）；纯函数，`planVisibility` 供 index 复用行数口径 |
+| `config.ts`  | 面板预算配置（`maxLines`/`targetLines`，默认 7/5）；参照 pi-undo 模式      |
 | `render.ts`  | renderCall/renderResult + 行格式工具（glyph、截断）                        |
 
 依赖方向：`index → todo → {schema, state, store, overlay, render}`；状态模块不 import pi 运行时类型（结构类型注入，便于单测）。

@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.0] - 2026-09-24
+
+- feat: panel budget rendering — hard cap `maxLines` (default 7, `+N more` overflow) + soft cleanup target `targetLines` (default 5, best-effort); unfinished always kept, completed newest-first; both configurable via `config.json` (requires `2 <= targetLines <= maxLines`)
+- feat: 3s delayed cleanup of completed items — newly completed stays visible for a confirmation window, then trims to target oldest-first (previous rounds first); under-target lists persist across rounds (no more blanket per-round clear); render-layer only, replay contract untouched
+- feat: collapse shortcut `alt+t` (keeps `ctrl+shift+t` as alias); collapsed panel is a single line `▸ Todos (done/total) ✓n ◐n ○n — alt+t to expand`, expanded title carries `▾`
+- feat: guideline #2 rewritten to completion timing (123 chars, still within prompt budgets)
+- fix: view state isolated per rendered session — switching sessions resets completion order/rounds/suppressed set, so colliding ids are no longer wrongly hidden or misordered across sessions; project-level config.json wired via `isProjectTrusted` (dual-session regression test included)
+- note: true header-click needs pi-tui mouse support (not available in 0.84.2); toggle stays shortcut-only
+
 ## [0.1.1] - 2026-08-22
 
 - fix: create with a stray `id` param no longer crashes — `runAction` forwards the `changed` task returned by `applyTodoAction` instead of re-finding by id (regression test included)

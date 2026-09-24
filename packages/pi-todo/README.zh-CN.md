@@ -23,9 +23,20 @@ pi install npm:@inobit/pi-todo
   - `todo update <id> <status> [activeForm]` 推进状态（`in_progress` / `completed`，可带进行时标签如 "writing tests"）
   - `todo list [status]` / `todo get <id>` / `todo delete <id>` / `todo clear`
 - `/todos`：全屏分组列表（Pending / In Progress / Completed），Escape 关闭
-- 面板折叠快捷键：`ctrl+shift+t`
+- 面板折叠快捷键：`alt+t`（`ctrl+shift+t` 为兼容别名）；折叠后为带状态计数的单行
+- 面板预算：最多显示 `maxLines` 行（默认 7），未完成任务必留；已完成任务在置完成 3s 后按 `targetLines`（默认 5）自动清理，先藏最旧
 
-任务状态 `pending → in_progress → completed`，`completed` 仅由模型显式设置；删除走 tombstone 防 id 重用。v1 不提供配置文件。
+任务状态 `pending → in_progress → completed`，`completed` 仅由模型显式设置；删除走 tombstone 防 id 重用。
+
+## 配置
+
+可选 `config.json`（全局 `~/.pi/agent/extensions/pi-todo/config.json`，或 trusted 时项目 `<cwd>/.pi/extensions/pi-todo/config.json`）：
+
+```json
+{ "maxLines": 7, "targetLines": 5 }
+```
+
+要求 `2 <= targetLines <= maxLines`，非法值回退默认；`targetLines` 超过 `maxLines` 时钳制到 `maxLines`。
 
 ## 开发
 

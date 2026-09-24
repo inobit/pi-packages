@@ -29,7 +29,7 @@ export const TODO_PROMPT_SNIPPET = "Manage a task list to track multi-step progr
 
 export const TODO_PROMPT_GUIDELINES = [
 	"Use todo when work has 3+ distinct steps, the user gives a task list, or new instructions arrive; skip single trivial steps.",
-	"Mark a todo in_progress before starting it (one at a time); mark completed only when actually done — never on intent or while tests fail.",
+	"Mark todo in_progress when starting; mark todo completed promptly after verification — never on intent or while tests fail.",
 	"Todo status moves pending → in_progress → completed; pass a present-continuous activeForm like \"writing tests\" when starting a task.",
 ] as const;
 

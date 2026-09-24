@@ -23,9 +23,20 @@ Restart the Pi session to take effect. For local development, symlink to `~/.pi/
   - `todo update <id> <status> [activeForm]` — advance status (`in_progress` / `completed`, optional running label like "writing tests")
   - `todo list [status]` / `todo get <id>` / `todo delete <id>` / `todo clear`
 - `/todos`: fullscreen grouped list (Pending / In Progress / Completed), `Escape` to close
-- Panel collapse shortcut: `ctrl+shift+t`
+- Panel collapse shortcut: `alt+t` (`ctrl+shift+t` also works as an alias); collapsed panel is a single line with status counts
+- Panel budget: at most `maxLines` lines (default 7), unfinished tasks always kept; completed tasks auto-trim to `targetLines` (default 5) 3s after completion, oldest first
 
-Task states `pending → in_progress → completed`; `completed` is only set explicitly by the model. Deletes use a tombstone to prevent id reuse. No config file in v1.
+Task states `pending → in_progress → completed`; `completed` is only set explicitly by the model. Deletes use a tombstone to prevent id reuse.
+
+## Configuration
+
+Optional `config.json` (global `~/.pi/agent/extensions/pi-todo/config.json`, or project `<cwd>/.pi/extensions/pi-todo/config.json` when trusted):
+
+```json
+{ "maxLines": 7, "targetLines": 5 }
+```
+
+Requires `2 <= targetLines <= maxLines`; invalid entries fall back to defaults, and `targetLines` above `maxLines` clamps to `maxLines`.
 
 ## Development
 
