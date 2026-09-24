@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.1] - 2026-09-24
+
+- feat: header left-click toggles collapse via `Component.handleMouse` (duck-typed, same mechanism as pi-subagents: left click on header row `y===0`, modifier clicks ignored); works on hosts with mouse dispatch (verified on pi 0.87.1), harmless no-op on older hosts; `alt+t` shortcut path unchanged
+
 ## [0.2.0] - 2026-09-24
 
 - feat: panel budget rendering — hard cap `maxLines` (default 7, `+N more` overflow) + soft cleanup target `targetLines` (default 5, best-effort); unfinished always kept, completed newest-first; both configurable via `config.json` (requires `2 <= targetLines <= maxLines`)
@@ -7,7 +11,6 @@
 - feat: collapse shortcut `alt+t` (keeps `ctrl+shift+t` as alias); collapsed panel is a single line `▸ Todos (done/total) ✓n ◐n ○n — alt+t to expand`, expanded title carries `▾`
 - feat: guideline #2 rewritten to completion timing (123 chars, still within prompt budgets)
 - fix: view state isolated per rendered session — switching sessions resets completion order/rounds/suppressed set, so colliding ids are no longer wrongly hidden or misordered across sessions; project-level config.json wired via `isProjectTrusted` (dual-session regression test included)
-- note: true header-click needs pi-tui mouse support (not available in 0.84.2); toggle stays shortcut-only
 
 ## [0.1.1] - 2026-08-22
 

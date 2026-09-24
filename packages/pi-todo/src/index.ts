@@ -20,6 +20,16 @@ import { buildOverlayLines, planVisibility, type OverlayLine } from "./overlay.t
 import { loadConfig } from "./config.ts";
 import { registerTodoTool, registerTodosCommand, type TodoDeps } from "./todo.ts";
 
+/** pi-tui 结构化鼠标事件（鸭子类型：0.84.2 无分发时属性多余无害，0.87+ 宿主分发） */
+interface WidgetMouseEvent {
+	type?: string;
+	button?: string;
+	y?: number;
+	shift?: boolean;
+	alt?: boolean;
+	ctrl?: boolean;
+}
+
 export const WIDGET_ID = "pi-todo";
 /** 主快捷键；旧 `ctrl+shift+t` 保留为别名（部分终端截留 ctrl+shift 组合） */
 export const COLLAPSE_SHORTCUT = "alt+t";
@@ -165,7 +175,19 @@ export default function (pi: ExtensionAPI): void {
 			ctx.ui.setWidget(WIDGET_ID, undefined);
 			return;
 		}
-		ctx.ui.setWidget(WIDGET_ID, (_tui, theme) => new Text(styledText(currentLines, theme), 0, 0));
+		ctx.ui.setWidget(WIDGET_ID, (tui, theme) => {
+			const text = new Text(styledText(currentLines, theme), 0, 0);
+			// header 单击折叠（复刻 pi-subagents：仅左键 + header 行 y===0 + 无修饰键）
+			return Object.assign(text, {
+				handleMouse(event: WidgetMouseEvent) {
+					if (event?.type !== "click" || event?.button !== "left" || event?.y !== 0) return undefined;
+					if (event?.shift || event?.alt || event?.ctrl) return undefined;
+					toggleCollapsed(ctx);
+					(tui as unknown as { requestRender?: () => void })?.requestRender?.();
+					return { handled: true };
+				},
+			});
+		});
 	};
 
 	function scheduleCleanup(ctx: ExtensionContext): void {

@@ -8,7 +8,7 @@ Pi coding agent 的最小侵入任务清单扩展。
 
 - `todo` 工具：模型可 create/update/list/get/delete/clear 任务，`pending → in_progress → completed` 状态机推进
 - `/todos` 命令：当前会话全部任务的分组列表（TUI 全屏，Escape 关闭）
-- 编辑器上方面板（widget）：`Todos (done/total)` 标题 + glyph 行 + activeForm 标签，折叠（主 `alt+t`、别名 `ctrl+shift+t`，折叠为带 ✓/◐/○ 明细的单行）、硬上限 7 行溢出截断、已完成按软目标 5 + 3s 延迟清理（上一轮优先，未完成必留，量少跨轮保留）
+- 编辑器上方面板（widget）：`Todos (done/total)` 标题 + glyph 行 + activeForm 标签，折叠（主 `alt+t`、别名 `ctrl+shift+t`、header 左键单击，折叠为带 ✓/◐/○ 明细的单行）、硬上限 7 行溢出截断、已完成按软目标 5 + 3s 延迟清理（上一轮优先，未完成必留，量少跨轮保留）
 - 状态存会话分支：成功快照写入 tool result `details`，`session_start`/`session_compact`/`session_tree` 重放恢复
 
 ## 源码结构（src/）

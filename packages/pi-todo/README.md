@@ -23,7 +23,7 @@ Restart the Pi session to take effect. For local development, symlink to `~/.pi/
   - `todo update <id> <status> [activeForm]` — advance status (`in_progress` / `completed`, optional running label like "writing tests")
   - `todo list [status]` / `todo get <id>` / `todo delete <id>` / `todo clear`
 - `/todos`: fullscreen grouped list (Pending / In Progress / Completed), `Escape` to close
-- Panel collapse shortcut: `alt+t` (`ctrl+shift+t` also works as an alias); collapsed panel is a single line with status counts
+- Panel collapse: `alt+t` (`ctrl+shift+t` also works as an alias), or left-click the header row (hosts with mouse dispatch); collapsed panel is a single line with status counts
 - Panel budget: at most `maxLines` lines (default 7), unfinished tasks always kept; completed tasks auto-trim to `targetLines` (default 5) 3s after completion, oldest first
 
 Task states `pending → in_progress → completed`; `completed` is only set explicitly by the model. Deletes use a tombstone to prevent id reuse.

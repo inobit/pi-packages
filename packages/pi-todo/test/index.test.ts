@@ -332,6 +332,33 @@ describe("index.ts 工厂装配", () => {
 		expect(widgetText(ctx)?.length).toBeGreaterThan(1);
 	});
 
+	it("header 左键单击切换折叠（y===0），任务行/右键/修饰键忽略", async () => {
+		const pi = makePi();
+		factory(pi as never);
+		const branch = branchWith(
+			snapshot("create", [{ id: 1, subject: "a", status: "pending" }, { id: 2, subject: "b", status: "pending" }], 3),
+		);
+		const ctx = makeCtx({ sessionManager: { getSessionId: () => "test-session", getBranch: () => branch } });
+		await pi.emit("session_start", { type: "session_start" }, ctx);
+		expect(widgetText(ctx)?.length).toBeGreaterThan(1);
+		const factory2 = ctx.widgetCalls.at(-1)?.content as (
+				tui: unknown,
+				theme: Theme,
+		) => Text & { handleMouse(e: unknown): { handled: boolean } | undefined };
+		const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t, strikethrough: (t: string) => t } as unknown as Theme;
+		const comp = factory2(null as never, theme);
+		// 非 header 行 / 非左键 / 带修饰键 → 忽略
+		expect(comp.handleMouse({ type: "click", button: "left", y: 1 })).toBeUndefined();
+		expect(comp.handleMouse({ type: "click", button: "right", y: 0 })).toBeUndefined();
+		expect(comp.handleMouse({ type: "click", button: "left", y: 0, shift: true })).toBeUndefined();
+		expect(widgetText(ctx)?.length).toBeGreaterThan(1);
+		// header 左键单击 → 折叠单行
+		expect(comp.handleMouse({ type: "click", button: "left", y: 0 })).toEqual({ handled: true });
+		const collapsed = widgetText(ctx);
+		expect(collapsed?.length).toBe(1);
+		expect(collapsed?.[0]).toContain("▸");
+	});
+
 	it("/todos 命令：TUI 模式打开全屏列表（按状态分组）", async () => {
 		const pi = makePi();
 		factory(pi as never);
