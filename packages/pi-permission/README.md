@@ -19,7 +19,7 @@ Commands are classified by "can side effects be fully derived from the arguments
 | **W bounded writer** | Write targets fully enumerable from arguments | touch/mkdir/cp/mv/sed -i/redirects/find -delete |
 | **X opaque** | Effects not derivable — interpreters, build tools, every unrecognized program, parse-failure downgrades | python3/npm/make/bash -c/tar extraction/patch |
 
-The danger overlay (rm -r/-f, chmod/chown -R, git write subcommands, curl\|sh, sudo, bash -c, xargs, find -exec) sits above the tiers and keeps the existing product contract.
+The danger overlay (rm recursion/glob targets, chmod/chown -R, git write subcommands, curl\|sh, sudo, bash -c, xargs, find -exec) sits above the tiers and keeps the existing product contract.
 
 ## Features
 
@@ -95,11 +95,12 @@ Merged by layer (array fields are **union**-deduplicated across layers, non-arra
 | -- | --- | --- |
 | `sensitivePatterns` | Sensitive file glob list | `*.env` `*.env.*` `~/.ssh/*` `*.pem` `*.key` `id_rsa*` `credentials.json` `secrets*.yaml` `~/.aws/*` `.npmrc` `~/.config/gh/hosts.yml` |
 | `envExampleReadAllowed` | Allow reading `.env.example` without prompt | `true` |
-| `readonlyBashCommands` | Bash read allowlist | High-frequency read-only commands (cat/grep/ls/..., 72 entries) |
+| `readonlyBashCommands` | Bash read allowlist | High-frequency read-only commands (cat/grep/ls/..., 92 entries) |
 | `dangerousBashCommands` | Unified dangerous operation list (`sudo` or `git commit`) | Git write subcommands + dangerous shell |
 | `readonlyPowerShellCommands` | PowerShell read allowlist (canonical cmdlet names, aliases normalized before matching) | Read-only cmdlets (`get-childitem`/`get-content`/`select-string`/...) |
 | `dangerousPowerShellCommands` | PowerShell dangerous operation list | `start-process` / `add-type` / `register-scheduledtask` / ... |
 | `trustedExternalPaths` | Trusted external path prefixes — reads/writes under these prefixes are auto-allowed (e.g. `/tmp` for temp files; `os.tmpdir()` is merged at runtime) | `["/tmp"]` |
+| `additionalProjectRoots` | Extra project roots treated as in-domain (like OpenCode's startup dir ∪ worktree root); in-domain ≠ trusted — plan-mode writes here are still denied; auto-detected git root is always included | `[]` |
 | `readonlyTools` | Tool read allowlist (union across layers) | `read grep find ls` |
 | `strictPlanMode` | Plan mode: unverifiable execution (X segments) tightened from ask to silent deny | `false` |
 | `toggleModeShortcut` | Plan/build toggle shortcut (empty string to disable) | `alt+p` |
@@ -107,7 +108,7 @@ Merged by layer (array fields are **union**-deduplicated across layers, non-arra
 | `debugLog` | Debug log toggle (separate from review log, verbose events) | `false` |
 | `logDir` | Log directory (relative to `~/.pi/agent`, respects `PI_CODING_AGENT_DIR`; supports absolute path and `~/`, 0600; extension dir holds only config) | `logs/pi-permission` |
 
-> Fixed rules (not configurable): built-in write tools `write`/`edit`, `rm -r/-f`, `chmod -R`, `chown -R`,
+> Fixed rules (not configurable): built-in write tools `write`/`edit`, `rm` recursion/glob targets, `chmod -R`, `chown -R`,
 > `curl/wget | sh/bash`, `bash -c`/`eval`/`sudo`/`xargs`/`find -exec` are always treated as dangerous;
 > redirect targets `>`/`>>` are always checked; git subcommands not in `dangerousBashCommands` are treated as read-only.
 > Prompt reasons carry a `[bash]` / `[tool:<name>]` source prefix and include configuration hints.

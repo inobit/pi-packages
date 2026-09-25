@@ -21,21 +21,21 @@ Pi coding agent 的权限控制扩展：按「效果可证明性 × 信任域」
 | **W 有界写者** | 写目标可从参数穷举 | touch/cp/mv/sed -i/重定向/find -delete |
 | **X 不透明** | 效果不可推导：解释器、构建工具、未识别程序、解析失败降级 | python3/npm/make/bash -c/tar 解压 |
 
-危险叠加（rm -r/-f、chmod/chown/chgrp -R/--recursive、git 写子命令、curl\|sh、sudo、wrapper 家族）凌驾于档位之上。
+危险叠加（rm 递归（-r/-R/--recursive）/通配目标、chmod/chown/chgrp -R/--recursive、git 写子命令、curl\|sh、sudo、wrapper 家族）凌驾于档位之上。
 
 决策管线：
 
 ```
 前缀剥离（env/nice/timeout N/nohup/setsid/stdbuf/command/builtin/exec/time/VAR=x；
          sudo 不剥离直接叠加）→ 注册表查档 → 写动作扫描（R 可升级 W）→ glob/解析失败降 X
-→ 信任域判定：T_plan = trustedExternalPaths（∪ os.tmpdir()）；T_build = cwd ∪ trusted
+→ 信任域判定：T_plan = trustedExternalPaths（∪ os.tmpdir()）；T_build = cwd ∪ trusted；项目域 = cwd ∪ additionalProjectRoots ∪ findGitRoot 自动根（域内≠trusted，plan 写照样 deny）
 → 模式决策表（见下）
 ```
 
 - **plan（只读契约）**：① 危险叠加静默 deny → ② 可枚举写目标 ∉ T_plan 静默 deny（含项目内文件）→ ③ 敏感文件 ask → ④ 全部段 R/W allow → ⑤ 含 X 段真兜底（strictPlanMode ? 静默 deny : ask，FR-10）
 - **build**：① 危险叠加 ask → ② 敏感文件 ask → ③ 引用与写目标全部 ∈ T_build → allow（R/W/X 同权）→ ④ 纯 R（任意位置）allow → ⑤ 存在跨域引用兜底 ask（W 按 target 父目录、X 按 program 记忆）
 - **yolo**：跳过全部判定直接放行，仅敏感文件仍 deny（FR-1）
-- **前置层**：语法解析失败 / `$()` / 子 shell / 进程替换 → fail-closed（build=ask、plan=deny），不进上述决策表
+- **前置层**：语法解析失败 → fail-closed（build=ask、plan=deny），不进上述决策表；`$()`/子 shell/进程替换/`bash -c` 在 bash 下先过 L1 内部门（内层全 R + 无 danger/cd/敏感才净化后走正常链，否则回退 fail-closed），powershell 维持 fail-closed
 - 完整文案表（deny 反馈逐场景区分 + 红线）见仓库历史 plan.md B+ 节的设计裁决，改文案必须同步该表语义
 
 ## 源码结构（src/）

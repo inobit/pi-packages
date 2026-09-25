@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.1.2] - 2026-09-24
+
+### Added
+
+- **L1 shell-nest gate (fewer popups for read-like commands)**: `$(...)`/backticks/`(...)`/`<(...)` and static `bash -c "..."` are now recursively judged in bash mode — if every inner segment proves read-only with no danger/`cd`/sensitive hits, the fail-closed verdict is cleared and the outer command continues through the normal chain (e.g. `OLD=$(ss -ltnp|cut)`, `(ss -t; ps aux) | head`). Anything else (W/X/danger/parse-error/sensitive/nested syntax/`cd` inside) falls back to the existing FR-7 fail-closed; PowerShell keeps fail-closed. Includes `$(`-preserving top-level split, paren-depth-aware `&&` splitting, and an unbalanced-span guard.
+- **Worktree-aware project domain**: new `additionalProjectRoots` config (union merge) plus automatic git-root detection (`findGitRoot`, fs-only, cached) — references under any project root count as in-domain, mirroring OpenCode's startup-dir ∪ worktree semantics. Roots are in-domain, not trusted: plan-mode writes there are still denied.
+- **`$HOME`/`${HOME}` expansion** in path handling (same rights as `~`), closing a blind spot in domain and sensitive-file judgments.
+- **curl/wget effect classification**: pure GET (and `--spider`) is read-only; send signals (`-d/--data*/-F/--form*/-T/--upload-file`, non-GET `-X/--request`, `-K/--config`) stay X-danger; output options (`-o/--output/-O`, `-D/--dump-header`, `-c/--cookie-jar`, `--trace*`, `--output-dir`, wget `-O/--output-document/-o/-P/-a`) feed enumerated write targets with short-option bundling, unknown-option and missing-value fail-closed; file-valued metadata (`-E/--cert/--key/--cacert`, filename-form `-b/--cookie`) still participates in sensitive scanning.
+- **20 more provable readers** in `readonlyBashCommands` (`test`/`[`/`true`/`false`, `basename`/`dirname`/`readlink`/`realpath`, `seq`/`nproc`/`tty`/`logname`/`groups`/`printenv`/`locale`/`getconf`, `tput`/`jobs`/`yes`/`cal`).
+
+### Changed
+
+- **`rm` danger overlay narrowed to recursion/glob**: only `-r`/`-R`/`--recursive` or wildcard targets trigger the overlay (`rm -R` newly covered); `rm -f`/`--force` with literal targets follows the normal bounded-write chain (in-domain allow in build, FR-3 ask outside, deny in plan). `Remove-Item` mirrored: bare `-Force` follows the normal chain, `-Recurse`/glob targets stay danger.
+- **`--` is now honored** by write-target collection across all programs (`rm -- -rf` treats `-rf` as a filename).
+
 ## [1.1.1] - 2026-08-26
 
 ### Fixed

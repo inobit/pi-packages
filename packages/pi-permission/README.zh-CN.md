@@ -19,7 +19,7 @@
 | **W 有界写者** | 写目标可从参数穷举（可解析） | touch/mkdir/cp/mv/sed -i/重定向/find -delete |
 | **X 不透明** | 效果不可从参数推导——解释器、构建工具、一切未识别程序与解析失败降级 | python3/npm/make/bash -c/tar 解压/patch |
 
-危险叠加（rm -r/-f、chmod/chown -R、git 写子命令、curl\|sh、sudo、bash -c、xargs、find -exec）凌驾于档位之上，维持既有产品契约。
+危险叠加（rm 递归/通配目标、chmod/chown -R、git 写子命令、curl\|sh、sudo、bash -c、xargs、find -exec）凌驾于档位之上，维持既有产品契约。
 
 ## 特性
 
@@ -93,11 +93,12 @@ pi install npm:@inobit/pi-permission
 | -- | ---- | ---- |
 | `sensitivePatterns` | 敏感文件 glob 清单 | `*.env` `*.env.*` `~/.ssh/*` `*.pem` `*.key` `id_rsa*` `credentials.json` `secrets*.yaml` `~/.aws/*` `.npmrc` `~/.config/gh/hosts.yml` |
 | `envExampleReadAllowed` | `.env.example` 读取免弹窗 | `true` |
-| `readonlyBashCommands` | bash read 白名单 | 高频只读命令（cat/grep/ls/...，72 项） |
+| `readonlyBashCommands` | bash read 白名单 | 高频只读命令（cat/grep/ls/...，92 项） |
 | `dangerousBashCommands` | 敏感操作统一清单（`sudo` 或 `git commit`） | git 写子命令 + 危险 shell |
 | `readonlyPowerShellCommands` | PowerShell read 白名单（规范 cmdlet 名，匹配前别名已归一化） | 只读 cmdlet（get-childitem/get-content/select-string/...） |
 | `dangerousPowerShellCommands` | PowerShell 敏感操作清单 | start-process / add-type / register-scheduledtask / ... |
 | `trustedExternalPaths` | trusted 外部路径前缀：前缀下读写直接放行（如 `/tmp` 临时文件；运行时并入系统临时目录 `os.tmpdir()`） | `["/tmp"]` |
+| `additionalProjectRoots` | 附加项目根：视为域内（对标 OpenCode 启动目录 ∪ worktree 根）；域内≠trusted——plan 下写此类目录照样 deny；自动识别的 git 根恒包含 | `[]` |
 | `readonlyTools` | 工具 read 白名单（各层并集） | `read grep find ls` |
 | `strictPlanMode` | plan 下不可证执行（X 段兜底）由 ask 收紧为静默 deny | `false` |
 | `toggleModeShortcut` | plan/build 切换快捷键（空字符串禁用） | `alt+p` |
@@ -105,7 +106,7 @@ pi install npm:@inobit/pi-permission
 | `debugLog` | 调试日志开关（与审查日志分离，详细事件） | `false` |
 | `logDir` | 日志目录（相对 `~/.pi/agent`，尊重 `PI_CODING_AGENT_DIR`；支持绝对路径与 `~/`，0600；扩展目录仅放配置） | `logs/pi-permission` |
 
-> 固定规则（不可配置）：内置写工具 `write`/`edit`、`rm -r/-f`、`chmod -R`、`chown -R`、
+> 固定规则（不可配置）：内置写工具 `write`/`edit`、`rm` 递归/通配目标、`chmod -R`、`chown -R`、
 > `curl/wget | sh/bash`、`bash -c`/`eval`/`sudo`/`xargs`/`find -exec`、`find -delete/-fls/-fprint*` 恒为敏感操作或写动作；
 > 重定向 `>`/`>>` 写目标固定检测；启动器前缀（`env`/`nice`/`timeout N`/`nohup`/`setsid`/`stdbuf`/`VAR=x`）自动剥离后按真实程序分类（`sudo` 不剥离直接拦截）；git 未识别子命令按 X 处理。
 > 弹窗 reason 带 `[bash]` / `[tool:<name>]` 来源前缀；hint 每 rule 会话内只展示一次。

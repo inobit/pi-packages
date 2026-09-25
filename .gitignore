@@ -3,6 +3,9 @@ dist/
 *.tsbuildinfo
 .pnpm-store/
 
+# 会话过程文档（本地留存，不入库）
+docs/
+
 # 日志
 logs/
 *.log
