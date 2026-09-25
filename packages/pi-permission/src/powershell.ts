@@ -659,9 +659,9 @@ export function parsePowerShellCommand(command: string): ParsedCommand {
 // 效果分类
 // ---------------------------------------------------------------------------
 
-/** Remove-Item 的递归/强制标志（镜像 bash 的 rm -r/-f 固定危险叠加）。
- * 含单字母短旗标 -r/-f 与常见组合，及 `:$true` 绑定形态——保守方向宁可误报。 */
-const REMOVE_ITEM_FORCE_FLAGS = /^-(recurse|force|r|f|rf|fr)(:.*)?$/i;
+/** Remove-Item 的递归标志（镜像 bash 的 rm 递归危险叠加；裸 `-Force` 走正常链，glob 目标走叠加）。
+ * 含 `-r` 短旗标与 `:$true` 绑定形态——保守方向宁可误报。 */
+const REMOVE_ITEM_RECURSE_FLAGS = /^-(recurse|r)(:.*)?$/i;
 
 /** 单段效果分类：R/W/X 三档 + 危险叠加。未知 cmdlet 一律 X（fail-closed）；原生 exe 回退 bash 分类。 */
 export function classifyPowerShellSegment(
@@ -682,9 +682,11 @@ export function classifyPowerShellSegment(
   if (segment.wrapper) return { tier: "X", danger: true, id };
   // 固定危险清单（不可配置）
   if (FIXED_DANGEROUS_PS.has(program)) return { tier: "X", danger: true, id };
-  // Remove-Item 递归/强制
-  if (program === "remove-item" && segment.args.some((a) => REMOVE_ITEM_FORCE_FLAGS.test(a))) {
-    return { tier: "X", danger: true, id };
+  // Remove-Item 递归 / glob 目标（镜像 bash rm：裸 -Force 走正常链）
+  if (program === "remove-item") {
+    const targets = collectWriteTargetsPs(segment);
+    const recursive = segment.args.some((a) => REMOVE_ITEM_RECURSE_FLAGS.test(a));
+    if (recursive || targets.some((t) => /[*?]/.test(t))) return { tier: "X", danger: true, id };
   }
   // 二义性下载器（curl/wget 在 PS 5.1 是 Invoke-WebRequest 别名、PS 7 是真 exe）→ 不精确分类，X 兜底
   if (program === "curl" || program === "wget") return { tier: "X", danger: false, id };

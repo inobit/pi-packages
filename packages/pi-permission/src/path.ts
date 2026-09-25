@@ -2,11 +2,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-/** 展开 `~` / `~/...` 为 home 绝对路径（PowerShell 用户常写 `~\`，同样展开）。 */
+/** 展开 `~` / `~/...` / `$HOME` / `${HOME}` 为 home 绝对路径（PowerShell 用户常写 `~\`，同样展开）。 */
 export function expandHome(p: string, home: string): string {
   if (p === "~") return home;
   if (p.startsWith("~/")) return path.join(home, p.slice(2));
   if (p.startsWith("~\\")) return path.join(home, p.slice(2));
+  if (p === "$HOME" || p === "${HOME}") return home;
+  if (p.startsWith("$HOME/")) return path.join(home, p.slice(6));
+  if (p.startsWith("${HOME}/")) return path.join(home, p.slice(8));
   return p;
 }
 
@@ -127,6 +130,60 @@ export function isTrustedPath(
   return false;
 }
 
+/** git worktree 根缓存：key 为 realpath 归一化后的 cwd，进程内常驻无失效（cwd 不变则根不变）。 */
+const gitRootCache = new Map<string, string | undefined>();
+
+/**
+ * 从 cwd 向上找首个含 `.git`（文件或目录）的祖先，realpath 后即 worktree 根（E 自动识别）。
+ * 纯 fs、无 git 子进程；到 fs root 自停；找不到返回 undefined。
+ */
+export function findGitRoot(cwd: string): string | undefined {
+  const key = realpathOf(cwd) ?? cwd;
+  const cached = gitRootCache.get(key);
+  if (cached !== undefined || gitRootCache.has(key)) return cached;
+  let dir = key;
+  for (;;) {
+    try {
+      const st = fs.statSync(path.join(dir, ".git"));
+      if (st.isDirectory() || st.isFile()) {
+        const root = realpathOf(dir) ?? dir;
+        gitRootCache.set(key, root);
+        return root;
+      }
+    } catch {
+      // 无 .git，继续上溯
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      gitRootCache.set(key, undefined);
+      return undefined;
+    }
+    dir = parent;
+  }
+}
+
+/**
+ * 判断路径是否落在项目域内（E）：cwd 或任一 root 内即域内（对标 OpenCode 双轴）。
+ * 相对路径（含 `~/`、`$HOME/`）只按 cwd 解析一次为绝对路径，再与各 root 比较
+ * （避免按 root 重复解析导致基址错误）；绝对路径（POSIX/Windows）直通 isWithinCwd
+ * （保留盘符/UNC 语义）；前缀比较带 path separator（防 `/proj2` 误判）；roots 是域内不是 trusted。
+ */
+export function isWithinProject(
+  target: string,
+  cwd: string,
+  roots: readonly string[],
+  home: string,
+): boolean {
+  if (isWithinCwd(target, cwd, home)) return true;
+  const hasRoot = roots.some((r) => r !== "");
+  if (!hasRoot) return false;
+  if (!path.isAbsolute(target) && !isWindowsAbsolute(target)) {
+    const abs = normalizePath(target, cwd, home);
+    return roots.some((r) => r !== "" && isWithinCwd(abs, r, home));
+  }
+  return roots.some((r) => r !== "" && isWithinCwd(target, r, home));
+}
+
 /** 是否为 `.env.example`（读取豁免，FR-1 例外）。 */
 export function isSensitiveReadException(target: string, cwd: string, home: string): boolean {
   const abs = normalizePath(target, cwd, home);
@@ -161,7 +218,7 @@ export function isWithinCwd(target: string, cwd: string, home: string): boolean 
 }
 
 /** Windows 风格绝对路径：盘符路径（`C:\...` / `C:/...`）或 UNC 路径（`\\server\share`）。 */
-function isWindowsAbsolute(p: string): boolean {
+export function isWindowsAbsolute(p: string): boolean {
   return /^[A-Za-z]:[\\\/]/.test(p) || p.startsWith("\\\\");
 }
 

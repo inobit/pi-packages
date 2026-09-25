@@ -14,7 +14,7 @@ export interface PermissionConfig {
    * 危险操作统一清单（FR-4，仅作用于 bash 工具），命中即 ask（build）/ deny（plan）。
    * 条目两种格式：纯命令名（如 `sudo`、`dd`）或 `git <子命令>`（如 `git commit`、`git push`）。
    * 不在清单中的 git 子命令视为只读（status/diff/log 等静默放行）；
-   * 固定规则不可配置：rm -r/-f、chmod -R、chown -R、curl/wget 管道到 shell、wrapper 命令（bash -c/eval/sudo/xargs/find -exec）。
+   * 固定规则不可配置：rm 递归（-r/-R/--recursive）与通配目标、chmod -R、chown -R、curl/wget 管道到 shell、wrapper 命令（bash -c/eval/sudo/xargs/find -exec）。
    */
   dangerousBashCommands: string[];
   /** PowerShell 只读 cmdlet 白名单（FR-5 等价），规范名命中即视为只读；别名在分类前已归一化。 */
@@ -28,6 +28,9 @@ export interface PermissionConfig {
   /** trusted 外部路径前缀（FR-9）：落在前缀下的外部读写直接放行（如 `/tmp` 临时文件）；
    * realpath 双形态防软链逃逸；仅作用于目录放行层面，不改变危险/敏感判定的优先级。 */
   trustedExternalPaths: string[];
+  /** 附加项目根目录（E）：与 cwd 同为“域内”（对标 OpenCode 启动目录 ∪ worktree 根）。
+   * 注意这是域内不是 trusted——plan 下写此类目录文件照样 deny；数组字段走跨层并集。 */
+  additionalProjectRoots: string[];
   /** 内置只读工具（FR-8.3 plan 放行；内置默认 ∪ 用户配置）。 */
   readonlyTools: string[];
   /** strictPlanMode：未知工具在 plan 下由 ask 收紧为 deny（FR-8.3）。 */
@@ -78,6 +81,11 @@ export const DEFAULT_CONFIG: PermissionConfig = {
     "free", "vmstat", "iostat", "netstat", "ss", "lsof",
     // 会话基础设施类
     "sleep", "tmux", "agent-browser", "clear", "history",
+    // 路径/条件 introspect 与无文件副作用的信息输出类（F1）
+    "[", "test", "true", "false",
+    "basename", "dirname", "readlink", "realpath",
+    "seq", "nproc", "tty", "logname", "groups", "printenv", "locale", "getconf",
+    "tput", "jobs", "yes", "cal",
   ],
   dangerousBashCommands: [
     // git 写操作（`git <子命令>` 条目；不在清单中的 git 子命令视为只读）
@@ -136,6 +144,8 @@ export const DEFAULT_CONFIG: PermissionConfig = {
   ],
   // trusted 外部路径：默认 `/tmp`（运行时并入 os.tmpdir() 系统临时目录），可配置追加
   trustedExternalPaths: ["/tmp"],
+  // 附加项目根：默认空，由用户按需配置；另有 findGitRoot 自动识别（path.ts）
+  additionalProjectRoots: [],
   // 仅 pi 核心内置只读工具（createReadOnlyTools：read/grep/find/ls）；
   // 第三方扩展工具（web_search/agent-browser/skill/mcp_*/ffgrep 等）需用户自行追加（取并集）
   readonlyTools: [...BUILTIN_READONLY_TOOLS],
@@ -157,6 +167,7 @@ const ARRAY_FIELDS = new Set<keyof PermissionConfig>([
   "readonlyPowerShellCommands",
   "dangerousPowerShellCommands",
   "trustedExternalPaths",
+  "additionalProjectRoots",
   "readonlyTools",
 ]);
 /** 与 pi 核心 getAgentDir() 对齐的 agent 根（尊重 PI_CODING_AGENT_DIR）。 */

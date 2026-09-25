@@ -5,13 +5,17 @@ import {
   classifySegment,
   collectReadRefs,
   collectWriteTargets,
+  findShellNests,
   hasPipeToShell,
   parseBashCommand,
+  reparseSegment,
+  scrubShellNests,
+  WRAPPER_SHELLS,
   type BashSegment,
   type ParsedCommand,
 } from "./bash.ts";
 import { POWERSHELL_ADAPTER } from "./powershell.ts";
-import { expandHome, isSensitivePath, isSensitiveReadException, isTrustedPath, isWithinCwd, realpathOf, resolveCwdTarget } from "./path.ts";
+import { findGitRoot, isSensitivePath, isSensitiveReadException, isTrustedPath, isWithinProject, resolveCwdTarget } from "./path.ts";
 
 export type DecisionAction = "allow" | "ask" | "deny";
 
@@ -128,6 +132,12 @@ function trustedPrefixes(cfg: PermissionConfig): string[] {
   return [...new Set([...cfg.trustedExternalPaths, os.tmpdir()])];
 }
 
+/** 项目域根目录（E）：显式配置 + findGitRoot 自动识别；仅用于域内外判定（非 trusted）。 */
+function projectRoots(config: PermissionConfig, cwd: string): string[] {
+  const auto = findGitRoot(cwd);
+  return [...config.additionalProjectRoots, ...(auto === undefined ? [] : [auto])];
+}
+
 /**
  * FR-1 敏感文件检查：任何模式、任何优先级之前评估，命中即 ask（D9：ask 非 deny）。
  * `readRefs` 中命中的 `.env.example` 读取豁免（FR-1 例外）。
@@ -221,7 +231,7 @@ export function decideToolRequest(req: ToolDecisionRequest): Decision {
     return { action: "allow", rule: "FR-5", reason: `${label} no external path, allowed` };
   }
   // 3. cwd 外：trusted 赎免放行；read 白名单放行；否则 ask
-  const external = paths.filter((p) => !isWithinCwd(p, cwd, home()));
+  const external = paths.filter((p) => !isWithinProject(p, cwd, projectRoots(config, cwd), home()));
   if (external.length > 0) {
     if (readTool) {
       return { action: "allow", rule: "FR-5", reason: `${label} read-only tool whitelist, external path allowed` };
@@ -249,6 +259,130 @@ function failClosed(mode: WorkMode, label: string, kind: string, command?: strin
         // ask 必须带触发命令，否则弹窗无上下文，用户无法定位问题
         details: command === undefined ? undefined : [shellDetail(detailLabel ?? label, command)],
       };
+}
+
+/** 纯变量赋值前缀段（如 `OLD=""`）：B3 净化后仅剩此类内容直接丢弃（视同 R）。 */
+const PURE_ASSIGN_SEGMENT = /^([A-Za-z_][A-Za-z0-9_]*=("[^"]*"|'[^']*'|[^\s]*)\s*)+$/;
+
+/** 段内嵌套是否非平衡（切分残留的半边 span，如反引号内的 `&&` 切分产物）：是则门直接回退。
+ * 单引号 span 与转义先剥离；双引号内的括号为字面（不计），`$(` 与反引号在双引号内仍会执行故计入。 */
+function hasUnbalancedNests(raw: string): boolean {
+  let tmp = "";
+  let inS = false;
+  let esc = false;
+  for (const ch of raw) {
+    if (esc) {
+      esc = false;
+      continue;
+    }
+    if (ch === "\\") {
+      esc = true;
+      continue;
+    }
+    if (ch === "'") {
+      inS = !inS;
+      continue;
+    }
+    if (!inS) tmp += ch;
+  }
+  if ((tmp.split("`").length - 1) % 2 !== 0) return true; // 反引号不成对
+  let depth = 0;
+  let inD = false;
+  for (const c of tmp) {
+    if (c === '"') {
+      inD = !inD;
+      continue;
+    }
+    if (inD) continue;
+    if (c === "(") depth++;
+    else if (c === ")") {
+      depth--;
+      if (depth < 0) return true;
+    }
+  }
+  return depth !== 0;
+}
+
+/** 内部门结果：pass（附净化后段）/ fail（回退 fail-closed）/ sensitive（按 FR-1 口径返回）。 */
+type InnerGateResult =
+  | { outcome: "pass"; segments: BashSegment[] }
+  | { outcome: "fail" }
+  | { outcome: "sensitive"; decision: Decision };
+
+/** 检查单段内层文本（B2/B4 共用）：全 R + 无 danger + 无 parseError + 无 cd + 无敏感才通过。 */
+function checkInnerText(
+  inner: string,
+  segCwd: string,
+  config: PermissionConfig,
+  label: string,
+): { pass: true } | { pass: false } | { pass: false; sensitive: Decision } {
+  const parsed = parseBashCommand(inner);
+  // 嵌套直接回退（P0-2）：内层仍含复杂语法标记即整门回退，不逐层展开
+  if (parsed.parseError || parsed.hasCommandSubstitution || parsed.hasProcessSubstitution || parsed.hasSubshell) {
+    return { pass: false };
+  }
+  for (const seg of parsed.segments) {
+    // 内层含 cd 直接回退（P1-1）：不用外层 cwd 做敏感扫描，避免旁路
+    if (seg.program === "cd") return { pass: false };
+    const kind = classifySegment(seg, config);
+    if (kind.tier !== "R" || kind.danger) return { pass: false };
+    const readRefs = collectReadRefs(seg);
+    const writeTargets = collectWriteTargets(seg);
+    const hit = sensitiveDecision([...readRefs, ...writeTargets], segCwd, config, readRefs, label);
+    if (hit) return { pass: false, sensitive: hit };
+  }
+  return { pass: true };
+}
+
+/**
+ * L1 内部门（B2/B4，bash-only）：顶层已置 has* 标记时调用。
+ * 全 inner 通过 → 返回净化/展开后的段；任一失败 → fail（调用方回退 failClosed）；
+ * 内层敏感 → sensitive（调用方按 FR-1 口径返回）。展示一律用原始命令。
+ */
+function evalBashNestGate(
+  segments: readonly BashSegment[],
+  segmentCwds: readonly (string | undefined)[],
+  cwd: string,
+  config: PermissionConfig,
+  label: string,
+): InnerGateResult {
+  const out: BashSegment[] = [];
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i]!;
+    const segCwd = segmentCwds[i] ?? cwd;
+    // 非平衡残留（切分半边 span）直接回退，不参与抽取/净化
+    if (hasUnbalancedNests(seg.raw)) return { outcome: "fail" };
+    // B4：`bash -c "<静态脚本>"` 严格双参才展开
+    if (WRAPPER_SHELLS.has(seg.program) && seg.args.length === 2 && seg.args[0] === "-c") {
+      const checked = checkInnerText(seg.args[1]!, segCwd, config, label);
+      if (!checked.pass) {
+        return "sensitive" in checked ? { outcome: "sensitive", decision: checked.sensitive } : { outcome: "fail" };
+      }
+      const script = parseBashCommand(seg.args[1]!);
+      script.segments.forEach((s, idx) => {
+        out.push(idx === 0 ? { ...s, prevOp: seg.prevOp } : s);
+      });
+      continue;
+    }
+    const nests = findShellNests(seg.raw);
+    if (nests.length === 0) {
+      out.push(seg);
+      continue;
+    }
+    for (const nest of nests) {
+      const checked = checkInnerText(nest.inner, segCwd, config, label);
+      if (!checked.pass) {
+        return "sensitive" in checked ? { outcome: "sensitive", decision: checked.sensitive } : { outcome: "fail" };
+      }
+    }
+    // B3：净化后重解析；仅剩变量赋值/空直接丢弃（视同 R）
+    const scrubbed = scrubShellNests(seg.raw, nests);
+    if (scrubbed.trim() === "" || PURE_ASSIGN_SEGMENT.test(scrubbed.trim())) continue;
+    const { segment, error } = reparseSegment(scrubbed, seg.prevOp);
+    if (error) return { outcome: "fail" };
+    if (segment !== undefined) out.push(segment);
+  }
+  return { outcome: "pass", segments: out };
 }
 
 /**
@@ -304,18 +438,38 @@ export function decideShellRequest(req: BashDecisionRequest, adapter: ShellAdapt
 
   // FR-7 fail-closed：语法无法解析 / 含复杂语法 → build=ask、plan=deny
   if (parsed.parseError) return failClosed(mode, label, "unparseable", command, adapter.id);
-  if (parsed.hasCommandSubstitution || parsed.hasProcessSubstitution || parsed.hasSubshell) {
-    return failClosed(mode, label, "command substitution/subshell", command, adapter.id);
-  }
-
-  if (parsed.segments.length === 0) {
-    return { action: "allow", rule: "default", reason: `${label} empty command` };
-  }
 
   // 跟踪 cd：每段的有效工作目录（cd 后相对路径按新目录解析，防 cd 到外部绕过）
   // cd 无法解析（如 `cd -`）时置 undefined，后续相对路径保守按外部处理
   const segmentCwds = resolveSegmentCwds(parsed.segments, cwd, adapter);
-  const uncertainRelative = segmentCwds.includes(undefined);
+
+  // L1 内部门（B2/B4，bash-only）：顶层含嵌套时试探递归判定，通过则用净化后段走正常链
+  // （展示用的 parsed 保持原始命令；判定用的 segments/activeCwds 为净化后）
+  // B4 的 `bash -c "..."` 本身不置 has* 标记，需独立触发
+  let segments: readonly BashSegment[] = parsed.segments;
+  let activeCwds = segmentCwds;
+  const hasStaticBashC =
+    adapter.id === "bash" &&
+    parsed.segments.some((s) => WRAPPER_SHELLS.has(s.program) && s.args.length === 2 && s.args[0] === "-c");
+  if (parsed.hasCommandSubstitution || parsed.hasProcessSubstitution || parsed.hasSubshell || hasStaticBashC) {
+    if (adapter.id !== "bash") {
+      return failClosed(mode, label, "command substitution/subshell", command, adapter.id);
+    }
+    const gate = evalBashNestGate(parsed.segments, segmentCwds, cwd, config, label);
+    if (gate.outcome === "fail") {
+      return failClosed(mode, label, "command substitution/subshell", command, adapter.id);
+    }
+    if (gate.outcome === "sensitive") {
+      return { ...gate.decision, details: [...(gate.decision.details ?? []), shellDetail(adapter.id, command, parsed)] };
+    }
+    segments = gate.segments;
+    activeCwds = resolveSegmentCwds(segments, cwd, adapter);
+  }
+
+  if (segments.length === 0) {
+    return { action: "allow", rule: "default", reason: `${label} empty command` };
+  }
+  const uncertainRelative = activeCwds.includes(undefined);
 
   // 收集段信息（相对路径按各段有效 cwd 判定内外）
   // trusted 判定按段 cwd 解析（相对路径写 /tmp 也算 trusted）；cd 无法跟踪时相对路径保守视为非 trusted
@@ -330,20 +484,20 @@ export function decideShellRequest(req: BashDecisionRequest, adapter: ShellAdapt
     if (uncertainRelative && !path.isAbsolute(p)) return false;
     return isTrustedPath(p, prefixes, segCwd, home());
   };
-  for (let i = 0; i < parsed.segments.length; i++) {
-    const seg = parsed.segments[i]!;
-    const segCwd = segmentCwds[i] ?? cwd;
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i]!;
+    const segCwd = activeCwds[i] ?? cwd;
     const readRefs = adapter.readRefs(seg);
     const writeTargets = adapter.writeTargets(seg);
     for (const r of readRefs) {
-      const external = uncertainRelative && !path.isAbsolute(r) ? true : !isWithinCwd(r, segCwd, home());
+      const external = uncertainRelative && !path.isAbsolute(r) ? true : !isWithinProject(r, segCwd, projectRoots(config, segCwd), home());
       if (external) {
         externalRefs.push(r);
         if (!isTrustedForSegment(r, segCwd)) nonTrustedExternalRefs.push(r);
       }
     }
     for (const w of writeTargets) {
-      const external = uncertainRelative && !path.isAbsolute(w) ? true : !isWithinCwd(w, segCwd, home());
+      const external = uncertainRelative && !path.isAbsolute(w) ? true : !isWithinProject(w, segCwd, projectRoots(config, segCwd), home());
       if (!isTrustedForSegment(w, segCwd)) {
         nonTrustedWriteTargets.push(w);
       } else if (isSensitivePath(w, config.sensitivePatterns, segCwd, home())) {
@@ -359,9 +513,9 @@ export function decideShellRequest(req: BashDecisionRequest, adapter: ShellAdapt
 
   // 敏感文件检查按段执行（相对路径用段的有效 cwd）
   const sensitiveBySegment = (): Decision | undefined => {
-    for (let i = 0; i < parsed.segments.length; i++) {
-      const seg = parsed.segments[i]!;
-      const segCwd = segmentCwds[i] ?? cwd;
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i]!;
+      const segCwd = activeCwds[i] ?? cwd;
       const readRefs = adapter.readRefs(seg);
       const writeTargets = adapter.writeTargets(seg);
       const hit = sensitiveDecision([...readRefs, ...writeTargets], segCwd, config, readRefs, label);
@@ -370,15 +524,15 @@ export function decideShellRequest(req: BashDecisionRequest, adapter: ShellAdapt
     return undefined;
   };
 
-  const kinds = parsed.segments.map((seg) => adapter.classify(seg, config));
-  const dangerAny = kinds.some((k) => k.danger) || adapter.pipeToShell(parsed.segments);
+  const kinds = segments.map((seg) => adapter.classify(seg, config));
+  const dangerAny = kinds.some((k) => k.danger) || adapter.pipeToShell(segments);
   const hasX = kinds.some((k) => k.tier === "X");
   const allPureR = kinds.every((k) => k.tier === "R");
   // 会话批准记忆 id：危险 > 不透明 > 有界写 > 纯读，取最严段的标识
   const rankOf = (k: SegmentClassLike) => (k.danger ? 3 : k.tier === "X" ? 2 : k.tier === "W" ? 1 : 0);
   let approvalId: string | undefined;
   let bestRank = -1;
-  for (let i = 0; i < parsed.segments.length; i++) {
+  for (let i = 0; i < segments.length; i++) {
     const r = rankOf(kinds[i]!);
     if (r > bestRank) {
       bestRank = r;

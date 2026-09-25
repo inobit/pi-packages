@@ -85,7 +85,27 @@
     "tmux",
     "agent-browser",
     "clear",
-    "history"
+    "history",
+    "[",
+    "test",
+    "true",
+    "false",
+    "basename",
+    "dirname",
+    "readlink",
+    "realpath",
+    "seq",
+    "nproc",
+    "tty",
+    "logname",
+    "groups",
+    "printenv",
+    "locale",
+    "getconf",
+    "tput",
+    "jobs",
+    "yes",
+    "cal"
   ],
   "dangerousBashCommands": [
     "git add",
@@ -184,6 +204,7 @@
   "trustedExternalPaths": [
     "/tmp"
   ],
+  "additionalProjectRoots": [],
   "readonlyTools": [
     "read",
     "grep",

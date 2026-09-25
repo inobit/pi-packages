@@ -3,11 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  findGitRoot,
   isSensitivePath,
   isSensitiveReadException,
   isTrustedPath,
   realpathDeep,
   isWithinCwd,
+  isWithinProject,
   normalizePath,
   patternToRegExp,
 } from "../src/path.ts";
@@ -186,5 +188,47 @@ describe("Windows 风格绝对路径（powershell 工具回归）", () => {
     const d = isWithinCwd("D:/proj/startup.cmd", "D:\\proj", HOME);
     expect(d).toBe(true); // 绝对正斜杠目标仍走 winPair 精确比较
     // 相对目标的最终结果由宿主平台决定（Windows 上为域内 allow，见 README 平台说明）
+  });
+});
+
+describe("findGitRoot / isWithinProject（E worktree 域内）", () => {
+  function homedirCase(withGit: boolean, gitIsFile: boolean): { root: string; child: string } {
+    const root = fs.mkdtempSync(path.join(HOME, "pi-permission-wt-"));
+    if (withGit) {
+      if (gitIsFile) fs.writeFileSync(path.join(root, ".git"), "gitdir: elsewhere\n");
+      else fs.mkdirSync(path.join(root, ".git"));
+    }
+    const child = path.join(root, "sub", "deep");
+    fs.mkdirSync(child, { recursive: true });
+    return { root, child };
+  }
+
+  it("子目录上溯命中 worktree 根（目录/文件两种 .git 形态）", () => {
+    for (const asFile of [false, true]) {
+      const { root, child } = homedirCase(true, asFile);
+      try {
+        expect(findGitRoot(child)).toBe(fs.realpathSync(root));
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("无 .git 时返回 undefined（上溯到 fs root 自停）", () => {
+    const { root, child } = homedirCase(false, false);
+    try {
+      expect(findGitRoot(child)).toBe(undefined);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+    expect(findGitRoot("/")).toBe(undefined);
+  });
+
+  it("isWithinProject：cwd 或任一 root 内即域内；兄弟前缀不误判", () => {
+    expect(isWithinProject("/proj/src/a.ts", "/proj", [], HOME)).toBe(true);
+    expect(isWithinProject("/wt2/f.txt", "/proj", ["/wt2"], HOME)).toBe(true);
+    expect(isWithinProject("/outside/f.txt", "/proj", ["/wt2"], HOME)).toBe(false);
+    expect(isWithinProject("/proj2/f.txt", "/proj", [], HOME)).toBe(false);
+    expect(isWithinProject("/proj2/f.txt", "/other", ["/proj"], HOME)).toBe(false);
   });
 });

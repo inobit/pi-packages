@@ -73,16 +73,16 @@ describe("powershell 分类（R/W/X + danger）", () => {
   });
 
   it("写目标含通配符 → X（不可穷举）", () => {
-    expect(classOf("Remove-Item *.tmp")).toMatchObject({ tier: "X", danger: false });
+    expect(classOf("Remove-Item *.tmp")).toMatchObject({ tier: "X", danger: true });
   });
 
-  it("固定危险：iex/icm/Set-ExecutionPolicy/sc/Remove-Item -Recurse/-Force", () => {
+  it("固定危险：iex/icm/Set-ExecutionPolicy/sc/Remove-Item -Recurse/glob（裸 -Force 走正常链）", () => {
     expect(classOf("iex (Get-Content x)")).toMatchObject({ tier: "X", danger: true });
     expect(classOf("Invoke-Expression $cmd")).toMatchObject({ tier: "X", danger: true });
     expect(classOf("Invoke-Command -ScriptBlock {}")).toMatchObject({ tier: "X", danger: true });
     expect(classOf("Set-ExecutionPolicy Bypass")).toMatchObject({ tier: "X", danger: true });
     expect(classOf("Remove-Item -Recurse build")).toMatchObject({ tier: "X", danger: true });
-    expect(classOf("ri -Force temp.txt")).toMatchObject({ tier: "X", danger: true });
+    expect(classOf("ri -Force -Recurse temp.txt")).toMatchObject({ tier: "X", danger: true });
   });
 
   it("嵌套解释器与动态调用一律危险：pwsh/&调用操作符/点源/脚本块", () => {
@@ -209,9 +209,9 @@ describe("review 回归（C1/M1/M2/P2）", () => {
     expect(psReq("build", "Push-Location; Set-Content local.txt data").action).toBe("allow");
   });
 
-  it("M1: rm/ri 的单字母短旗标 -r/-f 命中 Remove-Item 危险叠加", () => {
+  it("M1: rm/ri 的单字母短旗标 -r 命中 Remove-Item 危险叠加；裸 -f 走正常 W 链", () => {
     expect(classOf("rm -r node_modules")).toMatchObject({ tier: "X", danger: true });
-    expect(classOf("ri -f temp.txt")).toMatchObject({ tier: "X", danger: true });
+    expect(classOf("ri -f temp.txt")).toMatchObject({ tier: "W", danger: false });
     expect(psReq("build", "rm -r node_modules").rule).toBe("FR-4");
   });
 
