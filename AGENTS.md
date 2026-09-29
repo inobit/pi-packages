@@ -50,3 +50,4 @@ pi -ne -e ./packages/<pkg>   # 本地冒烟（免编译直载，--no-extensions 
 | `@inobit/pi-undo` | 撤销扩展：`/undo` + `alt+u`，单次/轮、队列感知、原子 abort 再撤 |
 | `@inobit/pi-retry` | 手动透明重试：`/retry` + `alt+r`，原样重新发起失败 turn，零提示词注入 |
 | `@inobit/pi-themes` | 精选主题包：Rosé Pine / TokyoNight / Catppuccin / Solarized 四族亮暗主题，支持 `theme: "亮/暗"` 配对自动切换 |
+| `@inobit/pi-subagent-presets` | 按项目批量配置 pi-subagents 各 agent 的 model 与 thinking，字段级合并全局配置并导出全局 profile 模板 |
