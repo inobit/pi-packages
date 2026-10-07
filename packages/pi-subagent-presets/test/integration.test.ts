@@ -827,6 +827,30 @@ describe("会话装配 + 端到端保存", () => {
 		expect(scout.globalEntry).toEqual({ model: "u/m" });
 	});
 
+	it("回归：选择模型后矩阵立即显示草稿值，且保存计划与显示一致", () => {
+		writeUserSettings({ subagents: { agentOverrides: { reviewer: { model: "u/old" } } } });
+		const s = sessionOf(l1());
+		const sources = { models: [], registry: { getAvailable: () => [] }, scopedModels: [] };
+		const before = buildRowViews(s.rows, l1(), sources);
+		expect(before.find((v) => v.name === "reviewer")?.modelText).toBe("u/old");
+		expect(before.find((v) => v.name === "scout")?.modelText).toBe("");
+
+		const reviewerRow = s.rows.find((r) => r.name === "reviewer")!;
+		reviewerRow.draft.touched.add("model");
+		reviewerRow.draft.model = "p/new";
+		const scoutRow = s.rows.find((r) => r.name === "scout")!;
+		scoutRow.draft.touched.add("model");
+		scoutRow.draft.model = "p/first";
+		const after = refreshViews(before, s, l1(), sources);
+		const reviewer = after.find((v) => v.name === "reviewer")!;
+		expect(reviewer.modelText).toBe("p/new");
+		expect(reviewer.fullModelText).toBe("p/new");
+		expect(after.find((v) => v.name === "scout")?.modelText).toBe("p/first");
+		const { plan } = buildPlan(s, after);
+		expect(plan.overrides.reviewer?.model).toBe("p/new");
+		expect(plan.overrides.scout?.model).toBe("p/first");
+	});
+
 	it("refreshViews 按草稿重算脏行", () => {
 		writeUserSettings({ subagents: { agentOverrides: { reviewer: { model: "u/m2", thinking: "medium" } } } });
 		const s = sessionOf(l1());

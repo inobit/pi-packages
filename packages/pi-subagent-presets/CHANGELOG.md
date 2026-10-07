@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.1] - 2026-10-07
+
+- Fix the matrix model cell staying on the previous value after choosing a new model; it now displays the selected draft value before saving.
+
 ## [0.1.0] - 2026-09-28
 
 First release — `/subagent-presets [--from <profile>]`.

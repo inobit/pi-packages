@@ -344,7 +344,8 @@ function normalizeModelRef(value: unknown): string | undefined {
 function modelTextOf(base: Override, draft: RowEntry["draft"], globalEntry: Override | undefined): string {
 	if (draft.touched.has("model")) {
 		const draftModel = draft.model;
-		if (draftModel === "inherit" || draftModel === false) return "inherit";
+		if (typeof draftModel === "string") return draftModel;
+		if (draftModel === false) return "inherit";
 		if (draftModel === undefined) {
 			// 在 `e` 里删掉了 `model` 键（选择器已不提供 `None`）。
 			// ⚠️ **不能**显示全局值：对 builtin agent，项目条目一旦存在就是**整体替换**
