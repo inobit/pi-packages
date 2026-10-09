@@ -307,6 +307,53 @@ describe("§7.1 重建循环：四类移除", () => {
 		expect(plan.removals.map((r) => r.name)).toEqual(["reviewer"]);
 	});
 
+	it("Finding 8：--from 下模板缺该条目 ⇒ 移除原因说明 blueprint 无条目（行为正确：删项目条，留全局层）", () => {
+		// 模板没有该 agent 的条目，全局层有，项目层也有 ⇒ 基底落到全局层 ⇒ state GLOBAL。
+		// 项目条目被删是**对的**（模板 + 全局的结果就是全局那份），但原因不是 "merged base is empty"。
+		const plan = planRebuild({
+			rows: [
+				row("scout", {
+					projectEntry: { model: "p/m" },
+					globalEntry: { model: "u/m" },
+					merged: { model: "u/m" },
+					origin: { base: [], global: ["model"] },
+					// 无 fromEntry：模板里没有该 agent
+				}),
+			],
+			projectOverrides: { scout: { model: "p/m" } },
+			whitelist: ["scout"],
+			fromProfileActive: true,
+		});
+		expect(plan.overrides).toEqual({});
+		expect(plan.removals).toEqual([
+			{ name: "scout", reason: "empty-base", detail: "the blueprint has no entry for this agent; the project entry is removed so the global layer applies" },
+		]);
+	});
+
+	it("Finding 8：其余场景维持原文案（无 --from / 模板有该条目）", () => {
+		const opts = {
+			projectEntry: { model: "p/m" },
+			globalEntry: { model: "u/m" },
+			merged: { model: "u/m" },
+			origin: { base: [], global: ["model"] },
+		};
+		// 无 --from：原文案
+		const plain = planRebuild({
+			rows: [row("scout", opts)],
+			projectOverrides: { scout: { model: "p/m" } },
+			whitelist: ["scout"],
+		});
+		expect(plain.removals).toEqual([{ name: "scout", reason: "empty-base", detail: "merged base is empty, the entry will be removed" }]);
+		// --from 且模板有该条目（空条目也是“有”）：原文案
+		const withEntry = planRebuild({
+			rows: [row("scout", { ...opts, fromEntry: {} })],
+			projectOverrides: { scout: { model: "p/m" } },
+			whitelist: ["scout"],
+			fromProfileActive: true,
+		});
+		expect(withEntry.removals).toEqual([{ name: "scout", reason: "empty-base", detail: "merged base is empty, the entry will be removed" }]);
+	});
+
 	it("state === GLOBAL 且项目无条目 ⇒ 什么都不做（不产生移除记录）", () => {
 		const plan = planRebuild({
 			rows: [row("reviewer", { globalEntry: { model: "u/m" }, merged: { model: "u/m" } })],
@@ -475,6 +522,89 @@ describe("--from 的「模板未生效字段」预览", () => {
 			whitelist: ["reviewer"],
 		});
 		expect(plan.dropped).toEqual([]);
+	});
+});
+
+describe("--from 落盘修复（§16.1）", () => {
+	it("1. --from + 未编辑 + 项目条目与模板不同 ⇒ changed 含该行，overrides 取模板值", () => {
+		const projectEntry: Override = { model: "p/m", thinking: "low" };
+		const plan = planRebuild({
+			rows: [row("reviewer", { projectEntry, merged: { model: "b/m", thinking: "high" }, fromEntry: { model: "b/m", thinking: "high" } })],
+			projectOverrides: { reviewer: projectEntry },
+			whitelist: ["reviewer"],
+			fromProfileActive: true,
+		});
+		expect(plan.overrides.reviewer).toEqual({ model: "b/m", thinking: "high" });
+		expect(plan.changed).toHaveLength(1);
+		expect(plan.changed[0]?.name).toBe("reviewer");
+		expect(plan.changed[0]?.isNew).toBe(false);
+		expect(plan.changed[0]?.before).toEqual(projectEntry);
+		expect(plan.unchanged).toEqual([]);
+	});
+
+	it("2. --from + 未编辑 + 项目无条目 + 模板有 ⇒ 写入，isNew: true", () => {
+		const plan = planRebuild({
+			rows: [row("scout", { merged: { model: "b/m", thinking: "max" }, fromEntry: { model: "b/m", thinking: "max" } })],
+			projectOverrides: {},
+			whitelist: ["scout"],
+			fromProfileActive: true,
+		});
+		expect(plan.overrides.scout).toEqual({ model: "b/m", thinking: "max" });
+		expect(plan.changed).toHaveLength(1);
+		expect(plan.changed[0]?.name).toBe("scout");
+		expect(plan.changed[0]?.isNew).toBe(true);
+	});
+
+	it("3. --from + 未编辑 + 项目条目与模板完全相同 ⇒ 不写，unchanged 含该行（幂等）", () => {
+		const projectEntry: Override = { model: "b/m", thinking: "high" };
+		const plan = planRebuild({
+			rows: [row("reviewer", { projectEntry, merged: { model: "b/m", thinking: "high" }, fromEntry: { model: "b/m", thinking: "high" } })],
+			projectOverrides: { reviewer: projectEntry },
+			whitelist: ["reviewer"],
+			fromProfileActive: true,
+		});
+		expect(plan.changed).toEqual([]);
+		expect(plan.unchanged).toEqual(["reviewer"]);
+		expect(plan.overrides.reviewer).toEqual(projectEntry);
+	});
+
+	it("4. 不带 --from + 未编辑 + 项目无条目 ⇒ 不写（决策 5 的回归）", () => {
+		// 基底来自 default profile 的行：与用例 2 同形，只是没开 --from ⇒ 必须不写
+		const plan = planRebuild({
+			rows: [row("scout", { merged: { model: "d/m", thinking: "max" } })],
+			projectOverrides: {},
+			whitelist: ["scout"],
+		});
+		expect(plan.changed).toEqual([]);
+		expect(plan.overrides).toEqual({});
+		expect(plan.unchanged).toEqual([]);
+	});
+
+	it("5. --from + 模板条目为空（基底回落到项目条目）⇒ 不写、不产生 removal", () => {
+		const projectEntry: Override = { model: "p/m" };
+		const plan = planRebuild({
+			rows: [row("reviewer", { projectEntry, merged: { model: "p/m" } })],
+			projectOverrides: { reviewer: projectEntry },
+			whitelist: ["reviewer"],
+			fromProfileActive: true,
+		});
+		expect(plan.changed).toEqual([]);
+		expect(plan.removals).toEqual([]);
+		expect(plan.unchanged).toEqual(["reviewer"]);
+		expect(plan.overrides.reviewer).toEqual(projectEntry);
+	});
+
+	it("6. dropped：项目条目里模板没有的键进 plan.dropped", () => {
+		const projectEntry: Override = { model: "p/m", skills: ["s"] };
+		const plan = planRebuild({
+			rows: [row("reviewer", { projectEntry, merged: { model: "b/m" }, fromEntry: { model: "b/m" } })],
+			projectOverrides: { reviewer: projectEntry },
+			whitelist: ["reviewer"],
+			fromProfileActive: true,
+		});
+		expect(plan.overrides.reviewer).toEqual({ model: "b/m" });
+		expect(plan.changed).toHaveLength(1);
+		expect(plan.dropped).toEqual([{ name: "reviewer", keys: ["skills"] }]);
 	});
 });
 

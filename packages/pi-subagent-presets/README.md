@@ -90,22 +90,29 @@ can pick here. Use `r` to reset the row, or delete the key yourself in `e`.
 
 Non-interactive sessions print a summary of every agent and return without writing anything.
 
-## 注意事项
+## Two opposite upstream resolution paths
 
-上游对 `agentOverrides` 有**两条语义相反**的解析路径，取决于 agent 种类。写代码 / 排错前先确认你要改的 agent 属于哪一类：
+Upstream resolves `agentOverrides` through **two paths with opposite semantics**, depending on the agent kind. Before writing code or debugging, confirm which kind your target agent belongs to:
 
-| agent 种类 | 上游路径 | 语义 |
+| Agent kind | Upstream path | Semantics |
 | --- | --- | --- |
-| **内置**（pi-subagents 自带的 `worker` / `reviewer` / `researcher` / …） | `applyBuiltinOverrides` | **按 agent 整体替换**：项目里只要有该 agent 的条目，全局那条**整条不参与**。项目条目没写的字段回落到 agent 定义 → `subagents.default*` → 父会话模型 |
-| **自定义**（你在 `.pi/agents/*.md` 或某个 package 里定义的） | `applyCustomAgentOverrides` | **逐字段**合并：先应用全局、再应用项目（“project wins, without dropping user-only fields”） |
+| **Built-in** (`worker` / `reviewer` / `researcher` / … shipped with pi-subagents) | `applyBuiltinOverrides` | **Whole-entry replacement per agent**: once the project has an entry for that agent, the global entry is **entirely skipped**. Fields the project entry does not write fall back to the agent definition → `subagents.default*` → parent session model |
+| **Custom** (defined by you in `.pi/agents/*.md` or in some package) | `applyCustomAgentOverrides` | **Field-by-field** merge: global first, then project ("project wins, without dropping user-only fields") |
 
-由此有三个容易踩的地方：
+Measured comparison (project entry writes only `thinking`, global config has `model` / `machine`):
 
-- **在 `e` 里删掉一个字段，两类 agent 结果不同。** 内置：字段真的没了（先回落到定义层，定义层也没有才彻底消失）。自定义：**全局的值又填回来**—— 删键等于「回落到全局」，无法表达「我不要这个字段」。要强制清空得写 `"machine": false`（上游把 `false` 映射为 `delete`）。
-- **`MERGE` 在两类 agent 上的含义不同。** 它只表示「我们提供的字段没有覆盖全局的全部字段」。对内置 agent 意味着那些全局字段被**丢弃**；对自定义 agent 意味着它们**回落到全局值**。
-- **本扩展「写完整合并」的效果也不同。** 对内置是必须的（否则字段真丢）；对自定义，运行期结果一样，但项目里从此存了一份快照 —— 之后全局改 `model`，这个项目**不会跟着变**。
+| | `model` | `machine` | `output` |
+| --- | --- | --- | --- |
+| Built-in `researcher` | dropped | dropped | `research.md` (from the definition layer) |
+| Custom `probe-custom` | `g/GLOBAL-MODEL` | `r1` | `text` |
 
-（判断 agent 属于哪一类，看 pi-subagents discovery 的四桶：`builtin` / `package` / `user` / `project`。）
+Three easy traps follow from this:
+
+- **Deleting a field in `e` behaves differently per kind.** Built-in: the field is really gone (falls back to the definition layer first, and disappears entirely only if the definition layer has neither). Custom: **the global value fills back in** — deleting a key means "fall back to global" and cannot express "I don't want this field". To force a blank, write `"machine": false` (upstream maps `false` to `delete`).
+- **`MERGE` means different things per kind.** It only says "the fields we provide do not cover every global field". For built-in agents those uncovered global fields are **dropped**; for custom agents they **fall back to the global values**.
+- **This extension's "write the complete merge" lands differently too.** For built-in agents it is required (otherwise fields are really lost); for custom agents the runtime result is the same, but the project now holds a snapshot of its own — later edits to the global `model` **will not follow** into this project.
+
+(To tell which kind an agent is, look at pi-subagents discovery's four buckets: `builtin` / `package` / `user` / `project`.)
 
 ## Merge semantics
 
@@ -190,8 +197,8 @@ commented field skeleton: one line per one of the 26 fields, with its value doma
 
 | Case | Result |
 | --- | --- |
-| Known field with an illegal value / non-level `thinking` | ⚠️ `上游会对以下内容报错（已照原样保存）：reviewer.outputMode="x"` |
-| Unknown key | ⚠️ `未知键会被静默丢弃：reviewer.foo` |
+| Known field with an illegal value / non-level `thinking` | ⚠️ a red notice naming the field and the value you typed (saved as-is, upstream will complain) |
+| Unknown key | ⚠️ a red notice naming the key (silently dropped upstream) |
 
 Those warnings are summarised on the save screen. The only thing still rejected is a
 top-level non-object (that shape cannot be stored in `agentOverrides` at all).

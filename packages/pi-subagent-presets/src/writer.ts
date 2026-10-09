@@ -181,17 +181,39 @@ export function planRebuild(opts: RebuildOptions): RebuildPlan {
 			if (existing && Object.keys(materializeRow(base, draft)).length === 0) emptyBase.push(name);
 			if (existing) {
 				zeroContribution.push(name);
+				// `--from` 下模板缺该条目：基底落到全局层，项目条目被删是**对的**
+				// （模板 + 全局的结果就是全局那份），但原因不是 "merged base is empty"。
+				// 判据用 `fromEntry`：模板里有没有这一条（空对象也算"有"⇒ 走原文案）。
 				removals.push(
 					draft.reset && !resetParticipates(row)
 						? { name, reason: "reset", detail: "reset: project entry removed, falls back to the global layer" }
-						: { name, reason: "empty-base", detail: "merged base is empty, the entry will be removed" },
+						: fromProfileActive && !row.fromEntry
+							? {
+									name,
+									reason: "empty-base",
+									detail: "the blueprint has no entry for this agent; the project entry is removed so the global layer applies",
+								}
+							: { name, reason: "empty-base", detail: "merged base is empty, the entry will be removed" },
 				);
 			}
 			continue;
 		}
 
 		if (!rowDirty(row)) {
-			// 未 dirty 且非新建的行 ⇒ 保留其现有值（物化会把"跟随全局"翻转成遮蔽）
+			// `--from`：基底就是模板 ⇒ 未编辑的行也要按模板落盘。判定基准从
+			// “草稿 vs 草稿初值”换成“将写入对象 vs 项目现有条目”。
+			if (fromProfileActive) {
+				const after = materializeRow(base, draft);
+				if (Object.keys(after).length > 0) {
+					const fields = diffFields(existing, after);
+					if (fields.length > 0 || !existing) {
+						rebuilt[name] = after;
+						changed.push({ name, ...(existing ? { before: existing } : {}), after, fields, isNew: !existing });
+						continue;
+					}
+				}
+			}
+			// 未 dirty 且非新建的行 ⇒ 保留其现有值（物化会把“跟随全局”翻转成遮蔽）
 			if (existing) {
 				rebuilt[name] = existing;
 				unchanged.push(name);

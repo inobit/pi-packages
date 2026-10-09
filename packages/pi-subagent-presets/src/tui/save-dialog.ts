@@ -208,7 +208,7 @@ export class SaveDialog extends Container implements Focusable {
 			lines.push("");
 		}
 		if (plan.dropped.length > 0) {
-			lines.push("not applied (--from blueprint, project entry wins):");
+			lines.push("replaced (--from blueprint is the base; the project entry does not contribute):");
 			for (const drop of plan.dropped) lines.push(`  - ${drop.name}.${drop.keys.join(", ")}`);
 			lines.push("");
 		}
