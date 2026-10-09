@@ -597,14 +597,19 @@ export class PresetsMatrix extends Container implements Focusable {
 	}
 
 	private async openSaveDialog(): Promise<void> {
-		if (!this.anyDirty()) {
-			this.notify("info", "No changes");
-			this.invalidate();
-			return;
-		}
-		const { plan, warnings, overCeilingAgents } = this.opts.callbacks.planSave(this.rows);
-		if (plan.changed.length === 0 && plan.removals.length === 0 && plan.dropped.length === 0 && !plan.main.changed && !plan.main.removal) {
-			this.notify("info", "No changes");
+		// ⚠️ `S` **总是**打开保存屏，不看有没有未保存修改：导出/改名 profile 是一个**独立目的**
+		//   （profile = 整张矩阵快照，与“项目侧有没有待写入”解耦）。零改动时项目侧是空操作 ——
+		//   `writeProjectSettings` 对等值内容早退、不改文件；保存屏会明确标注“nothing to write”。
+		let plan: RebuildPlan;
+		let warnings: SaveWarning[];
+		let overCeilingAgents: string[];
+		try {
+			const computed = this.opts.callbacks.planSave(this.rows);
+			plan = computed.plan;
+			warnings = computed.warnings;
+			overCeilingAgents = computed.overCeilingAgents;
+		} catch (e) {
+			this.notify("error", `Cannot build the save plan: ${e instanceof Error ? e.message : String(e)}`);
 			this.invalidate();
 			return;
 		}
@@ -637,7 +642,7 @@ export class PresetsMatrix extends Container implements Focusable {
 		this.dirtyConfirmPending = false;
 		// ⚠️ 提示一律走 pi 的通知区（原则：提示归 pi）。成功就一句“写到哪了”，不报摘要。
 		if (outcome.ok) {
-			this.notify("info", `Saved to ${this.savedTargetPath(result)}`);
+			this.notify("info", `Saved to ${this.savedTargetPath(result, outcome)}`);
 			// 写盘后草稿会被 `resetAfterSave` 清空 ⇒ `e` 的警告也不该再留着
 			for (const row of this.rows) row.editWarnings = [];
 		} else {
@@ -655,10 +660,13 @@ export class PresetsMatrix extends Container implements Focusable {
 	}
 
 	/** 保存成功提示里的一句话：写到哪个文件（两个都写时用 `+` 连接）。 */
-	private savedTargetPath(result: SaveResult): string {
+	private savedTargetPath(result: SaveResult, outcome?: CommitResult): string {
+		// 只报**真的写了**的目标：零改动时项目侧是空操作（等值内容不重写文件）。
+		const wroteProject = outcome?.wroteProject ?? result.writeProject;
+		const wroteProfile = outcome?.wroteProfile ?? result.writeProfile;
 		const parts: string[] = [];
-		if (result.writeProject) parts.push(this.opts.projectPath);
-		if (result.writeProfile) parts.push(this.profilePathFor(result.profileName));
+		if (wroteProject) parts.push(this.opts.projectPath);
+		if (wroteProfile) parts.push(this.profilePathFor(result.profileName));
 		return parts.join(" + ");
 	}
 

@@ -47,7 +47,7 @@ pi -e ./packages/pi-subagent-presets
 | `shift+tab` | Cycle the thinking level (pi's default levels when the row has no model) |
 | `r` | Reset: do not write a project entry (state becomes `GLOBAL`); editing any field turns it into "write this instead". On the `main` row, `r` removes all three top-level keys at once |
 | `e` | Edit the **whole entry that will be written** in `$EDITOR` (model / thinking included; validation only warns) |
-| `S` | Save |
+| `S` | Save — always opens the save dialog, even with nothing pending: exporting or renaming a profile needs no change, and the project file is then left untouched |
 | `esc` | Quit (asks twice when there are unsaved changes) |
 
 The matrix has four columns (`agent` / `model` / `thinking` / `state`). `state` is

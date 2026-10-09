@@ -609,4 +609,8 @@ export type { RowContext, BulkFlag };
 export interface CommitResult {
 	ok: boolean;
 	message: string;
+	/** 项目 settings **真的被重写**（等值内容早退 ⇒ 零改动时为 false）。 */
+	wroteProject?: boolean;
+	/** profile 文件已导出（导出总是落盘，profile = 整张矩阵快照）。 */
+	wroteProfile?: boolean;
 }

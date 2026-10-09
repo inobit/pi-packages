@@ -15,6 +15,7 @@
 
 ### Changed
 
+- `S` no longer checks whether anything is pending: it always opens the save dialog. Anything that is not "write to the project" — re-exporting the matrix snapshot under another profile name, for instance — was unreachable before, because both gates only looked at project-side diffs. With nothing to write, the project settings file is skipped silently (untouched, and not named in the save notice, which now reports only the targets that were really written)
 - **a profile now exports the whole matrix snapshot, not just the rows being written**: the project side still writes only what has to be written, while the profile gets every managed agent visible in the matrix — including rows you never touched — because a profile is the blueprint a future project lays down with `--from`. The two sides deliberately differ, and the save screen now says so whenever the profile target is checked
 - `r` no longer leaves the `main` row showing (or writing) a cross-layer mix of the pre-reset project `defaultProvider` and the frozen global `defaultModel`. Provider resolution is now one function (`resolveMainEntry`) shared by the matrix cell, the write path and the `e` editor
 - the plain command no longer falls back to the default profile (values shown were never written); use `--from default` explicitly

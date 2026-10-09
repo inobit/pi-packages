@@ -768,6 +768,32 @@ describe("会话装配 + 端到端保存", () => {
 		expect(["pi", "git", "cwd"]).toContain(s.projectRoot.tier);
 	});
 
+	it("§16.8：零改动提交 ⇒ 项目文件一个字节都不碰，profile 快照照常导出", () => {
+		// "只想换个 profile 名字另存一份" 的场景：`S` 直接进保存屏，项目侧静默跳过。
+		writeProjectSettings({ theme: "dark", subagents: { agentOverrides: { worker: { model: "p/m" } } } });
+		const s = sessionOf(l1());
+		const views = sessionViews(s);
+		const { plan } = buildPlan(s, views);
+		expect(plan.changed).toEqual([]);
+		expect(plan.removals).toEqual([]);
+		const before = fs.readFileSync(getProjectSettingsPath(projectRoot), "utf8");
+		const beforeMtime = fs.statSync(getProjectSettingsPath(projectRoot)).mtimeMs;
+
+		const outcome = commitSave(s, { writeProject: true, writeProfile: true, profileName: "renamed" }, plan, [], agentDir, fakeModule(), [], views);
+		expect(outcome.ok).toBe(true);
+		// 项目侧：既没写、也没报路径
+		expect(outcome.wroteProject).toBe(false);
+		expect(outcome.message).not.toContain("project:");
+		expect(fs.readFileSync(getProjectSettingsPath(projectRoot), "utf8")).toBe(before);
+		expect(fs.statSync(getProjectSettingsPath(projectRoot)).mtimeMs).toBe(beforeMtime);
+		// profile 侧：整张矩阵快照落盘（名字也换了）
+		expect(outcome.wroteProfile).toBe(true);
+		const profile = JSON.parse(fs.readFileSync(getProfilePath("renamed", agentDir), "utf8")) as {
+			subagents: { agentOverrides: Record<string, Override> };
+		};
+		expect(profile.subagents.agentOverrides.worker).toEqual({ model: "p/m" });
+	});
+
 	it("settings.json 语法错误 ⇒ 报错并给出路径，不写入", () => {
 		fs.mkdirSync(path.dirname(getProjectSettingsPath(projectRoot)), { recursive: true });
 		fs.writeFileSync(getProjectSettingsPath(projectRoot), "{ broken", "utf-8");

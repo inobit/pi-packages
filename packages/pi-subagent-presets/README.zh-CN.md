@@ -47,7 +47,7 @@ pi -e ./packages/pi-subagent-presets
 | `shift+tab` | 环形切换 thinking 档位（该行没有 model 时用 pi 默认全 7 档） |
 | `r` | reset：该 agent 不写项目条目（状态变 `GLOBAL`）；改任一字段后改成“按新内容写”。在 `main` 行上按 `r` 会一次性删掉顶层三个键 |
 | `e` | 用 `$EDITOR` 编辑**整条将写入的条目**（含 model / thinking；校验只警告） |
-| `S` | 保存 |
+| `S` | 保存 —— **无条件**打开保存屏：导出/改名 profile 不需要先改任何配置；没有待写入内容时项目文件会被静默跳过（不碰、不出现在保存提示里） |
 | `esc` | 退出（有未保存改动时二次确认） |
 
 矩阵只有四列（`agent` / `model` / `thinking` / `state`）。`state` 由「将写入对象里字段的来源」实时计算：

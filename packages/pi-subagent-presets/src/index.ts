@@ -574,6 +574,34 @@ function mainSaveWarnings(
 }
 
 /**
+ * 项目侧是否真的无事可做（= 与现有内容等值）。
+ *
+ * `S` 不再因零改动而拦截（导出/改名 profile 是独立目的，§16.8：profile = 整张矩阵快照），
+ * 所以 commit 时用它在后台**静默跳过**项目写入 —— 既不改文件，也不在保存提示里报一个
+ * 没写过的路径。
+ */
+function projectIsNoop(plan: RebuildPlan): boolean {
+	return (
+		plan.changed.length === 0 &&
+		plan.removals.length === 0 &&
+		plan.dropped.length === 0 &&
+		!plan.main.changed &&
+		!plan.main.removal
+	);
+}
+
+/**
+ * 该不该真的写项目 settings。
+ *
+ * 零改动（只为导出/改名 profile）⇒ **静默跳过**，连文件都不碰。但 `settings.json` 本身
+ * 解析失败时照常尝试：写盘层会拒绝并把错误报出来（绝不覆盖用户数据），而跳过会把这条
+ * 信息一并吞掉。
+ */
+function shouldWriteProject(session: SessionState, plan: RebuildPlan): boolean {
+	return session.projectLayer.error !== undefined || !projectIsNoop(plan);
+}
+
+/**
  * 执行保存。
  *
  * 失败时**不**写后续目标（project 写失败就不写 profile），把错误交回调用方弹红条；
@@ -601,9 +629,14 @@ export function commitSave(
 	// `--from` 铺开用的模板”，只导出会写的部分就是残缺模板。必须在 `resetAfterSave`
 	// （下方）之前算，那会重算草稿。
 	const snapshot = result.writeProfile ? profileSnapshot(buildRebuildInputs(session, [...views])) : {};
-	if (result.writeProject) {
+	let wroteProject = false;
+	if (result.writeProject && shouldWriteProject(session, plan)) {
+		// 零改动（只为导出/改名 profile）时**静默跳过**项目写入：连文件都不碰。
+		// 等值内容 `writeProjectSettings` 本身也会早退，这里先判一次是为了不必读文件、
+		// 也不会让保存提示指向一个没写过的路径。
 		try {
 			writeProjectSettings(session.projectRoot.root, { overrides: plan.overrides, ...(mainAfter !== undefined ? { main: mainAfter } : {}) });
+			wroteProject = true;
 			messages.push(`project: ${getProjectSettingsPath(session.projectRoot.root)}`);
 			if (mainChanged) messages.push("main: defaultProvider/defaultModel/defaultThinkingLevel (next pi start)");
 		} catch (e) {
@@ -636,7 +669,7 @@ export function commitSave(
 	if (warnings.length > 0) messages.push(`${warnings.length} notice(s) shown before saving`);
 	if (agentChanged) messages.push("verify with /subagents-models <agent>");
 	if (mainChanged) messages.push("verify by starting pi again in this project");
-	return { ok: true, message: messages.join("; ") };
+	return { ok: true, message: messages.join("; "), wroteProject, wroteProfile: result.writeProfile };
 }
 
 /** 脏行必须重算：用户改草稿后列要按草稿值刷新（否则连按 shift+tab 看不到变化）。 */

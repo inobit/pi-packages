@@ -573,16 +573,13 @@ describe("PresetsMatrix：形状与键位", () => {
 		expect(render(matrix)).not.toContain("provider 作用域");
 	});
 
-	it("S 打开保存屏；无改动时提示 No changes", () => {
+	it("S 无条件打开保存屏（导出/改名 profile 不需要先改配置）", () => {
 		const a = row("reviewer", { projectEntry: { model: "m" } });
 		const { matrix, notices } = makeMatrix([a.view], [a.input]);
-		matrix.handleInput("S");
-		expect(notices).toContain("No changes");
-
-		a.view.draft.touched.add("model");
-		a.view.draft.model = "p/m";
+		// 零改动：旧实现在这里短路成 "No changes"，改不了 profile 名字
 		matrix.handleInput("S");
 		expect(render(matrix)).toContain("Save?");
+		expect(notices).not.toContain("No changes");
 	});
 
 	it("保存屏列出写入内容与四类移除", () => {
@@ -1220,7 +1217,7 @@ describe("Matrix main 行（§16.3.1）", () => {
 		expect(notices).not.toContain("No changes");
 	});
 
-	it("main 未改 + agent 未改 ⇒ S 提示 No changes（幂等，不误报）", () => {
+	it("main 未改 + agent 未改 ⇒ 仍进保存屏（项目侧静默跳过，profile 可照常导出）", () => {
 		const m = mainRow({ project: { defaultProvider: "p", defaultModel: "m" } });
 		const a = row("reviewer", { projectEntry: { model: "p/m" } });
 		const agentPlan = planRebuild({ rows: [a.input], projectOverrides: { reviewer: { model: "p/m" } }, whitelist: ["reviewer"] });
@@ -1237,7 +1234,8 @@ describe("Matrix main 行（§16.3.1）", () => {
 		});
 		expect(render(matrix)).not.toContain("● unsaved changes");
 		matrix.handleInput("S");
-		expect(notices).toContain("No changes");
+		expect(render(matrix)).toContain("Save?");
+		expect(notices).not.toContain("No changes");
 	});
 
 	it("顶部不出现任何 base/生效性文案（生效与否只由底部 ● 表达）", () => {
