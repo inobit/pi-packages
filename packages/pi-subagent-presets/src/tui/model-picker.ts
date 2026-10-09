@@ -47,9 +47,13 @@ export const MODEL_PREFIX = "model:";
  */
 type MouseDispatchResult = ReturnType<Container["handleMouse"]>;
 
+/**
+ * 模型选项（§16.3.2）：UI 选模型天然成对，`value` 仍是 `provider/id` 展示串
+ * （保持既有 encode/decode 兼容），`provider` / `id` 拆自首个斜杠（id 自身可含斜杠）。
+ */
 export type ModelChoice =
 	| { kind: "follow-parent" }
-	| { kind: "model"; value: string };
+	| { kind: "model"; value: string; provider: string; id: string };
 
 export function encodeModelChoice(choice: ModelChoice): string {
 	switch (choice.kind) {
@@ -62,7 +66,11 @@ export function encodeModelChoice(choice: ModelChoice): string {
 
 export function decodeModelChoice(raw: string): ModelChoice {
 	if (raw === FOLLOW_PARENT_KEY) return { kind: "follow-parent" };
-	return { kind: "model", value: raw.slice(MODEL_PREFIX.length) };
+	const value = raw.slice(MODEL_PREFIX.length);
+	// 只拆首个斜杠：id 自身可含斜杠（如 `opencode/exo-free`）。无斜杠时 provider 为空串。
+	const slash = value.indexOf("/");
+	if (slash <= 0) return { kind: "model", value, provider: "", id: value };
+	return { kind: "model", value, provider: value.slice(0, slash), id: value.slice(slash + 1) };
 }
 
 export interface ModelPickerOptions {
@@ -72,6 +80,11 @@ export interface ModelPickerOptions {
 	currentText: string;
 	/** 当前草稿值：`undefined`（删键）/ `"inherit"`（跟随父会话）/ 具体 id。 */
 	currentValue: string | false | undefined;
+	/**
+	 * 是否显示 `inherit` 固定项（§16.3.1）：main 行没有“跟随父会话”概念，传 `false` 隐藏。
+	 * 默认 `true`（agent 行保持现状）。
+	 */
+	followParent?: boolean | undefined;
 	theme: Theme;
 	keybindings: KeybindingsManager;
 	onChoose: (choice: ModelChoice) => void;
@@ -106,8 +119,13 @@ function fixedItems(): SelectItem[] {
 	return [{ value: FOLLOW_PARENT_KEY, label: "inherit", description: "(uses the parent session model, skips subagents.defaultModel)" }];
 }
 
-/** 固定项数量（选择索引空间：0..FIXED_COUNT-1 是固定项，之后是模型）。 */
-const FIXED_COUNT = 1;
+/**
+ * 该选择器实例的固定项（§16.3.2）：main 行传 `followParent: false` 时为空，
+ * 主 agent 没有“跟随父会话”概念。默认显示（agent 行保持现状）。
+ */
+function fixedItemsOf(opts: Pick<ModelPickerOptions, "followParent">): SelectItem[] {
+	return opts.followParent === false ? [] : fixedItems();
+}
 
 export class ModelPicker extends Container implements Focusable {
 	private _focused = false;
@@ -143,14 +161,19 @@ export class ModelPicker extends Container implements Focusable {
 		this.searchInput.onSubmit = () => this.selectCurrent();
 		this.addChild(this.searchInput);
 
-		const target = currentTarget(opts.currentValue);
-		if (target === FOLLOW_PARENT_KEY) {
+		const target = currentTarget(opts.currentValue, opts.followParent !== false);
+		if (target === FOLLOW_PARENT_KEY && this.fixedCount > 0) {
 			this.fixedSelected = 0;
 			this.list = this.buildList(undefined);
 		} else {
-			this.list = this.buildList(target);
+			this.list = this.buildList(target === FOLLOW_PARENT_KEY ? undefined : target);
 		}
 		this.addChild(this.list);
+	}
+
+	/** 该实例的固定项数量（main 行隐藏 `inherit` 时为 0）。 */
+	private get fixedCount(): number {
+		return fixedItemsOf(this.opts).length;
 	}
 
 	/** Focusable：把焦点透给搜索框（IME 光标定位需要它）。 */
@@ -206,8 +229,10 @@ export class ModelPicker extends Container implements Focusable {
 		// - 当前值本身就是固定项（`inherit`）⇒ 选中它。
 		// - 其余（无搜索词且当前值是某模型 / 有搜索词）⇒ 选中模型。
 		let fixed: number | null = null;
-		if (query && models.length === 0) fixed = 0;
-		else if (target === FOLLOW_PARENT_KEY) fixed = 0;
+		// 零匹配时：有固定项 ⇒ 回落到它（选中态有处安放）；main 行无固定项 ⇒
+		// 保持空列表（enter 无操作，不卡死，见 `selectCurrent` 的空守卫）。
+		if (query && models.length === 0) fixed = this.fixedCount > 0 ? 0 : null;
+		else if (target === FOLLOW_PARENT_KEY && this.fixedCount > 0) fixed = 0;
 		this.fixedSelected = fixed;
 		const next = this.buildList(fixed === null ? target : undefined);
 		this.removeChild(this.list);
@@ -218,7 +243,7 @@ export class ModelPicker extends Container implements Focusable {
 
 	private selectCurrent(): void {
 		if (this.fixedSelected !== null) {
-			const item = fixedItems()[this.fixedSelected];
+			const item = fixedItemsOf(this.opts)[this.fixedSelected];
 			if (item) this.opts.onChoose(decodeModelChoice(item.value));
 			return;
 		}
@@ -277,7 +302,7 @@ export class ModelPicker extends Container implements Focusable {
 
 	/** 上下移动：在「固定项 + 可见模型」这一个索引空间里环形走。 */
 	private move(delta: number): void {
-		const total = FIXED_COUNT + this.visibleModelItems().length;
+		const total = this.fixedCount + this.visibleModelItems().length;
 		if (total === 0) return;
 		this.setSelectedIndex(this.selectedIndex() + delta);
 	}
@@ -288,26 +313,29 @@ export class ModelPicker extends Container implements Focusable {
 		const models = this.visibleModelItems();
 		const item = this.list.getSelectedItem();
 		const index = item ? models.findIndex((entry) => entry.value === item.value) : -1;
-		return FIXED_COUNT + Math.max(0, index);
+		return this.fixedCount + Math.max(0, index);
 	}
 
 	private setSelectedIndex(next: number): void {
-		const total = FIXED_COUNT + this.visibleModelItems().length;
+		const fixedCount = this.fixedCount;
+		const total = fixedCount + this.visibleModelItems().length;
 		if (total === 0) return;
 		const wrapped = ((next % total) + total) % total;
-		if (wrapped < FIXED_COUNT) {
+		if (wrapped < fixedCount) {
 			this.fixedSelected = wrapped;
 			this.list.setSelectedIndex(0);
 		} else {
 			this.fixedSelected = null;
-			this.list.setSelectedIndex(wrapped - FIXED_COUNT);
+			this.list.setSelectedIndex(wrapped - fixedCount);
 		}
 		this.invalidate();
 	}
 
 	/** 固定两行 + 分隔线（**常驻置顶**，不随模型列表滚动）。 */
 	private renderFixedRows(width: number, t: Theme): string[] {
-		const items = fixedItems();
+		const items = fixedItemsOf(this.opts);
+		// main 行隐藏固定项时不画任何行（含分隔线）。
+		if (items.length === 0) return [];
 		const labelWidth = Math.max(...items.map((item) => item.label.length));
 		const lines = items.map((item, i) => {
 			const selected = this.fixedSelected === i;
@@ -333,7 +361,7 @@ export class ModelPicker extends Container implements Focusable {
 	/** 供测试断言：当前光标落在哪个 value 上。 */
 	/** 当前选中项的 value（固定项与模型统一口径）。 */
 	selectedValue(): string | undefined {
-		if (this.fixedSelected !== null) return fixedItems()[this.fixedSelected]?.value;
+		if (this.fixedSelected !== null) return fixedItemsOf(this.opts)[this.fixedSelected]?.value;
 		return this.list.getSelectedItem()?.value ?? undefined;
 	}
 
@@ -349,7 +377,9 @@ export class ModelPicker extends Container implements Focusable {
  * `undefined`（这一行不写 model）**不再**映射到任何固定项 —— `None` 已删除，
  * 没有「无值」这个可选项，直接不预选（光标落在第一个模型上）。
  */
-function currentTarget(value: string | false | undefined): string | undefined {
+function currentTarget(value: string | false | undefined, followParent = true): string | undefined {
 	if (typeof value !== "string" || value.length === 0) return undefined;
-	return value === "inherit" ? FOLLOW_PARENT_KEY : `${MODEL_PREFIX}${value}`;
+	// main 行隐藏固定项时 `inherit` 无处可落 ⇒ 不预选（光标落在第一个模型上）。
+	if (value === "inherit") return followParent ? FOLLOW_PARENT_KEY : undefined;
+	return `${MODEL_PREFIX}${value}`;
 }

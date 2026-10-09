@@ -1,8 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import { Container, KeybindingsManager, SelectList, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
+import { Container, KeybindingsManager, SelectList, TUI_KEYBINDINGS, visibleWidth } from "@earendil-works/pi-tui";
 import type { KeybindingsManager as PiKeybindingsManager, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { classifyRow, type RowState } from "../src/rowstate.ts";
 import { createDraft, synthesizeDetailed, type FieldOrigin, type Override } from "../src/merge.ts";
+import { MAIN_ROW_NAME, mainEntryForEditor, synthesizeMain, type MainLayer } from "../src/main-row.ts";
+import { buildPlan, commitSave, editorContentForMain, jsonEditorHeader, jsonEditorHeaderMain, reviewMainEditedJson, summaryLines } from "../src/index.ts";
+import type { SessionState } from "../src/session.ts";
+import { planMain } from "../src/writer.ts";
 import { PresetsMatrix, STRIKE_OFF, STRIKE_ON, STATE_COLUMN_WIDTH, type MatrixRowView } from "../src/tui/matrix.ts";
 import { ModelPicker, decodeModelChoice, encodeModelChoice, FOLLOW_PARENT_KEY } from "../src/tui/model-picker.ts";
 import { SaveDialog } from "../src/tui/save-dialog.ts";
@@ -85,6 +89,7 @@ function row(name: string, opts: RowOpts = {}): { view: MatrixRowView; input: Re
 	if (opts.reset) draft.reset = true;
 	const view: MatrixRowView = {
 		name,
+		kind: draft.kind,
 		classification,
 		draft,
 		merged,
@@ -181,6 +186,31 @@ describe("PresetsMatrix：形状与键位", () => {
 				.filter((line) => /worker|scout|reviewer/.test(line))
 				.map((line) => line.search(/\b(high|max)\b/));
 			expect(new Set(offsets).size).toBe(1); // 全部同一列
+		}
+	});
+
+	it("Finding 7：agent 名 / model 含 CJK 时各列跨行对齐（内容宽 + 1 右边距不变）", () => {
+		// `visibleWidth` 按显示列算（CJK 占 2 列）；`String.padEnd` 按码元算会让 CJK 行漂移。
+		// 锁定：thinking 列起点（显示列）跨行一致 + 数据行显示列宽全等。
+		const mk = (name: string, model: string, thinking: string): ReturnType<typeof row> => ({
+			...row(name, { userEntry: { model }, modelText: model, thinkingText: thinking }),
+		});
+		const rows = [mk("审查者", "p/模型 Alpha", "high"), mk("worker", "p/m", "max"), mk("scout-long-name", "ino2api/深度模型-beta", "low")];
+		const { matrix } = makeMatrix(rows.map((r) => r.view), rows.map((r) => r.input));
+		for (const width of [120, 100, 86]) {
+			const lines = matrix
+				.render(width)
+				.map((line) => line.replace(/\u001b\[[0-9;]*m/gu, ""))
+				.filter((line) => /审查者|worker|scout-long-name/.test(line));
+			expect(lines).toHaveLength(3);
+			// thinking 列起点（显示列）跨行一致
+			const offsets = lines.map((line) => {
+				const word = line.includes("high") ? "high" : line.includes("max") ? "max" : "low";
+				return visibleWidth(line.slice(0, line.indexOf(word)));
+			});
+			expect(new Set(offsets).size).toBe(1);
+			// 数据行显示列宽全等（state 同为 GLOBAL，列宽只由内容宽 + 1 右边距决定）
+			expect(new Set(lines.map((line) => visibleWidth(line))).size).toBe(1);
 		}
 	});
 
@@ -651,11 +681,12 @@ describe("ModelPicker（§6.3：常驻搜索框 + fuzzy 过滤）", () => {
 		expect(out).not.toContain("None");
 	});
 
-	it("选择编码往返：删键 / inherit / 具体模型", () => {
+	it("选择编码往返：删键 / inherit / 具体模型（§16.3.2：ModelChoice 天然成对，value 仍是展示串）", () => {
 		expect(decodeModelChoice(encodeModelChoice({ kind: "follow-parent" }))).toEqual({ kind: "follow-parent" });
 		expect(decodeModelChoice(encodeModelChoice({ kind: "follow-parent" }))).toEqual({ kind: "follow-parent" });
-		expect(decodeModelChoice(encodeModelChoice({ kind: "model", value: "p/a" }))).toEqual({ kind: "model", value: "p/a" });
-
+		expect(decodeModelChoice(encodeModelChoice({ kind: "model", value: "p/a", provider: "p", id: "a" }))).toEqual({ kind: "model", value: "p/a", provider: "p", id: "a" });
+		// id 自身可含斜杠：只拆首个斜杠（`opencode/exo-free` 是裸 id 的一部分）。
+		expect(decodeModelChoice("model:ino2api/opencode/exo-free")).toEqual({ kind: "model", value: "ino2api/opencode/exo-free", provider: "ino2api", id: "opencode/exo-free" });
 	});
 
 	it("直接输入即过滤（fuzzy），光标落在第一个匹配的模型上（不能误选 None）", () => {
@@ -733,7 +764,7 @@ describe("ModelPicker（§6.3：常驻搜索框 + fuzzy 过滤）", () => {
 		p.handleInput(KEY_UP); // 从固定项向上 ⇒ 环绕到最后一个模型
 		expect(p.selectedValue()).toBe("model:q/b");
 		p.handleInput(KEY_ENTER);
-		expect(onChoose).toHaveBeenCalledWith({ kind: "model", value: "q/b" });
+		expect(onChoose).toHaveBeenCalledWith({ kind: "model", value: "q/b", provider: "q", id: "b" });
 	});
 
 	it("esc 返回矩阵（不做“先清过滤再退出”的两段式）", () => {
@@ -992,3 +1023,495 @@ describe("SelectList 复用（pi-tui 提供，非 pi-subagents 内部件）", ()
 
 /** 未使用但保留导入的可读性检查（`FieldOrigin` 在 `row()` 里用得上）。 */
 export type _FieldOrigin = FieldOrigin;
+
+/** main 虚拟行的视图 + 会话行（§16.3：矩阵第 0 行，键是顶层三键）。 */
+function mainRow(opts: {
+	project?: Override;
+	user?: Override;
+	touchModel?: unknown;
+	touchThinking?: unknown;
+	extra?: Override;
+	reset?: boolean;
+	fromProfileActive?: boolean;
+} = {}): { view: MatrixRowView; plan: ReturnType<typeof planMain> } {
+	const toLayer = (entry: Override | undefined): MainLayer | undefined => {
+		if (!entry) return undefined;
+		const layer: MainLayer = {};
+		if (typeof entry.defaultProvider === "string") layer.provider = entry.defaultProvider;
+		if (typeof entry.defaultModel === "string") layer.model = entry.defaultModel;
+		if (typeof entry.defaultThinkingLevel === "string") layer.thinkingLevel = entry.defaultThinkingLevel;
+		return layer;
+	};
+	const { merged, origin } = synthesizeMain({ project: toLayer(opts.project), user: toLayer(opts.user) });
+	const draft = createDraft(MAIN_ROW_NAME, merged, "main");
+	if (opts.touchModel !== undefined || (opts as { touchModel?: unknown }).touchModel !== undefined) {
+		draft.touched.add("model");
+		draft.model = opts.touchModel;
+	}
+	if (opts.touchThinking !== undefined) {
+		draft.touched.add("thinking");
+		draft.thinking = opts.touchThinking;
+	}
+	if (opts.extra) draft.extra = { ...draft.extra, ...opts.extra };
+	if (opts.reset) draft.reset = true;
+	const classification = { state: "project" as const, isAlias: false, disabledByOverride: false, disabledUpstream: false, providerHits: [] as string[], bulkFlags: [] as never[], projectProviderHits: [] as string[] };
+	const view: MatrixRowView = {
+		name: MAIN_ROW_NAME,
+		kind: "main",
+		classification: { ...classification },
+		draft,
+		merged,
+		origin,
+		locatedModel: undefined,
+		maxThinking: undefined,
+		fullModelText: "",
+		modelText: "",
+		modelUnresolved: false,
+		thinkingText: "",
+		thinkingValue: "",
+		overCeiling: false,
+		carriedKeys: [],
+		editWarnings: [],
+	};
+	const plan = planMain({
+		...(opts.project ? { project: opts.project } : {}),
+		merged,
+		origin,
+		...(opts.user ? { globalEntry: opts.user } : {}),
+		draft,
+		...(opts.fromProfileActive ? { fromProfileActive: true } : {}),
+	});
+	return { view, plan };
+}
+
+describe("Matrix main 行（§16.3.1）", () => {
+	it("main 固定第 0 行，其后一条空行分隔（不占选中位）", () => {
+		const m = mainRow({ project: { defaultProvider: "p", defaultModel: "m" } });
+		m.view.modelText = "p/m";
+		const a = row("reviewer", { projectEntry: { model: "p/m" }, modelText: "p/m" });
+		const { matrix } = makeMatrix([m.view, a.view], [a.input]);
+		const lines = matrix.render(120);
+		const mainAt = lines.findIndex((l) => l.includes("main"));
+		const reviewerAt = lines.findIndex((l) => l.includes("reviewer"));
+		expect(mainAt).toBeGreaterThanOrEqual(0);
+		expect(reviewerAt).toBeGreaterThan(mainAt);
+		// 其后紧跟一条空行分隔
+		expect(lines[mainAt + 1]?.trim()).toBe("");
+		// 选中位不受影响：首行仍是 main
+		expect(render(matrix)).toContain("→ main");
+	});
+
+	it("agent 行之后不插分隔空行（分隔只属于 main）", () => {
+		const a = row("reviewer", { projectEntry: { model: "p/m" }, modelText: "p/m" });
+		const b = row("scout", { projectEntry: { model: "q/n" }, modelText: "q/n" });
+		const lines = makeMatrix([a.view, b.view], [a.input, b.input]).matrix.render(120);
+		const reviewerAt = lines.findIndex((l) => l.includes("reviewer"));
+		expect(lines[reviewerAt + 1]?.includes("scout")).toBe(true);
+	});
+
+	it("UI 选模型天然成对：裸 id 进 model 列 + provider 进 extra（不校验）", () => {
+		const m = mainRow({});
+		const a = row("reviewer", { projectEntry: { model: "p/m" } });
+		const { matrix } = makeMatrix([m.view, a.view], [a.input]);
+		(matrix as unknown as { applyModelChoice: (r: unknown, c: unknown) => void }).applyModelChoice(m.view, {
+			kind: "model",
+			value: "q/n",
+			provider: "q",
+			id: "n",
+		});
+		expect(m.view.draft.touched.has("model")).toBe(true);
+		expect(m.view.draft.model).toBe("n");
+		expect(m.view.draft.extra.defaultProvider).toBe("q");
+	});
+
+	it("UI 选模型成对：id 自身含斜杠时整体进 defaultModel（只拆首段）", () => {
+		const m = mainRow({});
+		const a = row("reviewer", { projectEntry: { model: "p/m" } });
+		const { matrix } = makeMatrix([m.view, a.view], [a.input]);
+		(matrix as unknown as { applyModelChoice: (r: unknown, c: unknown) => void }).applyModelChoice(m.view, {
+			kind: "model",
+			value: "ino2api/opencode/exo-free",
+			provider: "ino2api",
+			id: "opencode/exo-free",
+		});
+		expect(m.view.draft.model).toBe("opencode/exo-free");
+		expect(m.view.draft.extra.defaultProvider).toBe("ino2api");
+	});
+
+	it("agent 行选模型仍写完整 `provider/id`（main 拆键不影响 agent）", () => {
+		const a = row("reviewer", { projectEntry: { model: "p/m" } });
+		const { matrix } = makeMatrix([a.view], [a.input]);
+		(matrix as unknown as { applyModelChoice: (r: unknown, c: unknown) => void }).applyModelChoice(a.view, {
+			kind: "model",
+			value: "q/n",
+			provider: "q",
+			id: "n",
+		});
+		expect(a.view.draft.model).toBe("q/n");
+	});
+
+	it("main 行的模型选择器不显示 inherit（enter 进去也看不到固定项）", () => {
+		const m = mainRow({ project: { defaultProvider: "p", defaultModel: "m" } });
+		m.view.modelText = "p/m";
+		m.view.fullModelText = "p/m";
+		const a = row("reviewer", { projectEntry: { model: "p/m" } });
+		const { matrix } = makeMatrix([m.view, a.view], [a.input]);
+		matrix.handleInput(KEY_ENTER);
+		const out = render(matrix);
+		expect(out).toContain("Select model for main");
+		expect(out).not.toContain("inherit");
+		expect(out).not.toContain("uses the parent session model");
+	});
+
+	it("`e` 回填 main 行走三条真实键（裸 id + provider 进 extra）", async () => {
+		const m = mainRow({ project: { defaultProvider: "p", defaultModel: "m" } });
+		const edited = { defaultProvider: "q", defaultModel: "n", defaultThinkingLevel: "high" };
+		const a = row("reviewer", { projectEntry: { model: "p/m" } });
+		const { matrix, notices } = makeMatrix([m.view, a.view], [a.input], {
+			callbacks: {
+				onDone: vi.fn(),
+				onNeedRefresh: vi.fn(),
+				onEditJson: async () => ({ value: edited, warnings: [] }),
+				planSave: () => ({ plan: planRebuild({ rows: [a.input], projectOverrides: {}, whitelist: ["reviewer"] }), warnings: [], overCeilingAgents: [] }),
+				onSave: async () => ({ ok: true, message: "saved" }),
+			},
+		});
+		matrix.handleInput("e");
+		await vi.waitFor(() => expect(m.view.draft.touched.has("model")).toBe(true));
+		expect(m.view.draft.model).toBe("n");
+		expect(m.view.draft.thinking).toBe("high");
+		expect(m.view.draft.extra).toEqual({ defaultProvider: "q" });
+		// 回填内容即 `mainEntryForEditor` 的三键投影
+		expect(mainEntryForEditor(m.view.merged, m.view.draft, m.view.merged)).toEqual(edited);
+	});
+
+	it("Finding 3：e 里加未知键 ⇒ plan.main.after 无该键、fields 不出该行 diff", () => {
+		// 未知键永远不会落盘（writeProjectSettings 只写 MAIN_KEYS），
+		// 所以 after 与保存屏 diff 都只覆盖顶层三键。
+		const m = mainRow({ project: { defaultProvider: "p", defaultModel: "m" }, touchModel: "m", extra: { someKey: 1 } });
+		expect(m.plan.after).toEqual({ defaultProvider: "p", defaultModel: "m" });
+		expect(m.plan.fields).toEqual([]);
+		expect(m.plan.changed).toBe(false);
+	});
+
+	it("Finding 3：main 编辑器头说明未知键被忽略（只写三键）", () => {
+		expect(jsonEditorHeaderMain()).toContain("only these three are written");
+		expect(jsonEditorHeaderMain()).not.toContain("kept but have no effect");
+	});
+
+	it("只改 main 也算 dirty：● unsaved changes 亮 + S 能进保存屏", () => {
+		const m = mainRow({ project: { defaultProvider: "p", defaultModel: "m" }, touchModel: "n" });
+		const a = row("reviewer", { projectEntry: { model: "p/m" } });
+		const agentPlan = planRebuild({ rows: [a.input], projectOverrides: { reviewer: { model: "p/m" } }, whitelist: ["reviewer"] });
+		const plan = { ...agentPlan, main: m.plan };
+		expect(m.plan.changed).toBe(true);
+		const { matrix, notices } = makeMatrix([m.view, a.view], [a.input], {
+			callbacks: {
+				onDone: vi.fn(),
+				onNeedRefresh: vi.fn(),
+				onEditJson: async () => undefined,
+				planSave: () => ({ plan, warnings: [], overCeilingAgents: [] }),
+				onSave: async () => ({ ok: true, message: "saved" }),
+			},
+		});
+		expect(render(matrix)).toContain("● unsaved changes");
+		matrix.handleInput("S");
+		expect(render(matrix)).toContain("Save?");
+		expect(notices).not.toContain("No changes");
+	});
+
+	it("main 未改 + agent 未改 ⇒ S 提示 No changes（幂等，不误报）", () => {
+		const m = mainRow({ project: { defaultProvider: "p", defaultModel: "m" } });
+		const a = row("reviewer", { projectEntry: { model: "p/m" } });
+		const agentPlan = planRebuild({ rows: [a.input], projectOverrides: { reviewer: { model: "p/m" } }, whitelist: ["reviewer"] });
+		const plan = { ...agentPlan, main: m.plan };
+		expect(m.plan.changed).toBe(false);
+		const { matrix, notices } = makeMatrix([m.view, a.view], [a.input], {
+			callbacks: {
+				onDone: vi.fn(),
+				onNeedRefresh: vi.fn(),
+				onEditJson: async () => undefined,
+				planSave: () => ({ plan, warnings: [], overCeilingAgents: [] }),
+				onSave: async () => ({ ok: true, message: "saved" }),
+			},
+		});
+		expect(render(matrix)).not.toContain("● unsaved changes");
+		matrix.handleInput("S");
+		expect(notices).toContain("No changes");
+	});
+
+	it("顶部不出现任何 base/生效性文案（生效与否只由底部 ● 表达）", () => {
+		const m = mainRow({ project: { defaultProvider: "p", defaultModel: "m" } });
+		const a = row("reviewer", { projectEntry: { model: "p/m" } });
+		const out = render(makeMatrix([m.view, a.view], [a.input]).matrix);
+		expect(out).not.toMatch(/base:/);
+		expect(out).not.toContain("--from");
+	});
+});
+
+describe("ModelPicker followParent 隐藏（§16.3.2）", () => {
+	function mainPicker(currentValue: string | undefined, models = [{ id: "a", provider: "p" }, { id: "b", provider: "q" }]) {
+		const onChoose = vi.fn();
+		const onCancel = vi.fn();
+		const p = new ModelPicker({
+			agentName: "main",
+			models,
+			currentText: currentValue ?? "—",
+			currentValue,
+			followParent: false,
+			theme,
+			keybindings,
+			onChoose,
+			onCancel,
+		});
+		return { p, onChoose, onCancel };
+	}
+
+	it("main 选择器不渲染 inherit 固定项", () => {
+		const out = mainPicker(undefined).p.render(100).join("\n");
+		expect(out).not.toContain("inherit");
+		expect(out).not.toContain("uses the parent session model");
+	});
+
+	it("隐藏后搜索零匹配不卡死：enter 无操作、不抛错", () => {
+		const { p, onChoose } = mainPicker(undefined);
+		expect(() => p.handleInput("zzz")).not.toThrow();
+		expect(p.visibleModelCount()).toBe(0);
+		expect(p.selectedValue()).toBeUndefined();
+		expect(() => p.handleInput(KEY_ENTER)).not.toThrow();
+		expect(onChoose).not.toHaveBeenCalled();
+	});
+
+	it("隐藏后 ↑↓ 只在模型里环形（无固定项可落）", () => {
+		const { p } = mainPicker(undefined);
+		expect(p.selectedValue()).toBe("model:p/a");
+		p.handleInput(KEY_UP); // 无固定项 ⇒ 直接环绕到末尾
+		expect(p.selectedValue()).toBe("model:q/b");
+		p.handleInput(KEY_DOWN);
+		expect(p.selectedValue()).toBe("model:p/a");
+	});
+
+	it("隐藏后当前值仍预选到对应模型行", () => {
+		expect(mainPicker("q/b").p.selectedValue()).toBe("model:q/b");
+	});
+});
+
+describe("SaveDialog main 段（§16.3.3）", () => {
+	function mainDialog(main: ReturnType<typeof planMain>, agentPlan = planRebuild({ rows: [], projectOverrides: {}, whitelist: [] })) {
+		const onConfirm = vi.fn();
+		const onCancel = vi.fn();
+		const plan = { ...agentPlan, main };
+		const d = new SaveDialog({
+			projectPath: "/proj/.pi/settings.json",
+			profilePath: "/agent/profiles/pi-subagents/default.json",
+			plan,
+			warnings: [],
+			bulkFlags: [],
+			untrusted: false,
+			overCeilingAgents: [],
+			defaultProfileName: "default",
+			theme,
+			onConfirm,
+			onCancel,
+		});
+		return { d, onConfirm, onCancel };
+	}
+
+	it("main 改动时新增顶层段 + 下次启动提示", () => {
+		const { plan } = mainRow({ project: { defaultProvider: "p", defaultModel: "a" }, touchModel: "b" });
+		expect(plan.changed).toBe(true);
+		const out = mainDialog(plan).d.render(120).join("\n");
+		expect(out).toContain("will write top-level settings (main agent):");
+		expect(out).toContain("defaultModel");
+		expect(out).toContain("apply on the next pi start");
+	});
+
+	it("main 未改动时不显示顶层段", () => {
+		const { plan } = mainRow({ project: { defaultProvider: "p", defaultModel: "a" } });
+		expect(plan.changed).toBe(false);
+		const out = mainDialog(plan).d.render(120).join("\n");
+		expect(out).not.toContain("will write top-level settings");
+	});
+
+	it("`r` reset（removal）显示删除行", () => {
+		const { plan } = mainRow({ project: { defaultProvider: "p", defaultModel: "m", defaultThinkingLevel: "low" }, reset: true });
+		expect(plan.removal).toBe(true);
+		const out = mainDialog(plan).d.render(120).join("\n");
+		expect(out).toContain("will write top-level settings (main agent):");
+		expect(out).toContain("- defaultProvider");
+		expect(out).toContain("- defaultModel");
+		expect(out).toContain("- defaultThinkingLevel");
+	});
+
+	it("§16.8：勾选 profile 时始终说明导出的是整张矩阵快照（不自动取消勾选）", () => {
+		const { plan } = mainRow({ touchModel: "n", touchThinking: "high" });
+		const out = mainDialog(plan).d.render(120).join("\n");
+		expect(out).toContain("profile: full matrix snapshot (all managed agents), no agent entries changed in this save");
+		// 两个目标仍默认勾选
+		expect(out).toContain("[x] project");
+		expect(out).toContain("[x] profile");
+	});
+
+	it("§16.8：有 agent 改动时也声明 profile 是整张矩阵快照", () => {
+		const { plan: main } = mainRow({});
+		const agentPlan = planRebuild({
+			rows: [],
+			projectOverrides: {},
+			whitelist: [],
+		});
+		agentPlan.changed = [{ name: "worker", after: { model: "p/m" }, fields: [], isNew: true }];
+		const out = mainDialog(main, agentPlan).d.render(120).join("\n");
+		expect(out).toContain("profile: full matrix snapshot (all managed agents)");
+		expect(out).not.toContain("only main defaults will be exported");
+	});
+});
+
+describe("index 接线（§16.3.4）", () => {
+	function mainSession(mainDraft: ReturnType<typeof createDraft>, opts: { fromProfileActive?: boolean } = {}): { session: SessionState; view: MatrixRowView } {
+		const merged: Override = { defaultProvider: "p", defaultModel: "m", defaultThinkingLevel: "low" };
+		const origin: FieldOrigin = { base: ["defaultProvider", "defaultModel", "defaultThinkingLevel"], global: [] };
+		const classification = { state: "project" as const, isAlias: false, disabledByOverride: false, disabledUpstream: false, providerHits: [] as string[], bulkFlags: [] as never[], projectProviderHits: [] as string[] };
+		const entry = {
+			name: MAIN_ROW_NAME,
+			classification: { ...classification },
+			merged,
+			origin,
+			projectEntry: { defaultProvider: "p", defaultModel: "m", defaultThinkingLevel: "low" },
+			draft: mainDraft,
+		};
+		const session = {
+			projectRoot: { root: "/proj", tier: "cwd" },
+			projectPath: "/proj/.pi/settings.json",
+			projectLayer: { settingsPath: "/proj/.pi/settings.json", exists: true, settings: {}, subagents: { agentOverrides: {}, agentOverridesByProvider: {}, disableBuiltins: false, disableThinking: false, hasProviderOverrides: false }, main: { provider: "p", model: "m" } },
+			userLayer: { settingsPath: "/u/settings.json", exists: false, settings: {}, subagents: { agentOverrides: {}, agentOverridesByProvider: {}, disableBuiltins: false, disableThinking: false, hasProviderOverrides: false }, main: {} },
+			whitelist: [],
+			rows: [entry],
+			bulkFlags: [],
+			notices: [],
+			errors: [],
+			fromProfileActive: opts.fromProfileActive ?? false,
+			fromProfileRejected: false,
+			baseSources: {},
+		} as unknown as SessionState;
+		const view: MatrixRowView = {
+			name: MAIN_ROW_NAME,
+			kind: "main",
+			classification: { ...classification },
+			draft: mainDraft,
+			merged,
+			origin,
+			locatedModel: undefined,
+			maxThinking: undefined,
+			fullModelText: "p/m",
+			modelText: "p/m",
+			modelUnresolved: false,
+			thinkingText: "",
+			thinkingValue: "",
+			overCeiling: false,
+			carriedKeys: [],
+			editWarnings: [],
+		};
+		return { session, view };
+	}
+
+	it("`r` reset = 一次性删三个键：plan.main.removal，不半删", () => {
+		const draft = createDraft(MAIN_ROW_NAME, { defaultProvider: "p", defaultModel: "m", defaultThinkingLevel: "low" }, "main");
+		draft.reset = true;
+		const { session, view } = mainSession(draft);
+		const { plan } = buildPlan(session, [view]);
+		expect(plan.main.removal).toBe(true);
+		expect(plan.main.after).toEqual({});
+		expect(plan.main.fields.map((f) => f.key).sort()).toEqual(["defaultModel", "defaultProvider", "defaultThinkingLevel"]);
+		expect(plan.overrides).toEqual({});
+		expect(plan.overrides).not.toHaveProperty("main");
+	});
+
+	it("buildPlan 把 main 挂到 plan.main（agent 循环碰不到它）", () => {
+		const draft = createDraft(MAIN_ROW_NAME, { defaultProvider: "p", defaultModel: "m" }, "main");
+		draft.touched.add("model");
+		draft.model = "n";
+		const { session, view } = mainSession(draft);
+		const { plan } = buildPlan(session, [view]);
+		expect(plan.main.changed).toBe(true);
+		expect(plan.main.after).toEqual({ defaultProvider: "p", defaultModel: "n", defaultThinkingLevel: "low" });
+		expect(plan.overrides).not.toHaveProperty("main");
+	});
+
+	it("main 落盘值定位不到 ⇒ registry 警告（不阻止）", () => {
+		const draft = createDraft(MAIN_ROW_NAME, { defaultProvider: "p", defaultModel: "m" }, "main");
+		draft.touched.add("model");
+		draft.model = "ghost";
+		const { session, view } = mainSession(draft);
+		const { warnings } = buildPlan(session, [view], { registry: { getAvailable: () => [] }, models: [] });
+		expect(warnings.some((w) => w.agent === "main" && w.message.includes("is not in the model registry"))).toBe(true);
+	});
+
+	it("main provider 无凭证 ⇒ auth 警告（不阻止）", () => {
+		const draft = createDraft(MAIN_ROW_NAME, { defaultProvider: "p", defaultModel: "m" }, "main");
+		draft.touched.add("thinking");
+		draft.thinking = "high";
+		const { session, view } = mainSession(draft);
+		const model = { id: "m", provider: "p", reasoning: true };
+		const { warnings } = buildPlan(session, [view], {
+			registry: { getAvailable: () => [model], find: () => model, getProviderAuthStatus: () => ({ configured: false }) },
+			models: [model],
+		});
+		expect(warnings.some((w) => w.agent === "main" && w.message.includes("has no configured credentials"))).toBe(true);
+	});
+
+	it("main 未改动 ⇒ 无 registry/auth 警告（不打扰）", () => {
+		const draft = createDraft(MAIN_ROW_NAME, { defaultProvider: "p", defaultModel: "m" }, "main");
+		const { session, view } = mainSession(draft);
+		const { warnings } = buildPlan(session, [view], {
+			registry: { getAvailable: () => [], getProviderAuthStatus: () => ({ configured: false }) },
+			models: [],
+		});
+		expect(warnings.filter((w) => w.agent === "main")).toEqual([]);
+	});
+
+	it("commitSave：只有 main 改动时 verify 指引是重进项目（不带 subagents-models）", () => {
+		const draft = createDraft(MAIN_ROW_NAME, { defaultProvider: "p", defaultModel: "m" }, "main");
+		draft.touched.add("model");
+		draft.model = "n";
+		const { session, view } = mainSession(draft);
+		const { plan } = buildPlan(session, [view]);
+		const outcome = commitSave(session, { writeProject: false, writeProfile: false, profileName: "default" }, plan, [], "/agent", undefined);
+		expect(outcome.ok).toBe(true);
+		expect(outcome.message).toContain("verify by starting pi again in this project");
+		expect(outcome.message).not.toContain("/subagents-models");
+	});
+
+	it("无 UI 摘要 base 文案：--from 写名字，否则写 project settings only", () => {
+		const draft = createDraft(MAIN_ROW_NAME, {}, "main");
+		const { session, view } = mainSession(draft, { fromProfileActive: true });
+		const ctx = { cwd: "/proj", model: { provider: "p", id: "m" } } as never;
+		expect(summaryLines(ctx, session, [view], "work").join("\n")).toContain("base: --from work");
+		const plain = summaryLines(ctx, { ...session, fromProfileActive: false }, [view]).join("\n");
+		expect(plain).toContain("base: project settings only");
+		expect(plain).not.toContain("default profile");
+	});
+
+	it("main 编辑器头是英文三键说明；agent 头不动", () => {
+		const header = jsonEditorHeaderMain();
+		expect(header).toContain("top-level");
+		expect(header).toContain("next pi start");
+		expect(header).toContain("untrusted");
+		expect(header).not.toMatch(/[\u4e00-\u9fa5]/);
+		// agent 版保持原样（含中文说明与字段表）
+		expect(jsonEditorHeader("reviewer")).toContain("override");
+	});
+
+	it("`e` 校验 main 只警告不阻止：非法档位进 warnings，照样 accepted", () => {
+		const review = reviewMainEditedJson({ defaultProvider: "p", defaultModel: "m", defaultThinkingLevel: "turbo" });
+		expect(review.accepted).toBe(true);
+		expect(review.errors).toEqual([]);
+		expect(review.warnings.length).toBeGreaterThan(0);
+		expect(reviewMainEditedJson([]).accepted).toBe(false);
+	});
+
+	it("editorContentForMain = main 头 + 三键 JSON", () => {
+		const content = editorContentForMain({ defaultProvider: "p", defaultModel: "m" });
+		expect(content).toContain("top-level");
+		expect(content).toContain('"defaultModel": "m"');
+	});
+});

@@ -4,14 +4,18 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getConfigDirName, getProjectSettingsPath, resolveProjectRoot } from "../src/context.ts";
 import { createDraft, synthesize, type FieldOrigin, type Override } from "../src/merge.ts";
+import { synthesizeMain, type MainLayer } from "../src/main-row.ts";
 import type { RowClassification } from "../src/rowstate.ts";
 import {
 	buildProfileDocument,
+	planMain,
 	planRebuild,
 	SettingsWriteError,
 	writeJsonAtomic,
 	writeProfile,
 	writeProjectAgentOverrides,
+	writeProjectSettings,
+	type MainPlanInput,
 	type RebuildRowInput,
 } from "../src/writer.ts";
 
@@ -110,7 +114,7 @@ afterEach(() => {
 	fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-function writeProjectSettings(value: unknown): void {
+function writeProjectSettingsFile(value: unknown): void {
 	fs.mkdirSync(path.dirname(projectPath), { recursive: true });
 	fs.writeFileSync(projectPath, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
 }
@@ -616,7 +620,7 @@ describe("writeProjectAgentOverrides（只替换一个键 + 原子写）", () =>
 	});
 
 	it("其余键语义保留（键集合与值相等）", () => {
-		writeProjectSettings({
+		writeProjectSettingsFile({
 			theme: "dark",
 			enabledModels: ["a"],
 			subagents: { defaultModel: "u/m", maxThinking: "high", modelScope: { a: 1 }, agentOverrides: { old: { model: "x" } } },
@@ -634,13 +638,13 @@ describe("writeProjectAgentOverrides（只替换一个键 + 原子写）", () =>
 	});
 
 	it("② agentOverrides 全空 ⇒ 删该键；subagents 也空 ⇒ 一并删 subagents", () => {
-		writeProjectSettings({ theme: "dark", subagents: { agentOverrides: { old: { model: "x" } } } });
+		writeProjectSettingsFile({ theme: "dark", subagents: { agentOverrides: { old: { model: "x" } } } });
 		writeProjectAgentOverrides(projectRoot, {});
 		expect(readProjectSettings()).toEqual({ theme: "dark" });
 	});
 
 	it("② agentOverrides 全空但 subagents 还有别的键 ⇒ 只删 agentOverrides", () => {
-		writeProjectSettings({ subagents: { agentOverrides: { old: {} }, defaultModel: "u/m" } });
+		writeProjectSettingsFile({ subagents: { agentOverrides: { old: {} }, defaultModel: "u/m" } });
 		writeProjectAgentOverrides(projectRoot, {});
 		expect(readProjectSettings()).toEqual({ subagents: { defaultModel: "u/m" } });
 	});
@@ -843,5 +847,212 @@ describe("连续两次保存幂等（§11 用例 10）", () => {
 		const before = fs.statSync(projectPath).mtimeMs;
 		writeProjectAgentOverrides(projectRoot, second.overrides);
 		expect(fs.statSync(projectPath).mtimeMs).toBe(before);
+	});
+});
+
+/** main 计划的输入构造：`synthesizeMain` 产出基底，草稿恒 `kind: "main"`。 */
+function toMainLayer(entry: Override | undefined): MainLayer | undefined {
+	if (!entry) return undefined;
+	const layer: MainLayer = {};
+	if (typeof entry.defaultProvider === "string") layer.provider = entry.defaultProvider;
+	if (typeof entry.defaultModel === "string") layer.model = entry.defaultModel;
+	if (typeof entry.defaultThinkingLevel === "string") layer.thinkingLevel = entry.defaultThinkingLevel;
+	return layer;
+}
+
+function mainInput(
+	opts: {
+		project?: Override | undefined;
+		user?: Override | undefined;
+		fromProfile?: Override | undefined;
+		touchModel?: unknown;
+		touchThinking?: unknown;
+		extra?: Override;
+		reset?: boolean;
+		fromProfileActive?: boolean;
+	} = {},
+): MainPlanInput {
+	const { merged, origin } = synthesizeMain({
+		fromProfile: toMainLayer(opts.fromProfile),
+		project: toMainLayer(opts.project),
+		user: toMainLayer(opts.user),
+	});
+	const draft = createDraft("main", merged, "main");
+	if (opts.touchModel !== undefined || "touchModel" in opts) {
+		draft.touched.add("model");
+		draft.model = opts.touchModel;
+	}
+	if (opts.touchThinking !== undefined || "touchThinking" in opts) {
+		draft.touched.add("thinking");
+		draft.thinking = opts.touchThinking;
+	}
+	if (opts.extra) draft.extra = { ...draft.extra, ...opts.extra };
+	if (opts.reset) draft.reset = true;
+	return {
+		...(opts.project ? { project: opts.project } : {}),
+		merged,
+		origin,
+		...(opts.user ? { globalEntry: opts.user } : {}),
+		draft,
+		...(opts.fromProfileActive ? { fromProfileActive: true } : {}),
+	};
+}
+
+describe("planMain（§16.2.5）", () => {
+	it("改过 ⇒ changed，after 是完整合并（含全局来源字段）", () => {
+		const plan = planMain({
+			...mainInput({ project: { defaultModel: "p/m" }, user: { defaultThinkingLevel: "low" }, touchThinking: "high" }),
+		});
+		expect(plan.changed).toBe(true);
+		expect(plan.removal).toBe(false);
+		expect(plan.after).toEqual({ defaultModel: "p/m", defaultThinkingLevel: "high" });
+		expect(plan.before).toEqual({ defaultModel: "p/m" });
+		expect(plan.isNew).toBe(false);
+	});
+
+	it("未编辑 + 普通命令 ⇒ 保留现有值（after == before，不写）", () => {
+		const project: Override = { defaultProvider: "p", defaultModel: "m" };
+		const plan = planMain({ ...mainInput({ project }) });
+		expect(plan.changed).toBe(false);
+		expect(plan.removal).toBe(false);
+		expect(plan.after).toEqual(project);
+	});
+
+	it("未编辑 + 项目无键 + 全来自全局 ⇒ 不写（after 为空，无 removal）", () => {
+		const plan = planMain({ ...mainInput({ user: { defaultModel: "u/m" } }) });
+		expect(plan.changed).toBe(false);
+		expect(plan.removal).toBe(false);
+		expect(plan.after).toEqual({});
+		expect(plan.isNew).toBe(false);
+	});
+
+	it("--from + 未编辑 + 项目无键 ⇒ 按模板落盘，isNew: true", () => {
+		const plan = planMain({
+			...mainInput({ fromProfile: { defaultModel: "b/m", defaultThinkingLevel: "max" }, fromProfileActive: true }),
+		});
+		expect(plan.changed).toBe(true);
+		expect(plan.isNew).toBe(true);
+		expect(plan.after).toEqual({ defaultModel: "b/m", defaultThinkingLevel: "max" });
+	});
+
+	it("--from + 未编辑 + 项目与模板相同 ⇒ 幂等（不写）", () => {
+		const project: Override = { defaultModel: "b/m" };
+		const plan = planMain({ ...mainInput({ project, fromProfile: { defaultModel: "b/m" }, fromProfileActive: true }) });
+		expect(plan.changed).toBe(false);
+		expect(plan.removal).toBe(false);
+		expect(plan.after).toEqual(project);
+	});
+
+	it("r reset ⇒ 一次性删三个键（removal，不写冻结的全局值）", () => {
+		const project: Override = { defaultProvider: "p", defaultModel: "m", defaultThinkingLevel: "low" };
+		const plan = planMain({ ...mainInput({ project, user: { defaultModel: "u/m" }, reset: true }) });
+		expect(plan.removal).toBe(true);
+		expect(plan.changed).toBe(false);
+		expect(plan.after).toEqual({});
+		expect(plan.fields.map((f) => f.key).sort()).toEqual(["defaultModel", "defaultProvider", "defaultThinkingLevel"]);
+	});
+
+	it("r reset 但项目本来就没键 ⇒ 无事可做（不产生 removal）", () => {
+		const plan = planMain({ ...mainInput({ reset: true }) });
+		expect(plan.removal).toBe(false);
+		expect(plan.changed).toBe(false);
+	});
+
+	it("显式清空全部三键 ⇒ removal", () => {
+		const project: Override = { defaultProvider: "p", defaultModel: "m" };
+		const input = mainInput({ project });
+		// `e` 删掉全部三键：model/thinking 显式清空 + extra 删 provider
+		input.draft.touched.add("model");
+		input.draft.model = undefined;
+		delete input.draft.extra.defaultProvider;
+		const plan = planMain(input);
+		expect(plan.removal).toBe(true);
+		expect(plan.after).toEqual({});
+	});
+});
+
+describe("writeProjectSettings（顶层三键 + 其余键语义保留，§16.2.5）", () => {
+	it("写顶层三键 + 保留其它顶层键；三键绝不进 subagents", () => {
+		writeProjectSettingsFile({ theme: "dark", subagents: { agentOverrides: { old: { model: "x" } } } });
+		const result = writeProjectSettings(projectRoot, {
+			overrides: { reviewer: { model: "p/m" } },
+			main: { defaultProvider: "p", defaultModel: "m", defaultThinkingLevel: "high" },
+		});
+		const settings = readProjectSettings();
+		expect(settings.theme).toBe("dark");
+		expect(settings.defaultProvider).toBe("p");
+		expect(settings.defaultModel).toBe("m");
+		expect(settings.defaultThinkingLevel).toBe("high");
+		expect(settings.subagents).toEqual({ agentOverrides: { reviewer: { model: "p/m" } } });
+		// subagents 里没有顶层三键的影子
+		expect("defaultProvider" in (settings.subagents as Record<string, unknown>)).toBe(false);
+		expect("defaultModel" in (settings.subagents as Record<string, unknown>)).toBe(false);
+		expect("defaultThinkingLevel" in (settings.subagents as Record<string, unknown>)).toBe(false);
+		expect(result.changedKeys).toContain("subagents.agentOverrides");
+		expect(result.changedKeys).toContain("defaultModel");
+	});
+
+	it("main 缺省的键 ⇒ 从文件里删除该顶层键（r reset 的落盘）", () => {
+		writeProjectSettingsFile({ defaultProvider: "p", defaultModel: "m", defaultThinkingLevel: "low", theme: "dark" });
+		const result = writeProjectSettings(projectRoot, { overrides: {}, main: {} });
+		const settings = readProjectSettings();
+		expect("defaultProvider" in settings).toBe(false);
+		expect("defaultModel" in settings).toBe(false);
+		expect("defaultThinkingLevel" in settings).toBe(false);
+		expect(settings.theme).toBe("dark");
+		expect(result.deletedKeys).toContain("defaultModel");
+	});
+
+	it("main 整体缺省（薄封装）⇒ 顶层三键不动", () => {
+		writeProjectSettingsFile({ defaultModel: "m" });
+		writeProjectAgentOverrides(projectRoot, { reviewer: { model: "p/m" } });
+		expect(readProjectSettings().defaultModel).toBe("m");
+	});
+
+	it("settings.json 语法错误 ⇒ 抛 SettingsWriteError，不写盘", () => {
+		fs.mkdirSync(path.dirname(projectPath), { recursive: true });
+		fs.writeFileSync(projectPath, "{ not json", "utf-8");
+		expect(() => writeProjectSettings(projectRoot, { overrides: {}, main: {} })).toThrow(SettingsWriteError);
+		expect(fs.readFileSync(projectPath, "utf8")).toBe("{ not json");
+	});
+
+	it("内容无变化时不重写文件（mtime 不变）", () => {
+		writeProjectSettings(projectRoot, { overrides: { reviewer: { model: "p/m" } }, main: { defaultModel: "m" } });
+		const before = fs.statSync(projectPath).mtimeMs;
+		const result = writeProjectSettings(projectRoot, { overrides: { reviewer: { model: "p/m" } }, main: { defaultModel: "m" } });
+		expect(result.changedKeys).toEqual([]);
+		expect(result.deletedKeys).toEqual([]);
+		expect(fs.statSync(projectPath).mtimeMs).toBe(before);
+	});
+});
+
+describe("profile 导出带顶层三键（§16.2.5）", () => {
+	it("buildProfileDocument 输出顶层三键（不在 subagents 里）", () => {
+		const { document } = buildProfileDocument({ reviewer: { model: "p/m" } }, { defaultProvider: "p", defaultModel: "m" });
+		expect(document.defaultProvider).toBe("p");
+		expect(document.defaultModel).toBe("m");
+		expect("defaultThinkingLevel" in document).toBe(false);
+		expect(document.subagents).toEqual({ agentOverrides: { reviewer: { model: "p/m" } } });
+		expect(Object.keys(document.subagents)).toEqual(["agentOverrides"]);
+	});
+
+	it("main 三键全空 / 缺省 ⇒ 顶层三项不出现", () => {
+		expect(buildProfileDocument({ reviewer: { model: "p/m" } }, {}).document).toEqual({
+			subagents: { agentOverrides: { reviewer: { model: "p/m" } } },
+		});
+		expect(buildProfileDocument({ reviewer: { model: "p/m" } }).document).toEqual({
+			subagents: { agentOverrides: { reviewer: { model: "p/m" } } },
+		});
+	});
+
+	it("writeProfile 落盘含顶层三键", () => {
+		const agentDir = path.join(tmp, "agentdir");
+		const file = path.join(agentDir, "profiles", "pi-subagents", "main.json");
+		writeProfile(file, { reviewer: { model: "p/m" } }, { defaultModel: "m", defaultThinkingLevel: "high" });
+		expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual({
+			subagents: { agentOverrides: { reviewer: { model: "p/m" } } },
+			defaultModel: "m",
+			defaultThinkingLevel: "high",
+		});
 	});
 });

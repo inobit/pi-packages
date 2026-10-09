@@ -1,7 +1,7 @@
 {
   "name": "@inobit/pi-subagent-presets",
-  "version": "0.1.1",
-  "description": "Batch-configure the model and thinking level of pi-subagents agents per project, and export the result as a reusable global profile blueprint.",
+  "version": "0.2.0",
+  "description": "Batch-configure the model and thinking level of pi-subagents agents per project, plus the main agent defaults, and export the result as a reusable global profile blueprint.",
   "type": "module",
   "exports": {
     ".": {

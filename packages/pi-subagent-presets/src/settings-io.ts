@@ -11,8 +11,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getProfilesDir, getProjectSettingsPath, getUserSettingsPath } from "./context.ts";
+import { readMainLayer, type MainLayer } from "./main-row.ts";
 import type { Override } from "./merge.ts";
-import { isSafeProfileName, validateProfileAgentOverrides } from "./validate.ts";
+import { isSafeProfileName, validateProfileAgentOverrides, validateProfileMain } from "./validate.ts";
 
 /** provider 条件层：`{ [provider]: { [agentName]: Override } }` */
 export type ProviderOverrideMap = Record<string, Record<string, Override>>;
@@ -36,6 +37,8 @@ export interface SettingsLayer {
 	/** 整个 settings 对象（写入时要做"其余键语义保留"）。 */
 	settings: Record<string, unknown>;
 	subagents: SubagentsLayer;
+	/** 顶层 main 三键（§16.2.3，非法类型已剔除）。 */
+	main: MainLayer;
 	/** 解析/读取错误（语法错误、顶层非对象）。 */
 	error?: string;
 }
@@ -80,10 +83,15 @@ function parseSubagentsLayer(value: unknown): SubagentsLayer {
 	};
 }
 
+/** 从一层 settings 顶层读 main 三键（非法类型已剔除；档位值域由调用方校验）。 */
+function parseMainLayer(parsed: Record<string, unknown>): MainLayer {
+	return readMainLayer(parsed);
+}
+
 /** 读一层 settings；文件不存在是正常情况（`exists: false`），语法错误则带 `error`。 */
 export function readSettingsLayer(settingsPath: string): SettingsLayer {
 	if (!fs.existsSync(settingsPath)) {
-		return { settingsPath, exists: false, settings: {}, subagents: EMPTY_SUBAGENTS };
+		return { settingsPath, exists: false, settings: {}, subagents: EMPTY_SUBAGENTS, main: {} };
 	}
 	let parsed: unknown;
 	try {
@@ -95,6 +103,7 @@ export function readSettingsLayer(settingsPath: string): SettingsLayer {
 			exists: true,
 			settings: {},
 			subagents: EMPTY_SUBAGENTS,
+			main: {},
 			error: `Failed to parse '${settingsPath}': ${detail}`,
 		};
 	}
@@ -104,6 +113,7 @@ export function readSettingsLayer(settingsPath: string): SettingsLayer {
 			exists: true,
 			settings: {},
 			subagents: EMPTY_SUBAGENTS,
+			main: {},
 			error: `Settings file '${settingsPath}' must contain a JSON object.`,
 		};
 	}
@@ -112,6 +122,7 @@ export function readSettingsLayer(settingsPath: string): SettingsLayer {
 		exists: true,
 		settings: parsed,
 		subagents: parseSubagentsLayer(parsed.subagents),
+		main: parseMainLayer(parsed),
 	};
 }
 
@@ -128,6 +139,8 @@ export interface ProfileEntry {
 	filePath: string;
 	/** `subagents.agentOverrides`（已过 profile 校验器）。 */
 	agentOverrides: Record<string, Override>;
+	/** 顶层 main 三键（§16.2.3，已过 `validateProfileMain`）。 */
+	main: MainLayer;
 	errors: string[];
 	warnings: string[];
 }
@@ -171,9 +184,9 @@ export function readProfile(name: string, agentDir?: string): ProfileEntry | und
 	const filePath = path.join(getProfilesDir(agentDir), `${name}.json`);
 	if (!fs.existsSync(filePath)) return undefined;
 	const { parsed, error } = readProfileFile(filePath);
-	if (error) return { name, filePath, agentOverrides: {}, errors: [error], warnings: [] };
+	if (error) return { name, filePath, agentOverrides: {}, main: {}, errors: [error], warnings: [] };
 	if (!isPlainObject(parsed)) {
-		return { name, filePath, agentOverrides: {}, errors: [`Profile '${filePath}' must contain a JSON object.`], warnings: [] };
+		return { name, filePath, agentOverrides: {}, main: {}, errors: [`Profile '${filePath}' must contain a JSON object.`], warnings: [] };
 	}
 	const subagents = parsed.subagents;
 	if (!isPlainObject(subagents)) {
@@ -181,25 +194,24 @@ export function readProfile(name: string, agentDir?: string): ProfileEntry | und
 			name,
 			filePath,
 			agentOverrides: {},
+			main: {},
 			errors: [`Profile '${filePath}' must contain a 'subagents' object.`],
 			warnings: [],
 		};
 	}
 	const validation = validateProfileAgentOverrides(subagents.agentOverrides);
-	if (validation.errors.length > 0) {
-		return { name, filePath, agentOverrides: {}, errors: validation.errors, warnings: validation.warnings };
+	// 顶层 main 三键与 agent 条目同规则：非法 ⇒ 进 errors，调用方红条拒绝合并
+	const mainValidation = validateProfileMain(parsed);
+	const errors = [...validation.errors, ...mainValidation.errors];
+	const warnings = [...validation.warnings, ...mainValidation.warnings];
+	if (errors.length > 0) {
+		return { name, filePath, agentOverrides: {}, main: {}, errors, warnings };
 	}
 	const raw = isPlainObject(subagents.agentOverrides) ? subagents.agentOverrides : {};
 	const agentOverrides: Record<string, Override> = {};
 	for (const [agent, entry] of Object.entries(raw)) {
 		if (isPlainObject(entry)) agentOverrides[agent] = entry;
 	}
-	return { name, filePath, agentOverrides, errors: [], warnings: validation.warnings };
+	return { name, filePath, agentOverrides, main: readMainLayer(parsed), errors: [], warnings };
 }
 
-/** default profile（§5：无 `--from` 且项目无条目时的基底 ①）。 */
-export function readDefaultProfile(agentDir?: string): Override | undefined {
-	const entry = readProfile("default", agentDir);
-	if (!entry || entry.errors.length > 0) return undefined;
-	return entry.agentOverrides;
-}

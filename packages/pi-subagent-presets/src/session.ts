@@ -7,13 +7,25 @@
 
 import { loadConfig, type PresetsConfig } from "./config.ts";
 import { resolveProjectRoot, type ProjectRootResolution } from "./context.ts";
-import { createDraft, rowBaseOf, synthesizeDetailed, type FieldOrigin, type Override } from "./merge.ts";
+import {
+	MAIN_KEYS,
+	MAIN_ROW_NAME,
+	classifyMainRow,
+	mainLayerToOverride,
+	mainModelText,
+	synthesizeMain,
+	type MainLayer,
+} from "./main-row.ts";
+import { createDraft, resetParticipates, rowBaseOf, synthesizeDetailed, type FieldOrigin, type Override } from "./merge.ts";
 import { classifyRow, detectBulkFlags, type BulkFlag, type RowClassification } from "./rowstate.ts";
-import { readDefaultProfile, readProfile, readProjectLayer, readUserLayer, type ProviderOverrideMap, type SettingsLayer } from "./settings-io.ts";
+import { readProfile, readProjectLayer, readUserLayer, type ProviderOverrideMap, type SettingsLayer } from "./settings-io.ts";
 import { checkCeiling } from "./thinking.ts";
 import { locateModel, type ModelLike, type ModelRegistryLike, type ScopedModelLike } from "./models.ts";
 import type { UpstreamAgent, UpstreamModule } from "./upstream.ts";
 import type { MatrixRowView } from "./tui/matrix.ts";
+
+/** main 虚拟行的行名（`rows[0]`，供后续 lane 的 TUI/接线判断）。 */
+export { MAIN_ROW_NAME };
 
 export interface UpstreamDiscovery {
 	module?: UpstreamModule;
@@ -58,10 +70,15 @@ export interface SessionState {
 	 * 不得带着替代基底（项目现有配置）进矩阵。
 	 */
 	fromProfileRejected: boolean;
-	/** 基底 ①/② 的来源，保存后用它重算每行的合并基底。 */
+	/**
+	 * `--from` 模板的来源，保存后用它重算每行的合并基底（§16.7：只有显式
+	 * `--from` 才引入模板，普通命令不等效于 `--from default`）。
+	 */
 	baseSources: {
+		/** `--from` profile 的 `agentOverrides` 映射（无 `--from` 时 undefined）。 */
 		fromProfile?: Record<string, unknown> | undefined;
-		defaultProfile?: Record<string, unknown> | undefined;
+		/** `--from` profile 顶层的 main 三键（§16.2.4，main 行的模板层）。 */
+		fromProfileMain?: MainLayer | undefined;
 	};
 }
 
@@ -82,29 +99,28 @@ export interface RowEntry {
  * 一行的基底 ①（§3.1 第一步），**同时产出逐字段来源**。
  *
  * ⚠️ 入参是**整张 profile 映射**（`{ [agentName]: Override }`），因为
- * `fromProfile` / `defaultProfile` 都是 profile 文件里的 `agentOverrides`；
- * 落到本行时取 `name` 对应的那一条。
+ * `fromProfile` 就是 profile 文件里的 `agentOverrides`；落到本行时取 `name`
+ * 对应的那一条。
  *
- * `--from <name>` 只是指定**用哪个 profile 当模板**（占用 default profile 那个槽位），
- * **不改变优先级**：项目现有条目始终优先。优先级由 `synthesizeDetailed` 统一实现
- * （`base0 = fromProfile ?? projectEntry ?? defaultProfile`），本函数不做任何特判。
+ * `--from <name>` 指定的 profile **直接成为基底**（项目现有条目不参与基底，
+ * 见 `merge.ts` 的 `synthesizeDetailed`：`base0 = fromProfile ?? projectEntry`），
+ * 本函数只负责把整张映射落到本行，不做任何特判。
+ *
+ * §16.7：普通命令不等效于 `--from default`，这里不再回落 default profile。
  */
 export function baseEntryFor(
 	name: string,
 	state: {
 		fromProfile?: Record<string, unknown> | undefined;
 		projectEntry?: Override | undefined;
-		defaultProfile?: Record<string, unknown> | undefined;
 		/** ② 全局 `~/.pi/agent/settings.json` 的同名条目（恒参与合并）。 */
 		userEntry?: Override | undefined;
 	},
 ): { merged: Override; origin: FieldOrigin } {
 	const fromEntry = state.fromProfile ? asOverride(state.fromProfile[name]) : undefined;
-	const defaultEntry = state.defaultProfile ? asOverride(state.defaultProfile[name]) : undefined;
 	return synthesizeDetailed({
 		...(fromEntry ? { fromProfile: fromEntry } : {}),
 		...(state.projectEntry ? { projectEntry: state.projectEntry } : {}),
-		...(defaultEntry ? { defaultProfile: defaultEntry } : {}),
 		...(state.userEntry ? { userEntry: state.userEntry } : {}),
 	});
 }
@@ -117,9 +133,12 @@ function asOverride(value: unknown): Override | undefined {
 /**
  * 装配一次会话（不含 TUI）。
  *
- * 合并优先级（§5）：① = 项目现有条目 ?? 模板（`--from` 指定的 profile，否则 default profile）
- * ——**项目现有配置始终优先**，`--from` 只决定模板槽位用哪个 profile。
+ * 合并优先级（§5、§16.7）：无 `--from` 时 ① = 项目现有条目（不回落 default
+ * profile，模板只能经 `--from` 显式使用）；有 `--from` 时 ① = `--from` 指定的
+ * profile（项目现有条目不参与基底，只在落盘对比与 `dropped` 提示里用到它）。
  * ② 恒为全局 `~/.pi/agent/settings.json`。
+ *
+ * `rows[0]` 恒为 main 虚拟行（§16.2.4），其后才是白名单 agent 行。
  */
 export function buildSession(inputs: SessionInputs, discovery: UpstreamDiscovery, config?: PresetsConfig): SessionState {
 	const notices: string[] = [];
@@ -142,8 +161,8 @@ export function buildSession(inputs: SessionInputs, discovery: UpstreamDiscovery
 	const settings = config ?? loadConfig(inputs.cwd, { trusted: inputs.trusted });
 	const whitelist = settings.agents;
 
-	const defaultProfile = readDefaultProfile(inputs.agentDir);
 	let fromProfile: Record<string, unknown> | undefined;
+	let fromProfileMain: MainLayer | undefined;
 	let fromProfileRejected = false;
 	if (inputs.fromProfile) {
 		const profile = readProfile(inputs.fromProfile, inputs.agentDir);
@@ -156,6 +175,7 @@ export function buildSession(inputs: SessionInputs, discovery: UpstreamDiscovery
 			fromProfileRejected = true;
 		} else {
 			fromProfile = profile.agentOverrides;
+			fromProfileMain = profile.main;
 		}
 	}
 
@@ -175,41 +195,62 @@ export function buildSession(inputs: SessionInputs, discovery: UpstreamDiscovery
 	const userProviderMap: ProviderOverrideMap = userLayer.subagents.agentOverridesByProvider;
 	const projectProviderMap: ProviderOverrideMap = projectLayer.subagents.agentOverridesByProvider;
 
-	const rows: RowEntry[] = whitelist.map((name) => {
-		const projectEntry = projectLayer.subagents.agentOverrides[name];
-		const globalEntry = userLayer.subagents.agentOverrides[name];
-		const classification = classifyRow({
-			name,
-			projectEntry,
-			// 全局条目也参与“我们自己配的禁用 / 上游禁用”的判定
-			...(globalEntry ? { userEntry: globalEntry } : {}),
-			userProviderMap,
-			projectProviderMap,
-			fourBucketAgents: discovery.fourBucketAgents,
-			resolveAgentName: discovery.module?.resolveAgentName
-				? (n, agents) => (discovery.module as UpstreamModule).resolveAgentName!(n, agents)
-				: undefined,
-		});
-		const { merged, origin } = baseEntryFor(name, {
-			fromProfile,
-			projectEntry,
-			defaultProfile,
-			userEntry: globalEntry,
-		});
-		// `noUncheckedIndexedAccess` 下 `fromProfile[name]` 是 `unknown`；条目必为对象才能算模板
-		const rawFromEntry: unknown = fromProfile ? fromProfile[name] : undefined;
-		const fromEntryOverride: Override | undefined = asOverride(rawFromEntry);
-		return {
-			name,
-			classification,
-			merged,
-			origin,
-			...(globalEntry ? { globalEntry } : {}),
-			...(projectEntry ? { projectEntry } : {}),
-			...(fromEntryOverride ? { fromEntry: fromEntryOverride } : {}),
-			draft: createDraft(name, merged),
-		};
+	// main 虚拟行（§16.2.4）：只在矩阵里表示"主 agent"，核心是顶层三键；
+	// 不进白名单、不进 `agentOverrides`。基底逐键：`--from` 模板 ▸ 项目层 ▸ 全局层。
+	const mainProjectEntry = mainLayerToOverride(projectLayer.main);
+	const mainGlobalEntry = mainLayerToOverride(userLayer.main);
+	const mainBase = synthesizeMain({
+		...(fromProfileMain ? { fromProfile: fromProfileMain } : {}),
+		project: projectLayer.main,
+		user: userLayer.main,
 	});
+	const mainRow: RowEntry = {
+		name: MAIN_ROW_NAME,
+		classification: classifyMainRow(Object.keys(mainProjectEntry).length > 0 ? mainProjectEntry : undefined),
+		merged: mainBase.merged,
+		origin: mainBase.origin,
+		...(Object.keys(mainGlobalEntry).length > 0 ? { globalEntry: mainGlobalEntry } : {}),
+		...(Object.keys(mainProjectEntry).length > 0 ? { projectEntry: mainProjectEntry } : {}),
+		draft: createDraft(MAIN_ROW_NAME, mainBase.merged, "main"),
+	};
+
+	const rows: RowEntry[] = [
+		mainRow,
+		...whitelist.map((name) => {
+				const projectEntry = projectLayer.subagents.agentOverrides[name];
+				const globalEntry = userLayer.subagents.agentOverrides[name];
+			const classification = classifyRow({
+				name,
+				projectEntry,
+				// 全局条目也参与“我们自己配的禁用 / 上游禁用”的判定
+				...(globalEntry ? { userEntry: globalEntry } : {}),
+				userProviderMap,
+				projectProviderMap,
+				fourBucketAgents: discovery.fourBucketAgents,
+				resolveAgentName: discovery.module?.resolveAgentName
+					? (n, agents) => (discovery.module as UpstreamModule).resolveAgentName!(n, agents)
+					: undefined,
+			});
+			const { merged, origin } = baseEntryFor(name, {
+				fromProfile,
+				projectEntry,
+				userEntry: globalEntry,
+			});
+			// `noUncheckedIndexedAccess` 下 `fromProfile[name]` 是 `unknown`；条目必为对象才能算模板
+			const rawFromEntry: unknown = fromProfile ? fromProfile[name] : undefined;
+			const fromEntryOverride: Override | undefined = asOverride(rawFromEntry);
+			return {
+				name,
+				classification,
+				merged,
+				origin,
+				...(globalEntry ? { globalEntry } : {}),
+				...(projectEntry ? { projectEntry } : {}),
+				...(fromEntryOverride ? { fromEntry: fromEntryOverride } : {}),
+				draft: createDraft(name, merged),
+			};
+		}),
+	];
 
 	return {
 		projectRoot,
@@ -223,12 +264,13 @@ export function buildSession(inputs: SessionInputs, discovery: UpstreamDiscovery
 		errors,
 		fromProfileActive: inputs.fromProfile !== undefined && !fromProfileRejected,
 		fromProfileRejected,
-		baseSources: { fromProfile, defaultProfile },
+		baseSources: { fromProfile, fromProfileMain },
 	};
 }
 
 /**
- * 保存后的状态转移：重读项目层，并按**新**的项目条目重算每行的合并基底与草稿。
+ * 保存后的状态转移：重读项目层，并按**新**的项目条目重算每行的合并基底与草稿
+ * （含 main 行的顶层三键，§16.2.4）。
  *
  * 不重算的话基底会停留在旧项目条目上，导致「保存后接着改 `e`」的 dirty 判定
  * 拿错了参照（连续两次保存可能因此不幂等）。
@@ -237,11 +279,27 @@ export function resetAfterSave(session: SessionState): void {
 	const fresh = readProjectLayer(session.projectRoot.root);
 	session.projectLayer = fresh;
 	for (const row of session.rows) {
+		// main 虚拟行：基底同样重算（逐键 `--from` 模板 ▸ 新项目层 ▸ 全局层）
+		if ((row.draft.kind ?? "agent") === "main") {
+			const projectEntry = mainLayerToOverride(fresh.main);
+			const globalEntry = mainLayerToOverride(session.userLayer.main);
+			const next = synthesizeMain({
+				...(session.baseSources.fromProfileMain ? { fromProfile: session.baseSources.fromProfileMain } : {}),
+				project: fresh.main,
+				user: session.userLayer.main,
+			});
+			row.projectEntry = Object.keys(projectEntry).length > 0 ? projectEntry : undefined;
+			row.globalEntry = Object.keys(globalEntry).length > 0 ? globalEntry : undefined;
+			row.merged = next.merged;
+			row.origin = next.origin;
+			// 草稿回到「未触碰」态：extra 重置为新基底的深拷贝
+			row.draft = createDraft(MAIN_ROW_NAME, row.merged, "main");
+			continue;
+		}
 		row.projectEntry = fresh.subagents.agentOverrides[row.name];
 		row.globalEntry = session.userLayer.subagents.agentOverrides[row.name];
 		const next = baseEntryFor(row.name, {
 			fromProfile: session.baseSources.fromProfile,
-			defaultProfile: session.baseSources.defaultProfile,
 			projectEntry: row.projectEntry,
 			userEntry: row.globalEntry,
 		});
@@ -286,14 +344,21 @@ export function buildRowViews(
 /** 一行在当前草稿下的完整显示视图（按过 `r` 且未再改时基底只取全局层）。 */
 function buildView(row: RowEntry, sources: ViewSources, baseline: UpstreamAgent | undefined): MatrixRowView {
 	const base = rowBaseOf(row);
-	const maxThinking = baseline?.maxThinking ?? sources.maxThinking;
+	// main 虚拟行（§16.2.4）：显示走 `mainModelText`，`maxThinking` 恒 undefined
+	//（`subagents.maxThinking` 只管子 agent）；基底两层都没有该键时显示空白。
+	const isMain = (row.draft.kind ?? "agent") === "main";
+	const maxThinking = isMain ? undefined : (baseline?.maxThinking ?? sources.maxThinking);
 	const provider = baseline?.modelProvider ?? sources.parentProvider;
 	const modelRef = modelRefOf(base, row.draft);
 	const located = modelRef ? locateModel({ registry: sources.registry, models: sources.models, modelRef, provider }) : undefined;
 	const model = located?.model;
-	const thinking = thinkingViewOf(base, row.draft, model, located?.thinkingSuffix, maxThinking);
+	const modelText = isMain ? mainModelTextOf(row, base) : modelTextOf(base, row.draft, row.globalEntry);
+	const thinking = isMain
+		? { text: mainThinkingText(base, row.draft), value: mainThinkingText(base, row.draft), over: false }
+		: thinkingViewOf(base, row.draft, model, located?.thinkingSuffix, maxThinking);
 	return {
 		name: row.name,
+		kind: row.draft.kind,
 		classification: row.classification,
 		draft: row.draft,
 		merged: row.merged,
@@ -301,15 +366,39 @@ function buildView(row: RowEntry, sources: ViewSources, baseline: UpstreamAgent 
 		...(row.globalEntry ? { globalEntry: row.globalEntry } : {}),
 		locatedModel: model,
 		maxThinking,
-		fullModelText: modelRef ?? "",
-		modelText: modelTextOf(base, row.draft, row.globalEntry),
+		fullModelText: isMain ? modelText : (modelRef ?? ""),
+		modelText,
 		modelUnresolved: modelUnresolved(modelRef, model, base, row.draft),
 		thinkingText: thinking.text,
 		thinkingValue: thinking.value,
 		overCeiling: thinking.over,
-		carriedKeys: Object.keys(base).filter((k) => k !== "model" && k !== "thinking"),
+		carriedKeys: isMain
+			? Object.keys(base).filter((k) => !(MAIN_KEYS as readonly string[]).includes(k))
+			: Object.keys(base).filter((k) => k !== "model" && k !== "thinking"),
 		editWarnings: [],
 	};
+}
+
+/**
+ * main 行的 thinking 显示：`defaultThinkingLevel` 的原始串（§16.2.4）。
+ *
+ * main 不走 registry 定位/夹取，所以没有档位标注；缺省 ⇒ 真正的空白。
+ */
+/**
+ * main 行的 model 显示：`provider` 有值 ⇒ `provider/model`，否则裸 id（§16.2.4）。
+ *
+ * 解析走 `mainModelText` → `resolveMainEntry`，与落盘（`writer.ts` 的 `mainAfter`）
+ * **同一个函数**：否则会出现"屏幕一个值、写盘另一个值"（reset 场景踩过）。
+ */
+function mainModelTextOf(row: RowEntry, base: Override): string {
+	return mainModelText(base, row.draft, row.merged);
+}
+
+function mainThinkingText(base: Override, draft: RowEntry["draft"]): string {
+	if (draft.touched.has("thinking")) {
+		return typeof draft.thinking === "string" ? draft.thinking : "";
+	}
+	return typeof base.defaultThinkingLevel === "string" ? base.defaultThinkingLevel : "";
 }
 
 /**
@@ -320,6 +409,9 @@ function buildView(row: RowEntry, sources: ViewSources, baseline: UpstreamAgent 
  * `inherit (not in registry)`）。
  */
 function modelRefOf(base: Override, draft: RowEntry["draft"]): string | undefined {
+	// main 行不走 registry 定位（§16.2.4）：显示由 `mainModelText` 组装，这里返回
+	// undefined ⇒ `locatedModel` 为空、`modelUnresolved` 为假。
+	if ((draft.kind ?? "agent") === "main") return undefined;
 	if (draft.touched.has("model")) {
 		const draftModel = draft.model;
 		if (typeof draftModel === "string") return draftModel === "inherit" ? undefined : draftModel;

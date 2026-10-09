@@ -6,11 +6,12 @@
 
 ## 目标
 
-- `/subagent-presets [--from <profile>]`：交互式矩阵（`agent` / `model` / `thinking` / `state` 四列）批量设置，写入项目 `.pi/settings.json`；保存时可同步导出全局 profile
+- `/subagent-presets [--from <profile>]`：交互式矩阵（`main` 虚拟行 + `agent` / `model` / `thinking` / `state` 四列）批量设置，写入项目 `.pi/settings.json`；保存时可同步导出全局 profile
+- `main` 虚拟行改顶层 `defaultProvider` / `defaultModel` / `defaultThinkingLevel`（主 agent 默认值），不进 `agentOverrides`、不进白名单
 - 键位：`enter` 选 model · `shift+tab` 循环 thinking · `r` reset 该行（不写项目）· `e` 用 `$EDITOR` 编辑整条将写入的条目 · `S` 保存 · `esc` 退出
 - **合并而非覆盖**：把「项目 / 模板 / 全局」逐字段合并后落盘，避免项目条目让全局同名条目整级出局而丢字段
 - **所见即所得**：矩阵显示的是**将真正生效的值**；基准值直读上游 discovery，不手算回落链
-- **白名单即托管清单**：`agents` 配置项既是矩阵行集，也是项目 `agentOverrides` 里允许出现的全部 agent
+- **白名单即托管清单**：`agents` 配置项既是矩阵行集，也是项目 `agentOverrides` 里允许出现的全部 agent（`main` 是保留名，不进白名单）
 - **不破坏用户显式意图**：provider 条件层行不物化（不写也不删）
 
 ## 源码结构（src/）
@@ -19,8 +20,9 @@
 |---|---|
 | `index.ts` | 工厂装配：命令注册、参数解析与 `--from` 补全、headless 摘要、`e` 的注释头 |
 | `session.ts` | 会话装配：discovery 探测、四桶归一、`state` 实时计算、显示值（model / thinking 档位与上限） |
-| `merge.ts` | 逐字段合并、草稿三态（`touched`）、`applyDraft` 删键语义、`state` 三值、reset 基底（纯函数） |
-| `writer.ts` | 保存计划与原子写：只整体替换 `subagents.agentOverrides`，保留其余键 |
+| `merge.ts` | 逐字段合并、草稿三态（`touched`）、`applyDraft` 删键语义、`state` 三值、reset 基底（纯函数）；`Draft.kind` 区分 agent / main 行的落盘键名 |
+| `main-row.ts` | main 虚拟行纯逻辑：三层逐键合并（`fromProfile` ▸ `project` ▸ `user`）、顶层三键读写、显示串组装、`e` 回填、provider 凭证警告 |
+| `writer.ts` | 保存计划与原子写：整体替换 `subagents.agentOverrides` + 顶层 main 三键，保留其余键；profile 文档顶层带三键 |
 | `rowstate.ts` | 行分类（正常 / 上游已禁用 / 上游已无 / 别名 / 不可合并）+ 行内标记 |
 | `validate.ts` | 26 字段值域知识；`e` 只警告不阻止，profile 载入才拒绝非法条目 |
 | `context.ts` | 项目根解析（`.pi` → git 根 → cwd）与配置目录名 |
@@ -49,4 +51,7 @@
 - **`rebuilt` 从空对象构建** ⇒ 任何 `continue` 都等于**删除**：`unmerged` 与 `!dirty` 两行必须走 `keepExisting`，不能裸 `continue`
 - **项目条存在 + 该行 `state === GLOBAL` ⇒ 必须删该条**（`r` 的全部意义就靠这一条）
 - **写入只替换 `subagents.agentOverrides` 一个键**，且自实现原子写（临时文件 + `rename`）：上游的拷贝是 allowlist，会剥掉未知键
+- **main 行不写 `agentOverrides`**：它的落盘键是顶层的 `defaultProvider` / `defaultModel` / `defaultThinkingLevel`；`defaultModel` 存裸 id，provider 由 UI 成对写入，插件**不校验配对**；`r` 一次性删三个键，不产生半删；profile 顶层三键同样不进 `subagents`（那里的 `defaultProvider` 是上游的裸 id 消歧键，同名不同义）
+- **`--from` 语义**：模板即基底，未编辑也落盘（`planRebuild` 按"将写入对象 vs 项目现有条目"判定）；**普通命令只写必须写的**，未编辑且无项目条目的行不写；**无 default profile 隐式回落**，它只能经 `--from default` 显式使用
+- **项目层 main 三键需 trust 且下次启动才生效**：未 trust 项目整个忽略项目层 settings；`pi --session` 恢复旧会话沿用会话记录的模型；`unsaved changes` 是唯一的生效性提示，不另加行标记
 - **settings.json 语法错误 ⇒ 报错并拒绝写入**，绝不覆盖用户数据

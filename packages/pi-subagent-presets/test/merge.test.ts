@@ -16,11 +16,13 @@ import {
 	rowBaseOf,
 	rowDirty,
 	rowMergeState,
+	storageKeysOf,
 	synthesize,
 	synthesizeDetailed,
 	type Draft,
 	type Override,
 	type RowBaseInput,
+	type RowKind,
 } from "../src/merge.ts";
 
 /** 26 字段全部塞满的全局条目（等价性回归的输入）。 */
@@ -59,29 +61,28 @@ describe("synthesize (§3.1)", () => {
 		expect(merged).toEqual({ model: "p/m1", thinking: "high", tools: ["read"] });
 	});
 
-	it("无 --from 时 base0 = 项目条目；项目无条目时回落 default profile", () => {
-		expect(synthesize({ projectEntry: { model: "p/m1" }, defaultProfile: { model: "d/m0" }, userEntry: {} })).toEqual({ model: "p/m1" });
-		expect(synthesize({ defaultProfile: { model: "d/m0", thinking: "low" }, userEntry: {} })).toEqual({ model: "d/m0", thinking: "low" });
+	it("纯命令不回落 default profile（§16.7）：基底只有项目条目与全局层", () => {
+		expect(synthesize({ projectEntry: { model: "p/m1" }, userEntry: {} })).toEqual({ model: "p/m1" });
+		// 没有 fromProfile/projectEntry 时，结果只剩 userEntry 提供的字段
+		expect(synthesize({ userEntry: { thinking: "low" } })).toEqual({ thinking: "low" });
 	});
 
-	it("--from 换的是整个基底：加载指定配置，项目现有条目不参与（base0 = fromProfile ?? …）", () => {
+	it("--from 换的是整个基底：加载指定配置，项目现有条目不参与（base0 = fromProfile ?? projectEntry）", () => {
 		const merged = synthesize({
 			fromProfile: { model: "b/m9", thinking: "low" },
 			projectEntry: { model: "p/m1", skills: ["s"] },
-			defaultProfile: { model: "d/m0" },
 			userEntry: { machine: "runner-b" },
 		});
-		// 指定 profile 整条胜出；项目条目与 default profile 都不参与基底
+		// 指定 profile 整条胜出；项目条目不参与基底（§16.7：default profile 选项已删除）
 		expect(merged).toEqual({ model: "b/m9", thinking: "low", machine: "runner-b" });
 	});
 
-	it("纯命令（无 --from）⇒ 基底取项目现有条目，项目没有才回落 default profile", () => {
+	it("纯命令（无 --from）⇒ 基底只取项目现有条目（§16.7，不回落 default profile）", () => {
 		expect(
-			synthesize({ fromProfile: undefined, projectEntry: { model: "p/m1", skills: ["s"] }, defaultProfile: { model: "d/m0" }, userEntry: {} }),
+			synthesize({ fromProfile: undefined, projectEntry: { model: "p/m1", skills: ["s"] }, userEntry: {} }),
 		).toEqual({ model: "p/m1", skills: ["s"] });
-		expect(synthesize({ fromProfile: undefined, projectEntry: undefined, defaultProfile: { model: "d/m0" }, userEntry: {} })).toEqual({
-			model: "d/m0",
-		});
+		// 不带 --from 且项目无条目 ⇒ 合并结果为空（本次行为变更的锚点）
+		expect(synthesize({ fromProfile: undefined, projectEntry: undefined, userEntry: {} })).toEqual({});
 	});
 
 	it("--from default ⇒ 显式使用 default profile（而非项目条目）", () => {
@@ -283,7 +284,7 @@ describe("keepExisting（§7.1 的 keep existing 分支）", () => {
 
 describe("合并基底不含定义层的值（§3.1）", () => {
 	it("两层都没有 ⇒ 合并结果里没有该键（不回落定义层）", () => {
-		const merged = synthesize({ projectEntry: undefined, defaultProfile: undefined, userEntry: undefined });
+		const merged = synthesize({ projectEntry: undefined, userEntry: undefined });
 		expect(merged).toEqual({});
 		expect("model" in merged).toBe(false);
 		expect("thinking" in merged).toBe(false);
@@ -473,5 +474,100 @@ describe("deepCloneOverride", () => {
 		expect(out.a).not.toBe(src.a);
 		(out.a as unknown[])[1] = "mutated";
 		expect((src.a as unknown[])[1]).toEqual({ b: 2 });
+	});
+});
+
+describe("kind 映射：矩阵两列的真实键名（§16.2.2）", () => {
+	it("storageKeysOf：agent 用 model/thinking，main 用 defaultModel/defaultThinkingLevel", () => {
+		expect(storageKeysOf("agent")).toEqual({ model: "model", thinking: "thinking" });
+		expect(storageKeysOf("main")).toEqual({ model: "defaultModel", thinking: "defaultThinkingLevel" });
+	});
+
+	it("createDraft 默认 kind = agent，既有调用点行为不变", () => {
+		const draft = createDraft("a", { model: "m", thinking: "high", tools: ["read"] });
+		expect(draft.kind).toBe("agent");
+		expect(draft.model).toBe("m");
+		expect(draft.thinking).toBe("high");
+		expect(draft.extra).toEqual({ tools: ["read"] });
+	});
+
+	it("main 行：draft.model 是裸 id，provider 留在 extra", () => {
+		const merged: Override = { defaultProvider: "p", defaultModel: "m", defaultThinkingLevel: "high" };
+		const draft = createDraft("main", merged, "main");
+		expect(draft.kind satisfies RowKind).toBe("main");
+		expect(draft.model).toBe("m");
+		expect(draft.thinking).toBe("high");
+		expect(draft.extra).toEqual({ defaultProvider: "p" });
+	});
+
+	it("main 行 initialExtra 排除 defaultModel/defaultThinkingLevel 且保留 defaultProvider", () => {
+		expect(initialExtra({ defaultProvider: "p", defaultModel: "m", defaultThinkingLevel: "high" }, "main")).toEqual({
+			defaultProvider: "p",
+		});
+		// agent 行口径不变
+		expect(initialExtra({ model: "m", thinking: "high", tools: ["read"] })).toEqual({ tools: ["read"] });
+	});
+
+	it("main 行 applyDraft 删 defaultModel 后落盘对象无该键", () => {
+		const merged: Override = { defaultProvider: "p", defaultModel: "m", defaultThinkingLevel: "high" };
+		const draft = createDraft("main", merged, "main");
+		draft.touched.add("model");
+		draft.model = undefined;
+		expect(materializeRow(merged, draft)).toEqual({ defaultProvider: "p", defaultThinkingLevel: "high" });
+	});
+
+	it("main 行 applyDraft 改 thinking 写 defaultThinkingLevel（不写 thinking）", () => {
+		const merged: Override = { defaultModel: "m" };
+		const draft = createDraft("main", merged, "main");
+		draft.touched.add("thinking");
+		draft.thinking = "max";
+		const out = materializeRow(merged, draft);
+		expect(out).toEqual({ defaultModel: "m", defaultThinkingLevel: "max" });
+		expect("thinking" in out).toBe(false);
+	});
+
+	it("main 行 extra 里的 defaultModel/defaultThinkingLevel 不进落盘（以矩阵值为准）", () => {
+		const merged: Override = { defaultModel: "m" };
+		const draft = createDraft("main", merged, "main");
+		draft.extra.defaultModel = "should-be-ignored";
+		draft.extra.defaultThinkingLevel = "should-be-ignored";
+		expect(materializeRow(merged, draft)).toEqual({ defaultModel: "m" });
+	});
+
+	/** main 行的基底直接用真实键名构造（synthesizeMain 的 merged 形状）。 */
+	function mainRowOf(merged: Override, origin: RowBaseInput["origin"], mutate?: (draft: Draft) => void): RowBaseInput {
+		const draft = createDraft("main", merged, "main");
+		mutate?.(draft);
+		return { merged, origin, draft };
+	}
+
+	it("mergeStateOf 对 main：GLOBAL / MERGE / OVERRIDE", () => {
+		expect(rowMergeState(mainRowOf({ defaultModel: "u/m" }, { base: [], global: ["defaultModel"] }))).toBe("GLOBAL");
+		expect(rowMergeState(mainRowOf({ defaultModel: "p/m" }, { base: ["defaultModel"], global: [] }))).toBe("OVERRIDE");
+		expect(
+			rowMergeState(mainRowOf({ defaultModel: "p/m", defaultThinkingLevel: "high" }, { base: ["defaultModel"], global: ["defaultThinkingLevel"] })),
+		).toBe("MERGE");
+	});
+
+	it("main 行 touched 显式选值计入 base 侧，显式清空计入 global 侧", () => {
+		const touched = mainRowOf({ defaultThinkingLevel: "high" }, { base: [], global: ["defaultThinkingLevel"] }, (draft) => {
+			draft.touched.add("model");
+			draft.model = "p/m";
+		});
+		expect(rowMergeState(touched)).toBe("MERGE");
+		const cleared = mainRowOf({ defaultModel: "p/m" }, { base: ["defaultModel"], global: [] }, (draft) => {
+			draft.touched.add("model");
+			draft.model = undefined;
+		});
+		expect(rowMergeState(cleared)).toBe("GLOBAL");
+	});
+
+	it("agent 行对 kind 改造完全等价：matrix/extra 语义不变", () => {
+		// applyDraft 里 agent 的 model/thinking 仍走原键名
+		const merged: Override = { model: "u/m2", thinking: "high", tools: ["read"] };
+		const draft = createDraft("a", merged);
+		draft.touched.add("model");
+		draft.model = "p/m1";
+		expect(materializeRow(merged, draft)).toEqual({ model: "p/m1", thinking: "high", tools: ["read"] });
 	});
 });

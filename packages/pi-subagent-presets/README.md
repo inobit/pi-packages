@@ -4,7 +4,7 @@
 
 Batch-configure the `model` and `thinking` level of every [pi-subagents](https://github.com/nicobailon/pi-subagents) agent **per project**, and export the result as a reusable global profile template.
 
-- **One command**: `/subagent-presets` opens a matrix of agents × (model, thinking) and writes a project-level `subagents.agentOverrides` in one save
+- **One command**: `/subagent-presets` opens a matrix of agents × (model, thinking) — plus a virtual `main` row for the session's own defaults — and writes project-level `subagents.agentOverrides` and the top-level `defaultProvider` / `defaultModel` / `defaultThinkingLevel` in one save
 - **Field-level merge, not overwrite**: global values for `tools` / `skills` / `acceptanceRole` / `machine` / … are copied into the project entry, so a project entry never silently drops what you configured globally
 - **What you see is what runs**: the `model` and `thinking` columns show the value that will actually take effect, not the current file contents
 - **Reusable template**: every save can also export a global profile under `~/.pi/agent/profiles/pi-subagents/`, interoperable with the official `/subagents-profiles` and `/subagents-load-profile`
@@ -36,8 +36,8 @@ pi -e ./packages/pi-subagent-presets
 ## Usage
 
 ```text
-/subagent-presets                 # base = project entry ?? default profile
-/subagent-presets --from work     # base = the "work" profile (--from replaces the whole base)
+/subagent-presets                 # base = project entries only
+/subagent-presets --from work     # base = the "work" profile, merged over the global layer (--from replaces the whole base)
 ```
 
 | Key | Action |
@@ -45,7 +45,7 @@ pi -e ./packages/pi-subagent-presets
 | `↑` `↓` | Move the selected row |
 | `enter` | Open the model picker (inline search box above the list, always focused — just type) |
 | `shift+tab` | Cycle the thinking level (pi's default levels when the row has no model) |
-| `r` | Reset: do not write a project entry (state becomes `GLOBAL`); editing any field turns it into "write this instead" |
+| `r` | Reset: do not write a project entry (state becomes `GLOBAL`); editing any field turns it into "write this instead". On the `main` row, `r` removes all three top-level keys at once |
 | `e` | Edit the **whole entry that will be written** in `$EDITOR` (model / thinking included; validation only warns) |
 | `S` | Save |
 | `esc` | Quit (asks twice when there are unsaved changes) |
@@ -121,7 +121,7 @@ For **built-in** agents — which is every agent pi-subagents ships with — `ag
 That is why hand-writing a project entry is lossy. This extension fixes it by writing the **merge**:
 
 ```text
-① base     = --from profile | project entry ?? default profile
+① base     = --from profile | project entry (a plain command never falls back to the default profile)
 ② global   = ~/.pi/agent/settings.json  (always)
 ③ frontmatter model + thinking  (display only, never written)
 
@@ -130,11 +130,27 @@ save ⇒ for each changed row: write ① ∘ ②, field by field
 
 Because every field written into the project entry becomes the final value, the resolved result is identical to "follow global" — field for field. Untouched rows are **not** written, so they keep following the global config.
 
+The `default` profile is only ever used when you ask for it explicitly via `--from default`. Without `--from`, rows with no project entry show genuinely blank cells (they follow the global layer at runtime) and are not written.
+
+`--from <name>` lays its template down directly: the matrix shows the template merged over the global layer, and pressing `S` writes it to the project **even if you changed nothing**. The bottom line `● unsaved changes` is the only signal that the displayed values have not been written yet — when it is absent, what you see is what is on disk.
+
 ### The cost of pinning
 
 Once the merged result is written into the project file, it no longer follows the global config: later edits to `~/.pi/agent/settings.json` will not reach that project. The save dialog lists exactly which fields are being pinned so you can decide per row.
 
 Worth keeping in mind for **custom** agents in particular: those follow the global config field by field, but after the merge is written they hold a snapshot just the same and stop following it.
+
+## The `main` row
+
+The first matrix row, `main`, is a virtual row for the **main agent** (the model running your session itself). It edits the three top-level keys of the project settings — `defaultProvider` / `defaultModel` / `defaultThinkingLevel` — and never touches `subagents.agentOverrides`.
+
+- `defaultModel` is stored as a **bare id** (the id itself may contain a slash, e.g. `opencode/exo-free`); the matrix displays `provider/model` when a provider is set. Picking a model in the UI always writes the pair together, so the two keys stay consistent. Hand-editing them in `e` is never validated — an unpaired combination is your own doing and the extension does not interfere.
+- `r` on this row removes all three keys from the project at once (falling back to the global layer). There is no partial removal.
+- `e` opens exactly the three real keys — what you see is what lands in the file.
+- Two runtime facts worth knowing: an **untrusted** project ignores its project settings entirely, so these defaults do nothing there; and they only take effect on the **next pi start** in this project — resuming an old session with `pi --session` keeps that session's model.
+- Pi silently ignores defaults it cannot use: a `defaultModel` that is not in the model registry, or a `defaultProvider` with no configured credentials, falls back to automatic model selection with no error. The save dialog warns about both cases without blocking the save.
+
+Profiles carry these three keys at the **top level** (next to `subagents`, never inside it — the `defaultProvider` inside `subagents` is upstream's bare-id disambiguation key, same name but a different meaning). `--from` reads them in and `S` exports them back out.
 
 ## Soft dependency
 
@@ -176,11 +192,23 @@ The project layer (`<cwd>/.pi/extensions/pi-subagent-presets/config.json`, trust
 Profiles live in `~/.pi/agent/profiles/pi-subagents/<name>.json`, the same directory the official tooling uses. Format:
 
 ```json
-{ "subagents": { "agentOverrides": { "reviewer": { "model": "p/m", "thinking": "high" } } } }
+{
+  "subagents": { "agentOverrides": { "reviewer": { "model": "p/m", "thinking": "high" } } },
+  "defaultProvider": "p",
+  "defaultModel": "m",
+  "defaultThinkingLevel": "high"
+}
 ```
 
 - Names must match `^[A-Za-z0-9][A-Za-z0-9._-]*$`; a trailing `.json` is stripped.
-- **A profile carries no top-level `subagents` keys** (`defaultModel`, `defaultThinking`, `maxThinking`, …). Those are not shadowed by an agent entry, so they are never exported — configure them separately in a new project.
+- **A profile exports the whole matrix snapshot, not just the rows being written**: the
+  project side writes only what has to be written (untouched rows never enter the project
+  file), while the profile gets **every managed agent visible in the matrix** — including
+  rows you never touched — because a profile is the blueprint a future project lays down
+  with `--from`. The two sides deliberately differ, and the save screen says so whenever the
+  profile target is checked.
+- A profile carries the `main` row's three keys at the **top level** (`defaultProvider` / `defaultModel` / `defaultThinkingLevel`, each optional). They never live inside `subagents` — the `defaultProvider` inside `subagents` is upstream's bare-id disambiguation key, same name but a different meaning. The remaining top-level `subagents` keys (`defaultModel`, `defaultThinking`, `maxThinking`, …) are **not** exported — configure them separately in a new project.
+- `--from <name>` reads the agent entries *and* the top-level three keys as the new base, merged over the global layer; saving writes both back (agent entries to `subagents.agentOverrides`, the three keys to the settings top level). The `default` profile is only used when named explicitly via `--from default`.
 - Every field is validated before export. `model: false` is legal in project settings but **not** in a profile, so it is stripped with a notice; an entry that becomes empty is dropped entirely.
 - Reading a profile runs the same validator. An illegal value is a red banner and the merge is refused.
 
@@ -207,9 +235,9 @@ top-level non-object (that shape cannot be stored in `agentOverrides` at all).
 
 - The `state` column only shows `GLOBAL` / `MERGE` / `OVERRIDE`, computed live from where each field of the entry to be written comes from. `project entry exists + state === GLOBAL` means the entry contributes nothing to the final result, so the save **deletes it** (that is what `r` acts on).
 - **The two kinds of "disabled" behave differently**: `disabled: true` inside the merge result (your own config) stays editable — set it to `false` to re-enable; disabled in the four buckets but not in the merge result behaves exactly like "upstream no longer has this agent" (not editable, never written), only the marker differs.
-- Writing only replaces `subagents.agentOverrides`. Everything else in `settings.json` keeps its key set and values; the JSON formatting (indent, key order, trailing newline) is normalized.
+- Writing only replaces `subagents.agentOverrides` plus the three top-level `main` keys (`defaultProvider` / `defaultModel` / `defaultThinkingLevel`). Everything else in `settings.json` keeps its key set and values; the JSON formatting (indent, key order, trailing newline) is normalized.
 - No `/reload` is needed: the discovery cache fingerprint includes `size:mtimeMs` of both settings files, so the next launch picks the values up. We also call `clearAgentDiscoveryCache` when available.
-- Verify a result with pi-subagents' own `/subagents-models <agent>`.
+- Verify an agent result with pi-subagents' own `/subagents-models <agent>`; verify a `main` change by starting pi again in this project.
 - The project config directory name is not hardcoded — it is resolved from pi's `CONFIG_DIR_NAME` (and pi-subagents resolves the same name from its own `package.json`).
 - The project root follows pi-subagents' `findConfiguredProjectRoot` when available (including its `.agents`-directory candidates, home cutoff, and `projectRootResolution` policy). Without the upstream, the root is `ctx.cwd`, and a banner tells you the file may not be picked up.
 

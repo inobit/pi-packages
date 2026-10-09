@@ -5,7 +5,7 @@
  * 设计立场：我们只生成配置，pi-subagents 负责解释配置。因此这里**不建模上游解析
  * 行为**，唯一例外是"不物化"保护（判定在 rowstate.ts / writer.ts，理由见那里）。
  *
- * 基底只有**两层**：`base0`（项目条目 / `--from` 模板条目 / default profile）与全局层。
+ * 基底只有**两层**：`base0`（项目条目 / `--from` 模板条目）与全局层。
  * ⚠ **定义层不参与**：不写这个字段时上游本来就会用定义层的值兜底，把它物化等于把
  * 上游默认值钉死，而且显示定义层的值会让人误以为那是"配好的"。
  */
@@ -17,6 +17,25 @@ export type MatrixKey = "model" | "thinking";
 export const MATRIX_KEYS: readonly MatrixKey[] = ["model", "thinking"];
 
 /**
+ * 矩阵行的种类（§16.2.2）。
+ * - `agent`：普通子 agent 行，落盘键就是 `model` / `thinking`。
+ * - `main`：main 虚拟行（§16.0），矩阵两列映射到顶层的 `defaultModel` /
+ *   `defaultThinkingLevel`；`defaultProvider` 留在 extra 里。
+ */
+export type RowKind = "agent" | "main";
+
+/** 矩阵两列在**落盘对象**里的真实键名（main 的 model 列要拆成 provider + model）。 */
+export const STORAGE_KEYS: Record<RowKind, { model: string; thinking: string }> = {
+	agent: { model: "model", thinking: "thinking" },
+	main: { model: "defaultModel", thinking: "defaultThinkingLevel" },
+};
+
+/** 取某类行在落盘对象里的真实键名（未知输入一律按 agent 处理，防御）。 */
+export function storageKeysOf(kind: RowKind): { model: string; thinking: string } {
+	return STORAGE_KEYS[kind] ?? STORAGE_KEYS.agent;
+}
+
+/**
  * 草稿。
  * - `touched` 区分三态：未触碰 / 显式清空（值为 undefined）/ 显式选值。
  * - `extra` 初值 = `merged` 中除 model/thinking 之外全部键的深拷贝。
@@ -26,6 +45,12 @@ export const MATRIX_KEYS: readonly MatrixKey[] = ["model", "thinking"];
  */
 export interface Draft {
 	name: string;
+	/**
+	 * 行种类（§16.2.2）：`agent` 落盘键是 `model` / `thinking`，`main` 则是
+	 * `defaultModel` / `defaultThinkingLevel`（provider 在 `extra.defaultProvider`）。
+	 * `model` 字段的语义随之改变：main 行里它是**裸 model id**（不含 provider 前缀）。
+	 */
+	kind: RowKind;
 	/**
 	 * 矩阵列的草稿值。类型是 `unknown` 而不是 `string | false | undefined`：
 	 * `e` 里这两个键是**同一份数据**（§6.6 定位重做），而"只警告不阻止保存"要求
@@ -51,12 +76,10 @@ export interface SynthesizeResult {
 }
 
 export interface SynthesizeOptions {
-	/** `--from <name>` 命中时用它，否则用项目现有条目 / default profile。 */
+	/** `--from <name>` 命中时用它，否则用项目现有条目。 */
 	fromProfile?: Override | undefined;
 	/** 项目现有条目（无 `--from` 时才参与基底）。 */
 	projectEntry?: Override | undefined;
-	/** default profile（无 `--from` 且项目无条目时）。 */
-	defaultProfile?: Override | undefined;
 	/** 全局 `~/.pi/agent/settings.json` 的同名条目。 */
 	userEntry?: Override | undefined;
 }
@@ -65,16 +88,17 @@ export interface SynthesizeOptions {
  * §3.1 两层合并的合成部分，**同时输出逐字段来源**（`state` 列的判定依据）。
  *
  * 数据驱动（不枚举字段清单）：`base0 > user`，逐字段取第一个命中的层。
- * `base0 = fromProfile ?? (projectEntry ?? defaultProfile)`——`--from <name>` 加载指定配置、
- * 直接成为基底（项目现有条目不参与）；不带参数的纯命令才是「项目现有条目 ?? default profile」。
+ * `base0 = fromProfile ?? projectEntry`——`--from <name>` 加载指定配置、直接成为基底
+ * （项目现有条目不参与）；不带参数的纯命令才是「项目现有条目」（§16.7：普通命令不
+ * 再回落 default profile，模板只能经 `--from` 显式使用）。
  * 不排除任何字段——`machine` / `tools` / `skills` / `acceptanceRole` 一视同仁。
  *
  * ⚠ 定义层（第 ③ 步）**不参与**：不写它，上游本来就会用定义层兜底。
  */
 export function synthesizeDetailed(opts: SynthesizeOptions): SynthesizeResult {
 	// `--from <name>` = 加载指定的配置：它**直接成为基底**，项目现有条目不参与。
-	// 不带 `--from` 的纯命令才是：项目现有条目 ?? default profile。
-	const base0: Override | undefined = opts.fromProfile ?? opts.projectEntry ?? opts.defaultProfile;
+	// 不带 `--from` 的纯命令：基底就是项目现有条目（§16.7，不回落 default profile）。
+	const base0: Override | undefined = opts.fromProfile ?? opts.projectEntry;
 	const layers: (Override | undefined)[] = [base0, opts.userEntry];
 	const keys = new Set<string>();
 	for (const layer of layers) {
@@ -111,7 +135,7 @@ export function synthesize(opts: SynthesizeOptions): Override {
  * | `OVERRIDE` | 全部字段来自基底 |
  *
  * 逐字段的归类：
- * - 合并基底里、来自 base0（项目条目 / `--from` 模板 / default profile）的字段 ⇒ `base`
+ * - 合并基底里、来自 base0（项目条目 / `--from` 模板）的字段 ⇒ `base`
  * - 合并基底里、来自全局的字段 ⇒ `global`
  * - 草稿里 `touched` 且是显式选值（`model` / `thinking` 改过）⇒ `base`（你改的算项目侧）
  * - 草稿里 `touched` 且是显式清空（键不写入）⇒ `global`（键不落地，运行时由全局兜底）
@@ -170,9 +194,12 @@ export function mergeStateOf(input: MergeStateInput): MergeState {
  * 该键是否是"你改的"（⇒ 计入 base 侧）。
  * 矩阵两列看 `touched`（显式选值算、显式清空不算——清空的键压根不在结果里）；
  * `e` 编辑的其它字段没有 touched 集合，按**与草稿原基底是否不同**判定。
+ * 矩阵两列按该行 kind 的**真实键名**判定（main ⇒ `defaultModel` / `defaultThinkingLevel`）。
  */
 function isUserProvided(draft: Draft, extraRef: Override, key: string): boolean {
-	if (key === "model" || key === "thinking") return draft.touched.has(key) && draft[key] !== undefined;
+	const storage = storageKeysOf(draft.kind ?? "agent");
+	if (key === storage.model) return draft.touched.has("model") && draft.model !== undefined;
+	if (key === storage.thinking) return draft.touched.has("thinking") && draft.thinking !== undefined;
 	if (!(key in draft.extra)) return false;
 	return !deepEqualOverride(draft.extra[key], extraRef[key]);
 }
@@ -216,7 +243,7 @@ export function rowOriginOf(row: RowBaseInput): FieldOrigin {
  * `extra`）就重新参与——否则用户改的值会被静默丢弃（回归项）。
  */
 export function resetParticipates(row: { merged: Override; draft: Draft }): boolean {
-	return row.draft.touched.size > 0 || !deepEqualOverride(row.draft.extra, initialExtra(row.merged));
+	return row.draft.touched.size > 0 || !deepEqualOverride(row.draft.extra, initialExtra(row.merged, row.draft.kind ?? "agent"));
 }
 
 /** `state` 列的三个值（`GLOBAL` / `MERGE` / `OVERRIDE`），每帧实时重算、不缓存。 */
@@ -226,7 +253,7 @@ export function rowMergeState(row: RowBaseInput): MergeState {
 		origin: rowOriginOf(row),
 		draft: row.draft,
 		// `extra` 的参照恒为草稿原基底（见 `MergeStateInput.extraRef` 的理由）
-		extraRef: initialExtra(row.merged),
+		extraRef: initialExtra(row.merged, row.draft.kind ?? "agent"),
 	});
 }
 
@@ -237,7 +264,7 @@ export function rowMaterialize(row: RowBaseInput): Override {
 
 /** dirty 判定：`extra` 的参照是**草稿原基底**，与 `rowMergeState` 同一口径。 */
 export function rowDirty(row: RowBaseInput): boolean {
-	return isDirty(row.draft, initialExtra(row.merged));
+	return isDirty(row.draft, initialExtra(row.merged, row.draft.kind ?? "agent"));
 }
 
 /** `r`（reset）后基底冻结为只取全局层，逐字段来源也随之只剩 global 侧。 */
@@ -288,24 +315,30 @@ export function deepEqualOverride(a: unknown, b: unknown): boolean {
 	return false;
 }
 
-/** `extra` 的初值：合并基底里除 model/thinking 之外的全部键（深拷贝）。 */
-export function initialExtra(merged: Override): Override {
+/**
+ * `extra` 的初值：合并基底里除矩阵两列的**真实键名**之外的全部键（深拷贝）。
+ * main 行 ⇒ 排除 `defaultModel` / `defaultThinkingLevel`，`defaultProvider` 留在 extra 里。
+ */
+export function initialExtra(merged: Override, kind: RowKind = "agent"): Override {
+	const storage = storageKeysOf(kind);
 	const extra: Override = {};
 	for (const [k, v] of Object.entries(merged)) {
-		if (k === "model" || k === "thinking") continue;
+		if (k === storage.model || k === storage.thinking) continue;
 		extra[k] = cloneValue(v);
 	}
 	return extra;
 }
 
-/** 为一行构造初始草稿（未触碰态）。 */
-export function createDraft(name: string, merged: Override): Draft {
+/** 为一行构造初始草稿（未触碰态）。第三参默认 `"agent"`，既有调用点与测试不变。 */
+export function createDraft(name: string, merged: Override, kind: RowKind = "agent"): Draft {
+	const storage = storageKeysOf(kind);
 	return {
 		name,
-		model: merged.model,
-		thinking: merged.thinking,
+		kind,
+		model: merged[storage.model],
+		thinking: merged[storage.thinking],
 		touched: new Set<MatrixKey>(),
-		extra: initialExtra(merged),
+		extra: initialExtra(merged, kind),
 		reset: false,
 	};
 }
@@ -325,24 +358,27 @@ export function isDirty(draft: Draft, baseExtra: Override): boolean {
  *
  * 遍历集合是 `union(keys(next), keys(extra))`：键在 next 里有、在 extra 里没有
  * ⇒ **删除该键**。否则用户在 `e` 里删键是静默 no-op（基底的同名字段会复活）。
+ * 矩阵两列按该行 kind 的**真实键名**读写（main ⇒ `defaultModel` / `defaultThinkingLevel`）。
  */
 export function applyDraft(next: Override, draft: Draft): Override {
+	const storage = storageKeysOf(draft.kind ?? "agent");
 	// e 编辑出来的其它字段（用户主动行为，照写；含未知键）
 	for (const [k, v] of Object.entries(draft.extra)) {
-		if (k === "model" || k === "thinking") continue; // 这两个以矩阵值为准
+		if (k === storage.model || k === storage.thinking) continue; // 这两个以矩阵值为准
 		if (v === undefined) delete next[k];
 		else next[k] = v;
 	}
 	// extra 里没有、但 next 里有的键 ⇒ 用户在 e 里删了它 ⇒ 一并删除
 	for (const k of Object.keys(next)) {
-		if (k !== "model" && k !== "thinking" && !(k in draft.extra)) delete next[k];
+		if (k !== storage.model && k !== storage.thinking && !(k in draft.extra)) delete next[k];
 	}
 	// model / thinking：只在 touched 时改写（undefined = 显式清空 = 删键）
 	for (const k of MATRIX_KEYS) {
 		if (!draft.touched.has(k)) continue;
+		const storageKey = storage[k];
 		const v = draft[k];
-		if (v === undefined) delete next[k];
-		else next[k] = v;
+		if (v === undefined) delete next[storageKey];
+		else next[storageKey] = v;
 	}
 	return next;
 }
@@ -352,6 +388,8 @@ export function applyDraft(next: Override, draft: Draft): Override {
  *
  * `model` / `thinking` 与矩阵草稿是**同一份数据的两个视图**，所以这里把它们也写进
  * 草稿并标 `touched`（不允许"改了没反应"）；`e` 里删掉的键 = 该键不写入。
+ * 注意：这是 agent 行的回填（键名 `model` / `thinking`）；main 行走
+ * `main-row.ts` 的 `applyMainEditedEntry`（真实键名 `defaultModel` / `defaultThinkingLevel`）。
  */
 export function applyEditedEntry(draft: Draft, edited: Override): void {
 	for (const key of MATRIX_KEYS) {

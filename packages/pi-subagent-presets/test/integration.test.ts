@@ -6,14 +6,15 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { buildCompletions } from "../src/completions.ts";
 import { getConfigDirName, getProfilePath, getProjectSettingsPath, getUserSettingsPath } from "../src/context.ts";
 import { DEFAULT_AGENTS, configPaths, loadConfig, normalizeAgents, normalizeConfig } from "../src/config.ts";
-import { listProfileNames, profileExists, readDefaultProfile, readProfile, readProjectLayer, readSettingsLayer, readUserLayer } from "../src/settings-io.ts";
+import { MAIN_ROW_NAME, applyMainEditedEntry, mainEntryForEditor } from "../src/main-row.ts";
+import { listProfileNames, profileExists, readProfile, readProjectLayer, readSettingsLayer, readUserLayer } from "../src/settings-io.ts";
 import { buildRowViews, buildSession, resetAfterSave, type UpstreamDiscovery } from "../src/session.ts";
 import type { UpstreamAgent, UpstreamModule } from "../src/upstream.ts";
 import { callDiscoverAll, clearDiscoveryCache, detectUpstream, findUpstreamInstall, UPSTREAM_ENTRIES } from "../src/upstream.ts";
-import { buildPlan, buildRebuildInputs, collectWarnings, commitSave, parseArgs, parseEditedContent, editorContent, entryForEditor, reviewEditedJson, jsonEditorHeader, readMaxThinking, summaryLines, collectDiscovery, refreshViews } from "../src/index.ts";
+import { buildPlan, buildRebuildInputs, collectWarnings, commitSave, parseArgs, parseEditedContent, editorContent, entryForEditor, mainEditorContent, reviewEditedJson, jsonEditorHeader, readMaxThinking, summaryLines, collectDiscovery, refreshViews } from "../src/index.ts";
 import register, { COMMAND_NAME } from "../src/index.ts";
 import type { MatrixRowView } from "../src/tui/matrix.ts";
-import { applyEditedEntry, synthesize, type Override, initialExtra, isDirty, rowMergeState } from "../src/merge.ts";
+import { applyEditedEntry, rowBaseOf, synthesize, type Override, initialExtra, isDirty, rowMergeState } from "../src/merge.ts";
 import { FIELD_GUIDE, KNOWN_FIELDS } from "../src/validate.ts";
 import { isEditable } from "../src/rowstate.ts";
 import { createDefaultLoader } from "../src/upstream.ts";
@@ -100,6 +101,7 @@ function sessionOf(discovery: UpstreamDiscovery, fromProfile?: string) {
 function sessionViews(s: ReturnType<typeof sessionOf>): MatrixRowView[] {
 	return s.rows.map((row) => ({
 		name: row.name,
+		kind: row.draft.kind,
 		classification: row.classification,
 		draft: row.draft,
 		merged: row.merged,
@@ -267,10 +269,6 @@ describe("profile 读写与校验（§11 用例 12）", () => {
 		expect(profileExists("nope", agentDir)).toBe(false);
 	});
 
-	it("default profile 是基底 ① 的回落", () => {
-		writeProfile("default", { subagents: { agentOverrides: { scout: { model: "d/m" } } } });
-		expect(readDefaultProfile(agentDir)).toEqual({ scout: { model: "d/m" } });
-	});
 });
 
 describe("上游探测（软依赖，loader 注入）", () => {
@@ -442,6 +440,77 @@ describe("会话装配 + 端到端保存", () => {
 		expect(scout.merged).toEqual({});
 		expect(scout.modelText).toBe("");
 		expect(scout.thinkingText).toBe("");
+	});
+
+	it("§16.7 回归：不带 --from 且项目无条目时，矩阵 model/thinking 显示空白", () => {
+		// 两层都没有该 agent 的字段 ⇒ 空白（default profile 不再是隐式基底）
+		const s = sessionOf(l1());
+		expect(s.rows[0]!.name).toBe(MAIN_ROW_NAME);
+		const sources = { models: [], registry: { getAvailable: () => [] }, scopedModels: [] };
+		const views = buildRowViews(s.rows, l1(), sources);
+		const scout = views.find((v) => v.name === "scout")!;
+		expect(scout.merged).toEqual({});
+		expect(scout.modelText).toBe("");
+		expect(scout.thinkingText).toBe("");
+		// main 行同样空白，maxThinking 恒 undefined（subagents.maxThinking 只管子 agent）
+		const main = views.find((v) => v.name === MAIN_ROW_NAME)!;
+		expect(main.modelText).toBe("");
+		expect(main.thinkingText).toBe("");
+		expect(main.maxThinking).toBeUndefined();
+	});
+
+	it("§16.7 回归：写了 default profile 文件、不带 --from 运行时行仍显示空白（模板只能经 --from 显式使用）", () => {
+		const profileFile = getProfilePath("default", agentDir);
+		fs.mkdirSync(path.dirname(profileFile), { recursive: true });
+		fs.writeFileSync(profileFile, JSON.stringify({ subagents: { agentOverrides: { scout: { model: "d/m", thinking: "high" } } } }));
+		const s = sessionOf(l1());
+		const sources = { models: [], registry: { getAvailable: () => [] }, scopedModels: [] };
+		const views = buildRowViews(s.rows, l1(), sources);
+		const scout = views.find((v) => v.name === "scout")!;
+		expect(scout.merged).toEqual({});
+		expect(scout.modelText).toBe("");
+		expect(scout.thinkingText).toBe("");
+		// 对照：显式 --from default 时模板生效
+		const withFrom = sessionOf(l1(), "default");
+		expect(withFrom.rows.find((r) => r.name === "scout")?.merged).toEqual({ model: "d/m", thinking: "high" });
+	});
+
+	it("§16.2.4：main 虚拟行排在最前，顶层三键逐键合并并组装显示", () => {
+		writeProjectSettings({ defaultModel: "p/m", subagents: { agentOverrides: {} } });
+		writeUserSettings({ defaultProvider: "u", defaultModel: "u/m", defaultThinkingLevel: "low" });
+		const s = sessionOf(l1());
+		// main 行是 rows[0]，但不进白名单
+		expect(s.rows[0]!.name).toBe(MAIN_ROW_NAME);
+		expect(s.whitelist).not.toContain(MAIN_ROW_NAME);
+		const main = s.rows[0]!;
+		// 逐键：model 取项目层，provider/thinkingLevel 回落全局层
+		expect(main.merged).toEqual({ defaultProvider: "u", defaultModel: "p/m", defaultThinkingLevel: "low" });
+		expect(main.draft.kind).toBe("main");
+		const sources = { models: [], registry: { getAvailable: () => [] }, scopedModels: [] };
+		const views = buildRowViews(s.rows, l1(), sources);
+		const mainView = views.find((v) => v.name === MAIN_ROW_NAME)!;
+		expect(mainView.modelText).toBe("u/p/m");
+		expect(mainView.fullModelText).toBe("u/p/m");
+		expect(mainView.thinkingText).toBe("low");
+		expect(mainView.maxThinking).toBeUndefined();
+		// resetAfterSave 同样重算 main 行基底（读新的项目层）
+		resetAfterSave(s);
+		const after = s.rows[0]!;
+		expect(after.merged).toEqual({ defaultProvider: "u", defaultModel: "p/m", defaultThinkingLevel: "low" });
+		expect(after.projectEntry).toEqual({ defaultModel: "p/m" });
+		expect(after.draft.touched.size).toBe(0);
+		// 注：落盘接线（planMain 挂到 buildPlan）是 §16.3.4 index lane 的事，本 lane 不断言 plan。
+	});
+
+	it("§16.2.4：--from 模板的顶层三键成为 main 行基底（优先级最高）", () => {
+		writeProjectSettings({ defaultModel: "p/m", subagents: { agentOverrides: {} } });
+		writeUserSettings({ defaultThinkingLevel: "low" });
+		const profileFile = getProfilePath("tpl", agentDir);
+		fs.mkdirSync(path.dirname(profileFile), { recursive: true });
+		fs.writeFileSync(profileFile, JSON.stringify({ defaultProvider: "t", defaultModel: "t/m", subagents: { agentOverrides: {} } }));
+		const s = sessionOf(l1(), "tpl");
+		// 逐键：provider/model 取模板，thinkingLevel 回落全局层（项目层 model 被模板覆盖）
+		expect(s.rows[0]!.merged).toEqual({ defaultProvider: "t", defaultModel: "t/m", defaultThinkingLevel: "low" });
 	});
 
 	it("端到端：把全局条目合并写入项目，其余键语义保留", () => {
@@ -713,7 +782,7 @@ describe("会话装配 + 端到端保存", () => {
 
 	it("项目未 trust ⇒ 顶部黄条 + 写入二次确认（配置依然会生效）", () => {
 		const s = buildSession({ cwd: projectRoot, agentDir, trusted: false }, l1(), { agents: ["worker"] });
-		const row = s.rows[0]!;
+		const row = s.rows.find((r) => r.name === "worker")!;
 		row.draft.touched.add("model");
 		row.draft.model = "p/m1";
 		const warnings = collectWarnings(s, sessionViews(s));
@@ -766,6 +835,55 @@ describe("会话装配 + 端到端保存", () => {
 		expect(row.projectEntry).toEqual({ model: "p/m" });
 	});
 
+	it("§16.8：只改 main 后导出 profile ⇒ 整张矩阵快照进 profile，项目侧仍只写该写的", () => {
+		// profile = “下个项目 --from 铺开用的模板” ⇒ 整张矩阵；项目 = 只写需要写的。
+		writeProjectSettings({ defaultProvider: "p", defaultModel: "m", subagents: { agentOverrides: { worker: { model: "p/m" } } } });
+		writeUserSettings({ subagents: { agentOverrides: { reviewer: { model: "u/r", thinking: "low" } } } });
+		const s = sessionOf(l1());
+		const mainRow = s.rows[0]!;
+		expect(mainRow.draft.kind).toBe("main");
+		mainRow.draft.touched.add("model");
+		mainRow.draft.model = "m2";
+		const views = sessionViews(s);
+		const { plan } = buildPlan(s, views);
+		// 项目侧：只写 main 的三键 + 本来就有的 worker 条目
+		expect(Object.keys(plan.overrides)).toEqual(["worker"]);
+
+		commitSave(s, { writeProject: true, writeProfile: true, profileName: "snap" }, plan, [], agentDir, fakeModule(), [], views);
+		const profile = JSON.parse(fs.readFileSync(getProfilePath("snap", agentDir), "utf8")) as {
+			defaultModel?: string;
+			subagents: { agentOverrides: Record<string, Override> };
+		};
+		// 顶层：只写项目层实际要写的 main 三键
+		expect(profile.defaultModel).toBe("m2");
+		// agent 条目：**全部**托管 agent 都在，一个都没改过的 reviewer 也在
+		const names = Object.keys(profile.subagents.agentOverrides);
+		expect(names).toContain("worker");
+		expect(names).toContain("reviewer"); // 一个字都没改过 —— 旧语义下不会出现在 profile 里
+		// 其余托管行**本来就没有任何值**（两层都没配）⇒ 矩阵显示空白 ⇒ 快照里也不该有
+		expect(names.sort()).toEqual(["reviewer", "worker"]);
+		// 值 = 矩阵里看到的生效值（reviewer 全程跟随全局层）
+		expect(profile.subagents.agentOverrides.reviewer).toEqual({ model: "u/r", thinking: "low" });
+	});
+
+	it("§16.8：profile 快照排除灰行 / 别名行 / provider 作用域行", () => {
+		writeProjectSettings({ subagents: { agentOverrides: { worker: { model: "p/m" } } } });
+		writeUserSettings({ subagents: { agentOverrides: { "stale-agent": { model: "u/x" } } } });
+		const s = sessionOf(l1());
+		const views = sessionViews(s);
+		const { plan } = buildPlan(s, views);
+		commitSave(s, { writeProject: false, writeProfile: true, profileName: "snap2" }, plan, [], agentDir, fakeModule(), [], views);
+		const profile = JSON.parse(fs.readFileSync(getProfilePath("snap2", agentDir), "utf8")) as {
+			subagents: { agentOverrides: Record<string, Override> };
+		};
+		const names = Object.keys(profile.subagents.agentOverrides);
+		expect(names).not.toContain("stale-agent"); // 灰行：上游已无
+		expect(names).not.toContain("advisor"); // 别名行
+		expect(names).toContain("worker");
+		// main 虚拟行绝不能进 agentOverrides
+		expect(names).not.toContain("main");
+	});
+
 	it("profile 导出：model:false 剔除并提示", () => {
 		const s = sessionOf(l1());
 		const row = s.rows.find((r) => r.name === "worker")!;
@@ -774,7 +892,7 @@ describe("会话装配 + 端到端保存", () => {
 		row.draft.touched.add("thinking");
 		row.draft.thinking = "high";
 		const { plan } = buildPlan(s, sessionViews(s));
-		const outcome = commitSave(s, { writeProject: true, writeProfile: true, profileName: "work" }, plan, [], agentDir, fakeModule());
+		const outcome = commitSave(s, { writeProject: true, writeProfile: true, profileName: "work" }, plan, [], agentDir, fakeModule(), [], sessionViews(s));
 		expect(outcome.ok).toBe(true);
 		expect(outcome.message).toContain("profile side stripped model:false");
 		const profile = JSON.parse(fs.readFileSync(getProfilePath("work", agentDir), "utf8")) as {
@@ -814,6 +932,209 @@ describe("会话装配 + 端到端保存", () => {
 		commitSave(s, { writeProject: true, writeProfile: false, profileName: "default" }, plan, [], agentDir, fakeModule());
 		const settings = readProjectSettings() as { subagents: { agentOverrides: Record<string, Override> } };
 		expect(settings.subagents.agentOverrides.scout).toEqual({ model: "p/m2", thinking: "high" });
+	});
+
+	it("Finding 1：保留名 main 不进白名单（normalizeAgents 丢弃）", () => {
+		expect(normalizeAgents(["main", "worker", " main ", "", 1])).toEqual(["worker"]);
+		expect(normalizeAgents(["main"])).toEqual([]);
+		expect(normalizeAgents(["worker", "scout"])).toEqual(["worker", "scout"]);
+	});
+
+	it("Finding 1：白名单含 main 时，main 虚拟行走 planMain，同名 agent 条目不静默消失", () => {
+		// 显式 config 绕过 normalizeAgents（防御旧快照）：whitelist 字面含 "main"。
+		// main 虚拟行（kind main）+ 名为 main 的真 agent 行（kind agent）同名共存。
+		writeProjectSettings({
+			defaultProvider: "p",
+			defaultModel: "p/m",
+			subagents: { agentOverrides: { main: { model: "m/x", thinking: "low" }, worker: { model: "w/y" } } },
+		});
+		const mainAgent = { name: "main", model: "def/m1" };
+		const discovery: UpstreamDiscovery = {
+			module: fakeModule(),
+			fourBucketAgents: [...BUILTIN_AGENTS, mainAgent],
+			baselineAgents: [...BUILTIN_AGENTS, mainAgent],
+		};
+		const s = buildSession({ cwd: projectRoot, agentDir, trusted: true }, discovery, { agents: ["main", "worker"] });
+		expect(s.rows.map((r) => r.name)).toEqual(["main", "main", "worker"]);
+		expect(s.rows.map((r) => r.draft.kind)).toEqual(["main", "agent", "agent"]);
+		const { plan } = buildPlan(s, sessionViews(s));
+		// main 虚拟行照常走 planMain：after = 项目顶层三键
+		expect(plan.main.after).toEqual({ defaultProvider: "p", defaultModel: "p/m" });
+		expect(plan.main.changed).toBe(false);
+		// 名为 main 的 agent 条目按 agent 行重建：原样保留，不静默消失
+		expect(plan.overrides.main).toEqual({ model: "m/x", thinking: "low" });
+		expect(plan.unchanged).toContain("main");
+		expect(plan.removals.map((r) => r.name)).not.toContain("main");
+	});
+
+	it("Finding A：同名 agent 下 `refreshViews` 按身份归属（改回按名字找⇒ 必挂）", () => {
+		// `refreshViews` 旧写法是 `session.rows.find(row => row.name === view.name)`：
+		// 白名单里真有一个叫 `main` 的 agent 时，**两行都会命中虚拟行**，
+		// agent 行的视图被重建成 `{name:"main", kind:"main"}` ⇒ `buildPlan` 把两行一起滤出
+		// `planRebuild` ⇒ 它的项目条目变成无主条目被删（`onNeedRefresh` 每次改草稿都会触发）。
+		writeProjectSettings({ defaultModel: "m", subagents: { agentOverrides: { main: { model: "m/x", thinking: "low" } } } });
+		const sources = { models: [], registry: { getAvailable: () => [] }, scopedModels: [] };
+		// 四桶里要有这个 agent，否则它被判成灰行（unresolved）→ 走移除而不是重建，测不到归属
+		const mainAgent = { name: "main", model: "def/m1" };
+		const discovery: UpstreamDiscovery = {
+			module: fakeModule(),
+			fourBucketAgents: [...BUILTIN_AGENTS, mainAgent],
+			baselineAgents: [...BUILTIN_AGENTS, mainAgent],
+		};
+		const s = buildSession({ cwd: projectRoot, agentDir, trusted: true }, discovery, { agents: ["main", "worker"] });
+		const before = sessionViews(s);
+		expect(before.map((v) => `${v.name}:${v.kind}`)).toEqual(["main:main", "main:agent", "worker:agent"]);
+		// 改一行草稿（生产里会触发 onNeedRefresh → refreshViews）
+		s.rows[1]!.draft.touched.add("model");
+		s.rows[1]!.draft.model = "m/y";
+		const after = refreshViews(before, s, discovery, sources);
+		expect(after.map((v) => `${v.name}:${v.kind}`)).toEqual(["main:main", "main:agent", "worker:agent"]);
+		// 同名 agent 行的 kind 仍是 agent ⇒ `buildPlan` 仍按 agent 行重建它的条目
+		const { plan } = buildPlan(s, after);
+		expect(plan.overrides.main).toEqual({ model: "m/y", thinking: "low" });
+	});
+
+	it("Finding 1：项目里名为 main 的条目按既有 not-whitelisted 规则移除时必须进 plan.removals", () => {
+		writeProjectSettings({ subagents: { agentOverrides: { main: { model: "m/x" } } } });
+		const s = buildSession({ cwd: projectRoot, agentDir, trusted: true }, l1(), { agents: ["worker"] });
+		const { plan } = buildPlan(s, sessionViews(s));
+		const removal = plan.removals.find((r) => r.name === "main");
+		expect(removal?.reason).toBe("not-whitelisted");
+		expect(plan.overrides.main).toBeUndefined();
+		// main 虚拟行不受影响：项目顶层无三键 ⇒ after 为空且无改动
+		expect(plan.main.after).toEqual({});
+		expect(plan.main.changed).toBe(false);
+		expect(plan.main.removal).toBe(false);
+	});
+
+	it("Finding 2：main 行 r → e 打开的是全局层的值（reset 冻结后的基底）", () => {
+		// 项目层只有 model，provider 回落全局层：reset 后基底 = 全局层的两键。
+		writeProjectSettings({ defaultModel: "m1" });
+		writeUserSettings({ defaultProvider: "p2", defaultModel: "m2" });
+		const s = sessionOf(l1());
+		const row = s.rows[0]!;
+		expect(row.draft.kind).toBe("main");
+		row.draft.reset = true;
+		// 驱动**生产出口** `mainEditorContent`（`e` 打开的就是它），而不是在测试里重算一遍表达式
+		const content = mainEditorContent(sessionViews(s)[0]!);
+		expect(parseEditedContent(content).ok).toBe(true);
+		expect((parseEditedContent(content) as { value: Override }).value).toEqual({ defaultProvider: "p2", defaultModel: "m2" });
+	});
+
+	it("Finding 2：把生产出口改回 `row.merged`（reset 前基底）⇒ 上面那条必挂", () => {
+		// 反向护栏：`row.merged` 里 model 仍是项目层的 m1，与全局层的 m2 不同。
+		writeProjectSettings({ defaultModel: "m1" });
+		writeUserSettings({ defaultProvider: "p2", defaultModel: "m2" });
+		const s = sessionOf(l1());
+		const view = sessionViews(s)[0]!;
+		s.rows[0]!.draft.reset = true;
+		const stale = mainEntryForEditor(view.merged, view.draft, view.merged);
+		expect(stale).toEqual({ defaultProvider: "p2", defaultModel: "m1" });
+	});
+
+	it("Finding 2：main 行 r → e 原样保存（内容与项目一致）⇒ 不产生任何写入", () => {
+		writeProjectSettings({ defaultProvider: "p", defaultModel: "m" });
+		writeUserSettings({ defaultProvider: "p", defaultModel: "m" });
+		const s = sessionOf(l1());
+		const row = s.rows[0]!;
+		row.draft.reset = true;
+		const content = (parseEditedContent(mainEditorContent(sessionViews(s)[0]!)) as { value: Override }).value;
+		expect(content).toEqual({ defaultProvider: "p", defaultModel: "m" });
+		// 原样保存：回填 → plan 无改动 → commitSave 不碰文件
+		applyMainEditedEntry(row.draft, content);
+		const { plan } = buildPlan(s, sessionViews(s));
+		expect(plan.main.changed).toBe(false);
+		expect(plan.main.removal).toBe(false);
+		const before = fs.readFileSync(getProjectSettingsPath(projectRoot), "utf8");
+		const outcome = commitSave(s, { writeProject: true, writeProfile: false, profileName: "default" }, plan, [], agentDir, fakeModule());
+		expect(outcome.ok).toBe(true);
+		expect(fs.readFileSync(getProjectSettingsPath(projectRoot), "utf8")).toBe(before);
+	});
+
+	it("冒烟：main 行 r 之后显示全局层的完整三键（不是项目/全局混合值）", () => {
+		// 实测（mine:2.2）：项目层 provider=mimo、model=mimo-v2.6-flash，全局层
+		// provider=ino2api、model=opencode/exo-free。按 `r` 后曾显示 `mimo/opencode/exo-free`
+		// —— provider 取自 reset 前的 `draft.extra`、model 取自冻结后的全局基底，
+		//拼出一个任何层都不存在的值。修复：reset 后尚未再编辑时不套草稿。
+		writeProjectSettings({ defaultProvider: "mimo", defaultModel: "mimo-v2.6-flash", defaultThinkingLevel: "minimal" });
+		writeUserSettings({ defaultProvider: "ino2api", defaultModel: "opencode/exo-free", defaultThinkingLevel: "max" });
+		const s = sessionOf(l1());
+		const mainRow = s.rows[0]!;
+		expect(mainRow.draft.kind).toBe("main");
+
+		const sources = { models: [], registry: { getAvailable: () => [] }, scopedModels: [] };
+		const before = buildRowViews(s.rows, l1(), sources)[0]!;
+		expect(before.modelText).toBe("mimo/mimo-v2.6-flash");
+		expect(before.thinkingText).toBe("minimal");
+
+		mainRow.draft.reset = true;
+		const after = refreshViews([before], s, l1(), sources)[0]!;
+		// 三个字段**全部**来自全局层，绝不混层
+		expect(after.modelText).toBe("ino2api/opencode/exo-free");
+		expect(after.thinkingText).toBe("max");
+	});
+
+	it("冒烟：main 行 r 之后再改档位 ⇒ 套回草稿（草稿重新参与）", () => {
+		// 与上一条成对：一旦重新编辑，就该显示草稿值（含新选的 provider）。
+		writeProjectSettings({ defaultProvider: "mimo", defaultModel: "mimo-v2.6-flash" });
+		writeUserSettings({ defaultProvider: "ino2api", defaultModel: "opencode/exo-free" });
+		const s = sessionOf(l1());
+		const row = s.rows[0]!;
+		row.draft.reset = true;
+		row.draft.touched.add("thinking");
+		row.draft.thinking = "high";
+		const sources = { models: [], registry: { getAvailable: () => [] }, scopedModels: [] };
+		const view = refreshViews(buildRowViews(s.rows, l1(), sources), s, l1(), sources)[0]!;
+		// 基底仍冻结为全局层（provider=ino2api），但 draft 重新参与（thinking=high）
+		expect(view.modelText).toBe("ino2api/opencode/exo-free");
+		expect(view.thinkingText).toBe("high");
+	});
+
+	it("Finding B：main 行 r → commitSave ⇒ 顶层三键真被删，其余键保留", () => {
+		// `r` reset 的 removal 语义必须一路推到文件：`planMain` 给 `{after:{}, removal:true}`
+		// ⇒ `commitSave` 的门控 `changed || removal` 为真 ⇒ 传 `{}` ⇒ 三键逐个 delete。
+		// 旧代码（门控只判 `changed`）会让 `r` 在 main 行上静默失效，而其它测试仍然全绿。
+		writeProjectSettings({ theme: "dark", defaultProvider: "p", defaultModel: "m", defaultThinkingLevel: "low" });
+		const s = sessionOf(l1());
+		const row = s.rows[0]!;
+		expect(row.draft.kind).toBe("main");
+		row.draft.reset = true;
+		const { plan } = buildPlan(s, sessionViews(s));
+		expect(plan.main.removal).toBe(true);
+		expect(plan.main.changed).toBe(false);
+		expect(plan.main.after).toEqual({});
+		const outcome = commitSave(s, { writeProject: true, writeProfile: false, profileName: "default" }, plan, [], agentDir, fakeModule());
+		expect(outcome.ok).toBe(true);
+		const settings = readProjectSettings() as Record<string, unknown>;
+		expect(settings).not.toHaveProperty("defaultProvider");
+		expect(settings).not.toHaveProperty("defaultModel");
+		expect(settings).not.toHaveProperty("defaultThinkingLevel");
+		expect(settings.theme).toBe("dark");
+	});
+
+	it("Finding 4：main 无任何改动时提交，项目 settings 顶层三键原样保留", () => {
+		writeProjectSettings({ defaultProvider: "p", defaultModel: "m", defaultThinkingLevel: "low" });
+		const s = sessionOf(l1());
+		// 剥掉 main 行：planMainFor 走显式 no-op 兜底（after={} 但 changed/removal 全假）。
+		// 旧代码把这个 `{}` 无条件传给写盘层 ⇒ 顶层三键全删（潜伏的批量删除）。
+		s.rows = s.rows.filter((r) => (r.draft.kind ?? "agent") !== "main");
+		const { plan } = buildPlan(s, sessionViews(s));
+		expect(plan.main.changed).toBe(false);
+		expect(plan.main.removal).toBe(false);
+		const outcome = commitSave(s, { writeProject: true, writeProfile: false, profileName: "default" }, plan, [], agentDir, fakeModule());
+		expect(outcome.ok).toBe(true);
+		expect(readProjectSettings()).toEqual({ defaultProvider: "p", defaultModel: "m", defaultThinkingLevel: "low" });
+	});
+
+	it("Finding 5：buildView 返回 kind（取 draft.kind），与 agent 行行为一致", () => {
+		const s = sessionOf(l1());
+		const sources = { models: [], registry: { getAvailable: () => [] }, scopedModels: [] };
+		const views = buildRowViews(s.rows, l1(), sources);
+		expect(views).toHaveLength(s.rows.length);
+		for (const [i, view] of views.entries()) {
+			expect(view.kind).toBe(s.rows[i]!.draft.kind);
+		}
+		expect(views[0]!.kind).toBe("main");
 	});
 
 	it("buildRebuildInputs 逐行对应 session.rows，并把 origin / globalEntry 带过去", () => {
@@ -1130,7 +1451,7 @@ describe("基线口径（纯函数，便于复核）", () => {
 			{ fourBucketAgents: [{ name: "reviewer" }], baselineAgents: [{ name: "reviewer" }] },
 			{ agents: ["reviewer"] },
 		);
-		const row = s.rows[0]!;
+		const row = s.rows.find((r) => r.name === "reviewer")!;
 		expect(row.merged).toEqual({ thinking: "max" });
 
 		resetAfterSave(s);
@@ -1176,11 +1497,12 @@ describe("基线口径（纯函数，便于复核）", () => {
 });
 
 describe("合并基底参与基底选择的回归（§3.1 步骤）", () => {
-	it("base0 = 项目条目 ?? default profile（无 --from）", () => {
+	it("base0 = 项目条目（无 --from，§16.7 不回落 default profile）", () => {
 		const userEntry: Override = { thinking: "low" };
-		const fromProject = synthesize({ projectEntry: { model: "p/m" }, defaultProfile: { model: "d/m" }, userEntry });
+		const fromProject = synthesize({ projectEntry: { model: "p/m" }, userEntry });
 		expect(fromProject).toEqual({ model: "p/m", thinking: "low" });
-		const fromDefault = synthesize({ defaultProfile: { model: "d/m" }, userEntry });
-		expect(fromDefault).toEqual({ model: "d/m", thinking: "low" });
+		// 项目无条目 ⇒ 只剩全局层（不再回落 default profile）
+		const noProject = synthesize({ userEntry });
+		expect(noProject).toEqual({ thinking: "low" });
 	});
 });

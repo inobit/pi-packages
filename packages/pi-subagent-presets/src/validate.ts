@@ -351,6 +351,39 @@ export function validateProfileAgentOverrides(value: unknown): ValidationResult 
 	return { errors, warnings };
 }
 
+/**
+ * 校验 profile 顶层的 main 三键（§16.2.6）。
+ *
+ * - 三个键缺省不校验；出现时必须是非空字符串。
+ * - `defaultThinkingLevel` ∈ `THINKING_LEVELS`（复用档位表，不新增）。
+ * - 顶层其它键（除 `subagents` 外）⇒ 只**警告**，不阻塞。
+ */
+export function validateProfileMain(value: unknown): ValidationResult {
+	const errors: string[] = [];
+	const warnings: string[] = [];
+	if (!isPlainObject(value)) {
+		return { errors: ["Profile must contain a JSON object"], warnings };
+	}
+	for (const key of ["defaultProvider", "defaultModel"] as const) {
+		if (!(key in value)) continue;
+		const v = value[key];
+		if (typeof v !== "string" || !v.trim()) errors.push(`Profile field '${key}' must be a non-empty string`);
+	}
+	if ("defaultThinkingLevel" in value) {
+		const v = value.defaultThinkingLevel;
+		if (typeof v !== "string" || !v.trim()) {
+			errors.push("Profile field 'defaultThinkingLevel' must be a non-empty string");
+		} else if (!THINKING_LEVELS.includes(v)) {
+			errors.push(`Profile field 'defaultThinkingLevel' must be one of ${THINKING_LEVELS.join(", ")} or omitted; got '${v}'`);
+		}
+	}
+	for (const key of Object.keys(value)) {
+		if (key === "subagents" || key === "defaultProvider" || key === "defaultModel" || key === "defaultThinkingLevel") continue;
+		warnings.push(`Unknown top-level field '${key}' in profile will be ignored`);
+	}
+	return { errors, warnings };
+}
+
 /** 官方 `SAFE_PATH_TOKEN`（`profiles.js:20`）+ `normalizeProfileName` 剥 `.json`。 */
 export function normalizeProfileName(raw: string): string {
 	return raw.trim().endsWith(".json") ? raw.trim().slice(0, -5) : raw.trim();

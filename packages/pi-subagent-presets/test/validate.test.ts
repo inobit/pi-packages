@@ -8,6 +8,7 @@ import {
 	validateAgentOverrides,
 	validateOverrideEntry,
 	validateProfileAgentOverrides,
+	validateProfileMain,
 } from "../src/validate.ts";
 
 describe("白名单", () => {
@@ -266,5 +267,45 @@ describe("profile 名归一化与校验（SAFE_PATH_TOKEN）", () => {
 		for (const bad of ["", ".", "..", "a/b", "a\\b", "-lead", "has space", "a:b"]) {
 			expect(isSafeProfileName(normalizeProfileName(bad)), bad).toBe(false);
 		}
+	});
+});
+
+describe("validateProfileMain（§16.2.6）", () => {
+	it("三键缺省 ⇒ 通过（无 errors 无 warnings）", () => {
+		expect(validateProfileMain({ subagents: { agentOverrides: {} } })).toEqual({ errors: [], warnings: [] });
+	});
+
+	it("合法三键 ⇒ 通过", () => {
+		expect(
+			validateProfileMain({ defaultProvider: "p", defaultModel: "m", defaultThinkingLevel: "high", subagents: {} }),
+		).toEqual({ errors: [], warnings: [] });
+	});
+
+	it("三键必须是非空字符串（缺省不校验）", () => {
+		expect(validateProfileMain({ defaultProvider: "" }).errors.length).toBeGreaterThan(0);
+		expect(validateProfileMain({ defaultProvider: 123 }).errors.length).toBeGreaterThan(0);
+		expect(validateProfileMain({ defaultModel: "" }).errors.length).toBeGreaterThan(0);
+		expect(validateProfileMain({ defaultModel: null }).errors.length).toBeGreaterThan(0);
+		expect(validateProfileMain({ defaultThinkingLevel: "" }).errors.length).toBeGreaterThan(0);
+	});
+
+	it("defaultThinkingLevel ∈ THINKING_LEVELS，非法档位拒绝", () => {
+		for (const level of THINKING_LEVELS) {
+			expect(validateProfileMain({ defaultThinkingLevel: level }).errors).toEqual([]);
+		}
+		const result = validateProfileMain({ defaultThinkingLevel: "turbo" });
+		expect(result.errors.length).toBeGreaterThan(0);
+		expect(result.errors.join("\n")).toContain("turbo");
+	});
+
+	it("顶层其它键 ⇒ 只警告不阻塞（subagents 除外）", () => {
+		const result = validateProfileMain({ defaultModel: "m", subagents: {}, futureTop: 1 });
+		expect(result.errors).toEqual([]);
+		expect(result.warnings.join("\n")).toContain("futureTop");
+	});
+
+	it("顶层非对象 ⇒ 拒绝", () => {
+		expect(validateProfileMain([]).errors.length).toBeGreaterThan(0);
+		expect(validateProfileMain("x").errors.length).toBeGreaterThan(0);
 	});
 });

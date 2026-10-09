@@ -11,6 +11,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getAgentDir, getConfigDirName } from "./context.ts";
+import { MAIN_ROW_NAME } from "./main-row.ts";
 
 export interface PresetsConfig {
 	/** 托管清单：参与矩阵的 agent，也是项目 agentOverrides 里允许出现的全部 agent。 */
@@ -60,7 +61,8 @@ export function normalizeAgents(raw: unknown): string[] | undefined {
 	for (const item of raw) {
 		if (typeof item !== "string") continue;
 		const t = item.trim();
-		if (!t || out.includes(t)) continue;
+		// `main` 是保留名（main 虚拟行，不是 agent，不进白名单），出现即丢弃
+		if (!t || t === MAIN_ROW_NAME || out.includes(t)) continue;
 		out.push(t);
 	}
 	return out;

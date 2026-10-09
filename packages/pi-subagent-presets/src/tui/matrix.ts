@@ -20,7 +20,7 @@
  * 字段时**不回落到上游解析值**——那是定义层的值，显示它会让人误以为那是"配好的"。
  */
 
-import { Container, type Focusable, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { Container, truncateToWidth, visibleWidth, type Focusable, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import type { KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import {
 	applyEditedEntry,
@@ -32,7 +32,9 @@ import {
 	type MatrixKey,
 	type MergeState,
 	type Override,
+	type RowKind,
 } from "../merge.ts";
+import { applyMainEditedEntry } from "../main-row.ts";
 import { agentCellText, isEditable, isStruckThrough, type BulkFlag, type RowClassification } from "../rowstate.ts";
 import type { CommitResult, RebuildPlan } from "../writer.ts";
 import { ModelPicker, type ModelChoice } from "./model-picker.ts";
@@ -61,6 +63,8 @@ const THINKING_COLUMN_WIDTH = 19;
 
 export interface MatrixRowView {
 	name: string;
+	/** 行种类（§16.3.1）：`main` = main 虚拟行（矩阵第 0 行），与 `draft.kind` 一致。 */
+	kind: RowKind;
 	classification: RowClassification;
 	draft: Draft;
 	merged: Override;
@@ -214,6 +218,8 @@ export class PresetsMatrix extends Container implements Focusable {
 			const selected = i === this.selectedIndex;
 			const prefix = selected ? "→ " : "  ";
 			const missing = row.classification.state === "unresolved";
+			// main 行恒走 `accent`（它永不可灰），agent 行保持 dim/accent 现状；
+			// 置顶 + 其后空行分隔就是 main 的全部区分（§16.3.1，不加行级标记）。
 			const style = (text: string): string => {
 				if (missing) return t.fg("dim", text);
 				return t.fg("accent", text);
@@ -228,6 +234,8 @@ export class PresetsMatrix extends Container implements Focusable {
 				this.pad(this.thinkingCellOf(row), columns.thinking, style) +
 				style(this.stateTextOf(row));
 			lines.push(selected ? t.bold(line) : line);
+			// main 行固定第 0 行，其后一条空行分隔（只渲染，不占 `selectedIndex`）。
+			if (i === 0 && isMainRow(row)) lines.push("");
 		}
 
 		// 下方区域**高度恒定**（1 空行 + 1 行状态 + footer），且只回答一件事：“整份配置改了东西、还没存”。
@@ -280,9 +288,10 @@ export class PresetsMatrix extends Container implements Focusable {
 	private padCell(text: string, width: number, style: (t: string) => string, decorate?: (t: string) => string): string {
 		// 与 `pad()` 同一套规则：内容宽 = `width`，右边距额外 1 空格
 		const contentWidth = Math.max(1, width);
-		const truncated = text.length <= contentWidth ? text : `${text.slice(0, Math.max(1, contentWidth - 1))}…`;
+		// 宽度按 `visibleWidth` 算（CJK 占 2 列，`String.length` 会算窄）。截断符沿用 `…`。
+		const truncated = visibleWidth(text) <= contentWidth ? text : truncateToWidth(text, contentWidth, "…");
 		const body = decorate ? decorate(truncated) : truncated;
-		return style(body + " ".repeat(contentWidth - truncated.length) + " ");
+		return style(body + " ".repeat(Math.max(0, contentWidth - visibleWidth(truncated))) + " ");
 	}
 
 	/**
@@ -297,9 +306,10 @@ export class PresetsMatrix extends Container implements Focusable {
 		//   最长的那行正好填满内容宽、不会被 margin 挤掉一格。
 		//   （曾经用 `Math.max(1, width - len)`：内容正好等宽时多补 1 格 ⇒ 那一行长 1，
 		//     thinking 列看着没对齐；补 0 格又会两列糊在一起。）
+		// 宽度按 `visibleWidth` 算（CJK 占 2 列，`String.length` 会算窄）。截断符沿用 `…`。
 		const contentWidth = Math.max(1, width);
-		const truncated = text.length <= contentWidth ? text : `${text.slice(0, Math.max(1, contentWidth - 1))}…`;
-		return style(truncated) + " ".repeat(contentWidth - truncated.length) + " ";
+		const truncated = visibleWidth(text) <= contentWidth ? text : truncateToWidth(text, contentWidth, "…");
+		return style(truncated) + " ".repeat(Math.max(0, contentWidth - visibleWidth(truncated))) + " ";
 	}
 
 	/**
@@ -313,7 +323,7 @@ export class PresetsMatrix extends Container implements Focusable {
 	 * 拿 `agentCellText()` 的**未加装饰**版本去量（删除线不占显示宽度但计入 `.length`）。
 	 */
 	private columnWidths(width: number): { agent: number; model: number; thinking: number } {
-		const agent = Math.max(AGENT_COLUMN_MIN, ...this.rows.map((row) => agentCellText(row.name, row.classification).length));
+		const agent = Math.max(AGENT_COLUMN_MIN, ...this.rows.map((row) => visibleWidth(agentCellText(row.name, row.classification))));
 		// ⚠️ thinking 列宽**固定**，不按当前内容取。
 		//   之前用 `max(thinkingCellOf(row).length)`，于是每按一次 shift+tab、值一变长
 		//   整列宽度就变，model/state 两列**跟着左右跳**（观感极差）。
@@ -327,7 +337,7 @@ export class PresetsMatrix extends Container implements Focusable {
 		// model 列**贴合内容**（封顶 MODEL_COLUMN_MAX），不吞掉剩余宽度。
 		// 之前是 `model = available - thinking`，宽终端上 model 列能涨到 100+ 字符，
 		// thinking/state 被推到最右边，中间一大片空白。现在列间距紧凑，多余宽度留白。
-		const contentMax = Math.max(MODEL_COLUMN_MIN, ...this.rows.map((row) => row.modelText.length));
+		const contentMax = Math.max(MODEL_COLUMN_MIN, ...this.rows.map((row) => visibleWidth(row.modelText)));
 		const model = Math.min(MODEL_COLUMN_MAX, Math.max(MODEL_COLUMN_MIN, Math.min(contentMax, available - thinking)));
 		return { agent, model, thinking };
 	}
@@ -419,13 +429,13 @@ export class PresetsMatrix extends Container implements Focusable {
 
 	/**
 	 * 「有没有未保存修改」是**整份配置**的属性，不是当前行的属性：
-	 * 只要任一 agent 会写入或删除项目条目就算未保存。
+	 * 只要任一 agent 会写入或删除项目条目（含 main 行的顶层三键）就算未保存。
 	 * 判定口径与保存屏一致（同一个 `planSave`），避免两处口径打架。
 	 */
 	private anyDirty(): boolean {
 		try {
 			const { plan } = this.opts.callbacks.planSave(this.rows);
-			return plan.changed.length > 0 || plan.removals.length > 0;
+			return plan.changed.length > 0 || plan.removals.length > 0 || plan.main.changed || plan.main.removal;
 		} catch {
 			// 计划算不出来时退回逐行判断（保守：有改动就当有改动）
 			return this.rows.some((row) => this.isRowDirty(row));
@@ -509,11 +519,14 @@ export class PresetsMatrix extends Container implements Focusable {
 		// （`this.opts.models` 始终是命令开始时的快照）——“按了 enter 没反应”的根源之一。
 		this.mode = "model";
 		this.clear();
+		// main 行没有“跟随父会话”概念 ⇒ 隐藏 `inherit` 固定项（§16.3.1）。
+		const main = isMainRow(row);
 		this.picker = new ModelPicker({
 			agentName: row.name,
 			models: this.opts.models,
 			currentText: row.modelText,
-			currentValue: draftModelValue(row.draft),
+			currentValue: main ? mainPickerValue(row) : draftModelValue(row.draft),
+			...(main ? { followParent: false } : {}),
 			theme: this.theme,
 			keybindings: this.opts.keybindings,
 			onChoose: (choice) => this.applyModelChoice(row, choice),
@@ -529,7 +542,14 @@ export class PresetsMatrix extends Container implements Focusable {
 				this.touch(row, "model", "inherit");
 				break;
 			case "model":
-				this.touch(row, "model", choice.value);
+				if (isMainRow(row)) {
+					// UI 选模型天然成对（§16.0 决策 2）：裸 id 进 model 列，provider 进 extra；
+					// 落盘写 `defaultProvider=provider + defaultModel=id`，不做任何配对校验。
+					this.touch(row, "model", choice.id);
+					row.draft.extra.defaultProvider = choice.provider;
+				} else {
+					this.touch(row, "model", choice.value);
+				}
 				break;
 		}
 		this.backToMatrix();
@@ -558,7 +578,9 @@ export class PresetsMatrix extends Container implements Focusable {
 		}
 		// 只存草稿；行是否重新参与写盘由 `merge.ts` 的 `resetParticipates` 判定
 		// （`e` 回填会把 model/thinking 标 touched ⇒ 行重新参与）
-		applyEditedEntry(row.draft, next.value);
+		// main 行回填三条真实键（`applyMainEditedEntry`），agent 行走 `applyEditedEntry`。
+		if (isMainRow(row)) applyMainEditedEntry(row.draft, next.value);
+		else applyEditedEntry(row.draft, next.value);
 		// 校验只警告：保存屏会把这些行汇总出来
 		row.editWarnings = next.warnings;
 		this.notify(next.warnings.length > 0 ? "warning" : "info", next.warnings.length > 0 ? `${next.warnings.length} warning(s) from the JSON editor (not blocking)` : "Entry updated");
@@ -581,7 +603,7 @@ export class PresetsMatrix extends Container implements Focusable {
 			return;
 		}
 		const { plan, warnings, overCeilingAgents } = this.opts.callbacks.planSave(this.rows);
-		if (plan.changed.length === 0 && plan.removals.length === 0 && plan.dropped.length === 0) {
+		if (plan.changed.length === 0 && plan.removals.length === 0 && plan.dropped.length === 0 && !plan.main.changed && !plan.main.removal) {
 			this.notify("info", "No changes");
 			this.invalidate();
 			return;
@@ -651,6 +673,36 @@ export class PresetsMatrix extends Container implements Focusable {
 	currentViews(): MatrixRowView[] {
 		return this.rows;
 	}
+}
+
+/** 行种类：`MatrixRowView.kind`（必填，与 `draft.kind` 一致）。 */
+function kindOfRow(row: MatrixRowView): RowKind {
+	return row.kind;
+}
+
+/**
+ * 是否 main 虚拟行：**只看 kind**，不按名字判。
+ *
+ * ⚠️ 不能拿 `row.name === MAIN_ROW_NAME` 兜底：`main` 是保留名（`config.ts` 的
+ * `normalizeAgents` 会丢弃它），一旦真出现同名 agent，按名字判就会把它错认成虚拟行，
+ * 它的项目条目会被当成"零贡献"删掉。同 `index.ts` 的 `isMainView` 口径。
+ */
+function isMainRow(row: MatrixRowView): boolean {
+	return kindOfRow(row) === "main";
+}
+
+/**
+ * main 行的选择器初值：touched 时由草稿拼 `provider/id`，否则用展示串
+ * （`fullModelText` 即 `provider/id`，与列表 value 同一维度）。
+ */
+function mainPickerValue(row: MatrixRowView): string | false | undefined {
+	if (row.draft.touched.has("model")) {
+		const model = row.draft.model;
+		if (typeof model !== "string" || model === "") return undefined;
+		const provider = row.draft.extra.defaultProvider;
+		return typeof provider === "string" && provider !== "" ? `${provider}/${model}` : model;
+	}
+	return row.fullModelText !== "" ? row.fullModelText : undefined;
 }
 
 /** 草稿里的 model 值 → 选择器初值（只有 string / false 有意义）。 */

@@ -126,6 +126,16 @@ export class SaveDialog extends Container implements Focusable {
 		lines.push("");
 		lines.push(`${this.mark("project")} ${this.writeProject ? "[x]" : "[ ]"} project  ${this.opts.projectPath}`);
 		lines.push(`${this.mark("profile")} ${this.writeProfile ? "[x]" : "[ ]"} profile  ${this.opts.profilePath}${this.profileExistsHint()}`);
+		// profile 语义（§16.8）：导出的是**整张矩阵快照**，不是“这次会写的行”。
+		// 勾选时始终说明一次，避免“只改一行 ⇒ profile 被整张覆盖”的意外。
+		if (this.writeProfile) {
+			const agentRows = this.opts.plan.changed.length + this.opts.plan.removals.length;
+			lines.push(
+				this.writeProfile && agentRows === 0
+					? "profile: full matrix snapshot (all managed agents), no agent entries changed in this save"
+					: "profile: full matrix snapshot (all managed agents)",
+			);
+		}
 		lines.push("");
 		for (const line of this.bodyLines(t)) lines.push(line);
 		lines.push("");
@@ -193,6 +203,16 @@ export class SaveDialog extends Container implements Focusable {
 					lines.push(`  ~ ${change.name}.${field.key}  ${formatValue(field.before)} → ${formatValue(field.after)}`);
 				}
 			}
+			lines.push("");
+		}
+		if (plan.main.changed || plan.main.removal) {
+			lines.push("will write top-level settings (main agent):");
+			for (const field of plan.main.fields) {
+				if (field.after === undefined) lines.push(`  - ${field.key}  ${formatValue(field.before)} → (removed)`);
+				else lines.push(`  ~ ${field.key}  ${formatValue(field.before)} → ${formatValue(field.after)}`);
+			}
+			// 提示不阻止：主 agent 默认值下次启动才生效，恢复旧会话时沿用会话记录的模型。
+			lines.push("main agent defaults apply on the next pi start in this project (resuming an old session with pi --session keeps that session's model)");
 			lines.push("");
 		}
 		if (plan.removals.length > 0) {

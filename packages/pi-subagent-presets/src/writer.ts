@@ -14,13 +14,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getProjectSettingsPath } from "./context.ts";
-import type { Draft, Override } from "./merge.ts";
-import { deepCloneOverride, keepExisting, materializeRow, resetParticipates, rowBaseOf, rowDirty, rowMergeState, type FieldOrigin } from "./merge.ts";
+import { MAIN_KEYS, resolveMainEntry } from "./main-row.ts";
+import type { Draft, Override, RowKind } from "./merge.ts";
+import { deepCloneOverride, keepExisting, materializeRow, resetParticipates, rowBaseOf, rowDirty, rowMaterialize, rowMergeState, type FieldOrigin } from "./merge.ts";
 import type { BulkFlag, RowClassification, RowContext } from "./rowstate.ts";
 
 /** 一行的全部决策所需输入（纯数据，测试可直接构造）。 */
 export interface RebuildRowInput {
 	name: string;
+	/** 行种类（默认 `"agent"`；main 虚拟行不走 `planRebuild` 的行循环，见 `planMain`）。 */
+	kind?: RowKind | undefined;
 	projectEntry?: Override | undefined;
 	merged: Override;
 	/** 逐字段来源（`state` 判定用）。 */
@@ -65,6 +68,8 @@ export interface DroppedField {
 export interface RebuildPlan {
 	/** 最终要写进 `subagents.agentOverrides` 的内容。 */
 	overrides: Record<string, Override>;
+	/** main 虚拟行的顶层三键计划（§16.2.5，不走行循环，由 `planMain` 单独算）。 */
+	main: MainPlan;
 	changed: ChangedEntry[];
 	removals: RemovalEntry[];
 	/** 未 dirty、保持现有值的行。 */
@@ -79,6 +84,128 @@ export interface RebuildPlan {
 	zeroContribution: string[];
 	/** 是否需要删掉 `subagents.agentOverrides` 键。 */
 	deleteAgentOverrides: boolean;
+}
+
+/**
+ * main 虚拟行的重建计划（§16.2.5）。
+ *
+ * main 不是 agent 条目，不走 `planRebuild` 的行循环：`index.ts` 组装 `buildPlan`
+ * 时把 `planMain(...)` 的结果挂到 `plan.main` 上。`after` 的键是三条真实键名，
+ * 缺省的键 ⇒ 从项目文件里**删除**该顶层键（`r` reset 的落盘）。
+ */
+export interface MainPlan {
+	/** 项目层现有三键（缺省/空 ⇒ undefined，无可删）。 */
+	before?: Override;
+	/** 将写入的三键（空对象 = 三键全部消失 ⇒ 需要删键）。 */
+	after: Override;
+	/** 逐字段差异（保存屏用）。 */
+	fields: { key: string; before: unknown; after: unknown }[];
+	/** 与 before 有差异（含 before 不存在）。移除走 `removal`，不走这里。 */
+	changed: boolean;
+	/** before 不存在且 after 非空。 */
+	isNew: boolean;
+	/** 项目层三键全部消失（`r` reset / 显式清空）⇒ 需要删键。 */
+	removal: boolean;
+}
+
+/** `planMain` 的输入（纯数据，测试可直接构造）。 */
+export interface MainPlanInput {
+	/** 项目层现有三键（真实键名，缺省 ⇒ 无现有值）。 */
+	project?: Override | undefined;
+	/** 合并基底（`synthesizeMain` 的 `merged`，真实键名）。 */
+	merged: Override;
+	/** 逐字段来源（`state` 判定用）。 */
+	origin: FieldOrigin;
+	/** 全局层三键（`r` reset 后基底冻结为只取它）。 */
+	globalEntry?: Override | undefined;
+	/** main 行的草稿（`kind: "main"`）。 */
+	draft: Draft;
+	/** `--from` 模板激活时，未编辑的行也要按模板落盘（与 agent 行 §16.1 同口径）。 */
+	fromProfileActive?: boolean;
+}
+
+/** 中性的 main 计划（`planRebuild` 行循环不产出 main，由调用方用 `planMain` 覆盖）。 */
+export function emptyMainPlan(): MainPlan {
+	return { after: {}, fields: [], changed: false, isNew: false, removal: false };
+}
+
+/**
+ * main 行落盘/显示**共用**的条目解析（单一口径）。
+ *
+ * 只覆盖顶层三键（`MAIN_KEYS`）：`resolveMainEntry` 会把草稿 `extra` 里的未知键
+ * 一并带出来，但 `writeProjectSettings` 只写三键 ⇒ 未知键永远不会落盘；这里提前滤掉，
+ * 它们也就不进 `fields`、不出现在保存屏的 diff 里（否则会显示一条永远不会落盘的
+ * `~ someKey → …`）。
+ *
+ * provider 的解析规则见 `main-row.ts` 的 `resolveMainEntry`（reset 后不复活项目层的
+ * provider）——显示与落盘必须走同一个函数，否则会出现“屏幕一个值、写盘另一个值”。
+ */
+function mainAfter(row: { merged: Override; origin: FieldOrigin; globalEntry?: Override | undefined; draft: Draft }): Override {
+	const after = resolveMainEntry(rowBaseOf(row), row.draft, row.merged);
+	const out: Override = {};
+	for (const key of MAIN_KEYS) {
+		if (key in after) out[key] = after[key];
+	}
+	return out;
+}
+
+/**
+ * main 行的重建判定（§16.2.5，`planRebuild` 行循环的 main 版等价实现）。
+ *
+ * - `r` reset 且未再改 ⇒ 直接删键（**不**写冻结的全局值，这正是 reset 的含义）。
+ * - `state === GLOBAL` 且项目有键 ⇒ 删（零贡献）；项目无键 ⇒ 无事可做。
+ * - 未 dirty：普通命令 ⇒ 保留现有值；`--from` ⇒ 按模板落盘（§16.1 同口径，幂等）。
+ * - dirty ⇒ 写完整合并；结果为空且项目有键 ⇒ 删。
+ *
+ * ⚠️ main 的三个键**绝不**进 `subagents.agentOverrides`：`after` 只含顶层三键，
+ * 由 `writeProjectSettings` 写顶层，`planRebuild` 的 `overrides` 碰不到它们。
+ */
+export function planMain(input: MainPlanInput): MainPlan {
+	const fromProfileActive = input.fromProfileActive === true;
+	const before = keepExisting(input.project);
+	const row = { merged: input.merged, origin: input.origin, globalEntry: input.globalEntry, draft: input.draft };
+	const withBefore = <T extends object>(extra: T): T & { before?: Override } => (before ? { ...extra, before } : extra);
+
+	// `r` reset 且未再改：删键（agent 行走 removals，这里走 removal）
+	if (input.draft.reset && !resetParticipates({ merged: input.merged, draft: input.draft })) {
+		if (before) return { ...withBefore({}), after: {}, fields: diffFields(before, {}), changed: false, isNew: false, removal: true };
+		return emptyMainPlan();
+	}
+
+	// 🔑 零贡献（与 agent 行的 GLOBAL 分支同理）
+	if (rowMergeState(row) === "GLOBAL") {
+		const after = mainAfter(row);
+		if (before && Object.keys(after).length === 0) {
+			return { ...withBefore({}), after: {}, fields: diffFields(before, {}), changed: false, isNew: false, removal: true };
+		}
+		return { ...withBefore({}), after: before ?? {}, fields: [], changed: false, isNew: false, removal: false };
+	}
+
+	if (!rowDirty(row)) {
+		// `--from`：基底就是模板 ⇒ 未编辑的行也要按模板落盘
+		if (fromProfileActive) {
+			const after = mainAfter(row);
+			if (Object.keys(after).length > 0) {
+				const fields = diffFields(before, after);
+				if (fields.length > 0 || !before) {
+					return { ...withBefore({}), after, fields, changed: true, isNew: !before, removal: false };
+				}
+			}
+		}
+		// 未 dirty ⇒ 保留现有值（写回等值对象，写盘层据此跳过重写）
+		return { ...withBefore({}), after: before ?? {}, fields: [], changed: false, isNew: false, removal: false };
+	}
+
+	const after = mainAfter(row);
+	if (Object.keys(after).length === 0) {
+		if (before) return { ...withBefore({}), after: {}, fields: diffFields(before, {}), changed: false, isNew: false, removal: true };
+		return emptyMainPlan();
+	}
+	const fields = diffFields(before, after);
+	if (fields.length > 0 || !before) {
+		return { ...withBefore({}), after, fields, changed: true, isNew: !before, removal: false };
+	}
+	return { ...withBefore({}), after, fields: [], changed: false, isNew: false, removal: false };
 }
 
 function diffFields(before: Override | undefined, after: Override): { key: string; before: unknown; after: unknown }[] {
@@ -262,6 +389,7 @@ export function planRebuild(opts: RebuildOptions): RebuildPlan {
 	const deleteAgentOverrides = Object.keys(rebuilt).length === 0;
 	return {
 		overrides: rebuilt,
+		main: emptyMainPlan(),
 		changed,
 		removals,
 		unchanged,
@@ -312,11 +440,25 @@ export interface WriteProjectResult {
 	deletedKeys: string[];
 }
 
+/** `writeProjectSettings` 的输入：agent 条目 + 可选的顶层 main 三键。 */
+export interface WriteProjectSettingsInput {
+	/** 最终要写进 `subagents.agentOverrides` 的内容（全空 ⇒ 删该键）。 */
+	overrides: Record<string, Override>;
+	/**
+	 * 顶层 main 三键（真实键名）。缺省的键 ⇒ 从文件里**删除**该顶层键
+	 * （`r` reset 的落盘）；整个 `main` 缺省 ⇒ 顶层三键不动。
+	 */
+	main?: Override | undefined;
+}
+
 /**
- * 只替换 `subagents.agentOverrides` 这一个键，其余内容**语义保留**
+ * 只替换 `subagents.agentOverrides` + 顶层 main 三键，其余内容**语义保留**
  * （键集合与值相等；JSON 重写会规范化格式，字节不保证）。
+ *
+ * ⚠️ main 的三个键写**顶层**，绝不进 `subagents`（那里的 `defaultProvider`
+ * 是上游的裸 id 消歧键，同名不同义，见 `settings-io.ts` 的 `SubagentsLayer`）。
  */
-export function writeProjectAgentOverrides(projectRoot: string, overrides: Record<string, Override>): WriteProjectResult {
+export function writeProjectSettings(projectRoot: string, input: WriteProjectSettingsInput): WriteProjectResult {
 	const file = getProjectSettingsPath(projectRoot);
 	const { value: settings, error } = readSettingsObject(file);
 	if (error) throw new SettingsWriteError(error);
@@ -327,18 +469,46 @@ export function writeProjectAgentOverrides(projectRoot: string, overrides: Recor
 			? ({ ...(settings.subagents as Record<string, unknown>) })
 			: {};
 
-	if (Object.keys(overrides).length === 0) {
+	if (Object.keys(input.overrides).length === 0) {
 		delete subagentsBefore.agentOverrides;
 		if (Object.keys(subagentsBefore).length === 0) delete settings.subagents;
 		else settings.subagents = subagentsBefore;
 	} else {
-		settings.subagents = { ...subagentsBefore, agentOverrides: deepCloneOverride(overrides) };
+		settings.subagents = { ...subagentsBefore, agentOverrides: deepCloneOverride(input.overrides) };
+	}
+	const changedKeys: string[] = [];
+	const deletedKeys: string[] = [];
+	if (input.main !== undefined) {
+		for (const key of MAIN_KEYS) {
+			if (key in input.main) {
+				if (JSON.stringify(settings[key]) !== JSON.stringify(input.main[key])) {
+					settings[key] = input.main[key];
+					changedKeys.push(key);
+				}
+			} else if (key in settings) {
+				delete settings[key];
+				deletedKeys.push(key);
+			}
+		}
 	}
 	if (JSON.stringify(settings) === before) {
 		return { file, changedKeys: [], deletedKeys: [] };
 	}
 	writeJsonAtomic(file, settings);
-	return { file, changedKeys: ["subagents.agentOverrides"], deletedKeys: Object.keys(overrides).length === 0 ? ["subagents.agentOverrides"] : [] };
+	return {
+		file,
+		changedKeys: ["subagents.agentOverrides", ...changedKeys],
+		deletedKeys: [...(Object.keys(input.overrides).length === 0 ? ["subagents.agentOverrides"] : []), ...deletedKeys],
+	};
+}
+
+/**
+ * 只替换 `subagents.agentOverrides` 这一个键，其余内容**语义保留**
+ * （键集合与值相等；JSON 重写会规范化格式，字节不保证）。
+ * 薄封装：等价 `writeProjectSettings(root, { overrides })`，顶层三键不动。
+ */
+export function writeProjectAgentOverrides(projectRoot: string, overrides: Record<string, Override>): WriteProjectResult {
+	return writeProjectSettings(projectRoot, { overrides });
 }
 
 export interface ProfileWriteResult {	file: string;
@@ -351,12 +521,56 @@ export interface ProfileWriteResult {	file: string;
 /**
  * 导出 profile：`{ subagents: { agentOverrides: … } }`，**不含顶层 `subagents` 键**
  * （`defaultModel` / `defaultThinking` / `maxThinking` 天然生效、不被遮蔽，所以不导出）。
+ *
+ * main 三键写文档**顶层**（真实键名），绝不进 `subagents`；三键全空时不出现。
  */
-export function buildProfileDocument(overrides: Record<string, Override>): { document: { subagents: { agentOverrides: Record<string, Override> } }; strippedModelFalse: string[]; droppedEntries: string[] } {
+export interface ProfileDocument {
+	subagents: { agentOverrides: Record<string, Override> };
+	defaultProvider?: unknown;
+	defaultModel?: unknown;
+	defaultThinkingLevel?: unknown;
+}
+
+/**
+ * profile 导出用：**整张矩阵的快照**（= 下一个项目 `--from` 铺开时要用的完整模板）。
+ *
+ * ⚠️ 与项目写入的口径**故意不同**（§16.8）：
+ * - 项目：只写“需要写的”（`plan.overrides`），未改动的行不进项目文件
+ * - profile：导出矩阵里看到的**全部托管 agent**，含一个改动都没有的行
+ *
+ * 为什么：profile 是“下个项目铺开用的模板”。只导出会写的部分，等于把“这次写了几行”
+ * 当成“这个项目的配置”，下次 `--from` 铺出来是个残缺模板。
+ *
+ * 排除项与 `planRebuild` 对齐：
+ * - `unresolved`（上游已无 / 已禁用）与别名行：profile 里写了也无效
+ * - `unmerged`（provider 条件层）：profile 格式没有这一层，写进去等于伪造
+ * - 物化后为空：同上游，写不出东西就不导
+ *
+ * ⚠️ 必须在 `resetAfterSave` **之前**算（那会重算草稿）；返回深拷贝，调用方随后
+ * `resetAfterSave` 不影响已算好的快照。
+ */
+export function profileSnapshot(rows: RebuildRowInput[]): Record<string, Override> {
+	const out: Record<string, Override> = {};
+	for (const row of rows) {
+		if ((row.draft.kind ?? "agent") === "main") continue;
+		const { classification } = row;
+		if (classification.state === "unresolved" || classification.isAlias) continue;
+		if (classification.state === "unmerged") continue;
+		const entry = rowMaterialize(row);
+		if (Object.keys(entry).length === 0) continue;
+		out[row.name] = entry;
+	}
+	return out;
+}
+
+export function buildProfileDocument(
+	entries: Record<string, Override>,
+	main?: Override | undefined,
+): { document: ProfileDocument; strippedModelFalse: string[]; droppedEntries: string[] } {
 	const out: Record<string, Override> = {};
 	const strippedModelFalse: string[] = [];
 	const droppedEntries: string[] = [];
-	for (const [name, entry] of Object.entries(overrides)) {
+	for (const [name, entry] of Object.entries(entries)) {
 		const next = deepCloneOverride(entry);
 		if (next.model === false) {
 			strippedModelFalse.push(name);
@@ -368,11 +582,23 @@ export function buildProfileDocument(overrides: Record<string, Override>): { doc
 		}
 		out[name] = next;
 	}
-	return { document: { subagents: { agentOverrides: out } }, strippedModelFalse, droppedEntries };
+	const document: ProfileDocument = { subagents: { agentOverrides: out } };
+	if (main) {
+		for (const key of MAIN_KEYS) {
+			if (key in main && main[key] !== undefined) document[key] = main[key];
+		}
+	}
+	return { document, strippedModelFalse, droppedEntries };
 }
 
-export function writeProfile(profileFile: string, overrides: Record<string, Override>): ProfileWriteResult {
-	const { document, strippedModelFalse, droppedEntries } = buildProfileDocument(overrides);
+/**
+ * 导出 profile：`{ defaultProvider?, defaultModel?, defaultThinkingLevel?, subagents: { agentOverrides } }`。
+ *
+ * `entries` 传 `profileSnapshot(...)` 的结果（整张矩阵快照），**不是** `plan.overrides` ——
+ * 见 `profileSnapshot` 的理由。顶层三键只写项目层实际要写的（`main` 为 `undefined` 时不写）。
+ */
+export function writeProfile(profileFile: string, entries: Record<string, Override>, main?: Override | undefined): ProfileWriteResult {
+	const { document, strippedModelFalse, droppedEntries } = buildProfileDocument(entries, main);
 	writeJsonAtomic(profileFile, document);
 	return { file: profileFile, strippedModelFalse, droppedEntries };
 }

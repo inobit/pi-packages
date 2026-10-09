@@ -20,8 +20,9 @@ import { buildCompletions } from "./completions.ts";
 import { loadConfig } from "./config.ts";
 import { applyConfigDirNameOverride, getProfilePath, getProjectSettingsPath } from "./context.ts";
 import { runExternalEditorRound } from "./external-editor.ts";
-import { listModels, refreshModels, type ModelRegistryLike, type ScopedModelLike } from "./models.ts";
-import { deepCloneOverride, rowMaterialize, type Override } from "./merge.ts";
+import { listModels, locateModel, refreshModels, type ModelRegistryLike, type ScopedModelLike } from "./models.ts";
+import { MAIN_ROW_NAME, mainAuthWarning, mainEntryForEditor } from "./main-row.ts";
+import { deepCloneOverride, rowBaseOf, rowMaterialize, type Override } from "./merge.ts";
 import {
 	buildRowViews,
 	buildSession,
@@ -45,8 +46,8 @@ import {
 } from "./upstream.ts";
 import { PresetsMatrix, type MatrixRowView } from "./tui/matrix.ts";
 import type { SaveResult, SaveWarning } from "./tui/save-dialog.ts";
-import { FIELD_GUIDE, isSafeProfileName, KNOWN_FIELDS, normalizeProfileName, overrideIssues, THINKING_LEVELS, type OverrideIssue, validateOverrideEntry } from "./validate.ts";
-import { planRebuild, writeProfile, writeProjectAgentOverrides, type CommitResult, type RebuildRowInput, type RebuildPlan } from "./writer.ts";
+import { FIELD_GUIDE, isSafeProfileName, KNOWN_FIELDS, normalizeProfileName, overrideIssues, THINKING_LEVELS, type OverrideIssue, validateOverrideEntry, validateProfileMain } from "./validate.ts";
+import { emptyMainPlan, planMain, planRebuild, profileSnapshot, writeProfile, writeProjectSettings, type CommitResult, type RebuildRowInput, type RebuildPlan } from "./writer.ts";
 
 applyConfigDirNameOverride(CONFIG_DIR_NAME);
 
@@ -174,11 +175,12 @@ function buildViewSources(ctx: ExtensionCommandContext, session: SessionState): 
 	};
 }
 
-/** L0 无 UI 摘要（与上游 `/subagents` 的 headless 行为一致）。 */
-export function summaryLines(ctx: ExtensionCommandContext, session: SessionState, views: MatrixRowView[]): string[] {
+/** L0 无 UI 摘要（与上游 `/subagents` 的 headless 行为一致）。main 行排在最前（`views` 首行即它）。 */
+export function summaryLines(ctx: ExtensionCommandContext, session: SessionState, views: MatrixRowView[], fromProfileName?: string): string[] {
 	const out: string[] = [];
+	// §16.7：default profile 已移除。`--from` 激活写 `--from <profile>`，否则写 `project settings only`。
 	out.push(
-		`Subagent presets · ${projectLabel(ctx)} · base: ${session.fromProfileActive ? "--from profile" : "project ?? default profile"}`,
+		`Subagent presets · ${projectLabel(ctx)} · base: ${session.fromProfileActive ? `--from ${fromProfileName ?? "profile"}` : "project settings only"}`,
 	);
 	out.push(`parent session model: ${parentModelText(ctx)}`);
 	out.push("");
@@ -236,6 +238,21 @@ export function jsonEditorHeader(agentName?: string): string {
 		"",
 	);
 	return lines.join("\n");
+}
+
+/**
+ * main 行的外部编辑器注释头（英文，§16.3.4）。
+ *
+ * 只讲三件事：这 3 个键原样写到 settings 顶层、下次启动生效、未 trust 不生效。
+ */
+export function jsonEditorHeaderMain(): string {
+	return [
+		"// main agent defaults — these 3 keys are written as-is to the top-level of the project settings",
+		"// They apply on the next pi start in this project (resuming an old session keeps that session's model)",
+		"// An untrusted project ignores the project settings entirely",
+		"// Keys other than these three are ignored — only these three are written; invalid values only warn, never block saving",
+		"",
+	].join("\n");
 }
 
 /**
@@ -345,6 +362,42 @@ export function editorContent(entry: Override, agentName?: string): string {
 	return `${jsonEditorHeader(agentName)}\n${JSON.stringify(entry, null, 2)}\n`;
 }
 
+/**
+ * `e` 的 main 行输入文本 = main 专属注释头 + 三条真实键（§16.3.4）。
+ * 所见即所得 = 将落盘的键（`defaultProvider` / `defaultModel` / `defaultThinkingLevel`）。
+ */
+export function editorContentForMain(entry: Override): string {
+	return `${jsonEditorHeaderMain()}\n${JSON.stringify(entry, null, 2)}\n`;
+}
+
+/**
+ * main 行 `e` 编辑器的内容（**生产路径的单一出口**，测试直接驱动本函数）。
+ *
+ * 基底取 `rowBaseOf(row)` 而非 `row.merged`：`r` reset 之后基底冻结为只取全局层，
+ * 否则 `e` 会把 reset 前的项目值重新端出来，接受即等于撤销 reset（与 agent 行的
+ * `entryForEditor` = `rowMaterialize` 同口径）。
+ */
+export function mainEditorContent(row: MatrixRowView): string {
+	return editorContentForMain(mainEntryForEditor(rowBaseOf(row), row.draft, row.merged));
+}
+
+/**
+ * 校验 main 行在 `e` 里编辑的 JSON（§16.3.4）。
+ *
+ * **只警告，绝不阻止保存**：`validateProfileMain` 的 errors 在此一并降为 warnings
+ * （配对与否是用户的行为，插件不干涉，§16.0 决策 2）。唯一拒绝的是顶层非对象。
+ */
+export function reviewMainEditedJson(
+	parsed: unknown,
+): { accepted: boolean; value: Override; errors: string[]; warnings: string[] } {
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+		return { accepted: false, value: {}, errors: ["The edited JSON must be a JSON object"], warnings: [] };
+	}
+	const value = parsed as Override;
+	const result = validateProfileMain(value);
+	return { accepted: true, value, errors: [], warnings: [...result.errors, ...result.warnings] };
+}
+
 /** 外部编辑器打开的内容：合并基底（有效 reset 时只取全局层）+ 草稿。 */
 export function entryForEditor(row: MatrixRowView): Override {
 	return rowMaterialize(row);
@@ -365,15 +418,38 @@ export function parseEditedContent(content: string): { ok: true; value: unknown 
 	}
 }
 
-/** 矩阵行 → 重建输入。 */
+/**
+ * 是否 main 虚拟行：**只**认 `kind === "main"`（`row.kind ?? row.draft.kind`）。
+ * 名字不算——白名单里可能有同名的真 agent 行（保留名见 `normalizeAgents`），
+ * 按名字判会把两行都标成 main 并滤出重建循环（Finding 1）。
+ * main 不进白名单、不进 `agentOverrides`（§16.0 决策 1）。
+ */
+function isMainView(row: { kind?: string | undefined; draft: { kind?: string | undefined } }): boolean {
+	return (row.kind ?? row.draft.kind ?? "agent") === "main";
+}
+
+/**
+ * 矩阵行 → 重建输入（含 main 行的 kind 标记；过滤由 `buildPlan` 做）。
+ *
+ * 按**身份**取行：main 行靠 `draft.kind === "main"` 找，其余按 name。
+ * 不能用 `name` 做 Map 键——白名单里若有同名的真 agent 行，它会覆盖 main 行
+ * （或反之），同名两行被一起误标成 main 后滤掉，`agentOverrides["main"]`
+ * 就进了无行认领的移除（Finding 1）。
+ */
 export function buildRebuildInputs(session: SessionState, rows: MatrixRowView[]): RebuildRowInput[] {
-	const byName = new Map<string, RowEntry>(session.rows.map((row) => [row.name, row]));
+	const mainEntry = session.rows.find((row) => (row.draft.kind ?? "agent") === "main");
+	const byName = new Map<string, RowEntry>();
+	for (const row of session.rows) {
+		if ((row.draft.kind ?? "agent") === "main") continue;
+		byName.set(row.name, row);
+	}
 	const inputs: RebuildRowInput[] = [];
 	for (const view of rows) {
-		const entry = byName.get(view.name);
+		const entry = isMainView(view) ? mainEntry : byName.get(view.name);
 		if (!entry) continue;
 		inputs.push({
 			name: view.name,
+			kind: isMainView(view) || (entry.draft.kind ?? "agent") === "main" ? "main" : "agent",
 			projectEntry: entry.projectEntry,
 			merged: entry.merged,
 			origin: entry.origin,
@@ -402,6 +478,8 @@ export function collectWarnings(session: SessionState, rows: MatrixRowView[]): S
 		}
 		for (const flag of session.bulkFlags) {
 			if (view.classification.state === "unmerged" || view.classification.state === "unresolved") continue;
+			// bulk 开关只管子 agent 条目 resuscitation，不管顶层 main 三键。
+			if (isMainView(view)) continue;
 			warnings.push({
 				agent: view.name,
 				message:
@@ -414,17 +492,85 @@ export function collectWarnings(session: SessionState, rows: MatrixRowView[]): S
 	return warnings;
 }
 
+/** `buildPlan` 的 registry 输入：main 静默失效警告需要定位模型与查 provider 凭证。 */
+export interface MainWarningSources {
+	registry: ModelRegistryLike & { getProviderAuthStatus?: (provider: string) => { configured: boolean } };
+	models: readonly (Record<string, unknown> & { id: string; provider: string })[];
+}
+
 export function buildPlan(
 	session: SessionState,
 	rows: MatrixRowView[],
+	sources?: MainWarningSources | undefined,
 ): { plan: RebuildPlan; warnings: SaveWarning[] } {
+	// main 虚拟行不走 `planRebuild` 的行循环（它不是 agent 条目），只走 `planMain`。
 	const plan = planRebuild({
-		rows: buildRebuildInputs(session, rows),
+		rows: buildRebuildInputs(session, rows).filter((input) => (input.kind ?? "agent") !== "main"),
 		projectOverrides: session.projectLayer.subagents.agentOverrides,
 		whitelist: session.whitelist,
 		fromProfileActive: session.fromProfileActive,
 	});
-	return { plan, warnings: collectWarnings(session, rows) };
+	plan.main = planMainFor(session, rows);
+	const warnings = collectWarnings(session, rows);
+	if (sources && (plan.main.changed || plan.main.removal)) warnings.push(...mainSaveWarnings(plan.main.after, sources));
+	return { plan, warnings };
+}
+
+/**
+ * main 行的重建输入：会话里的基底 + 视图里的实时草稿（与 agent 行同一 live 口径）。
+ *
+ * 兜底是显式 no-op（`changed` / `removal` 全假）：当前正常流程下不可达
+ * （`buildSession` 恒造 main 行），但绝不能是 `after: {}` 配无条件写盘——
+ * 那会把顶层三键全删（潜伏的批量删除）。`commitSave` 只在
+ * `changed || removal` 时才把 `after` 传下去，no-op 配 `undefined` = 顶层不动。
+ */
+function planMainFor(session: SessionState, rows: MatrixRowView[]): RebuildPlan["main"] {
+	const entry = session.rows.find((row) => (row.draft.kind ?? "agent") === "main");
+	const view = rows.find((row) => isMainView(row));
+	const draft = view?.draft ?? entry?.draft;
+	if (!entry || !draft) return emptyMainPlan();
+	return planMain({
+		...(entry.projectEntry ? { project: entry.projectEntry } : {}),
+		merged: entry.merged,
+		origin: entry.origin,
+		...(entry.globalEntry ? { globalEntry: entry.globalEntry } : {}),
+		draft,
+		...(session.fromProfileActive ? { fromProfileActive: true } : {}),
+	});
+}
+
+/**
+ * main 落盘值的静默失效警告（§16.0 调研，保存屏 `notices` 段展示，不阻止写入）。
+ * 只在 main 将写入时调用；`after` 为空（removal）⇒ 无警告。
+ */
+function mainSaveWarnings(
+	after: Override,
+	sources: MainWarningSources,
+): SaveWarning[] {
+	const warnings: SaveWarning[] = [];
+	const provider = after.defaultProvider;
+	const model = after.defaultModel;
+	if (typeof model === "string" && model !== "") {
+		const display = typeof provider === "string" && provider !== "" ? `${provider}/${model}` : model;
+		const located = locateModel({
+			registry: sources.registry,
+			models: sources.models,
+			modelRef: display,
+			provider: typeof provider === "string" && provider !== "" ? provider : undefined,
+		});
+		if (!located?.model) {
+			warnings.push({
+				agent: "main",
+				message: `main: defaultModel="${display}" is not in the model registry — pi will silently fall back to automatic model selection`,
+			});
+		}
+	}
+	if (typeof provider === "string" && provider !== "") {
+		const getAuthStatus = sources.registry.getProviderAuthStatus;
+		const warning = mainAuthWarning(provider, typeof getAuthStatus === "function" ? getAuthStatus.bind(sources.registry) : undefined);
+		if (warning) warnings.push({ agent: "main", message: warning });
+	}
+	return warnings;
 }
 
 /**
@@ -442,19 +588,31 @@ export function commitSave(
 	module: UpstreamModule | undefined,
 	/** 真正**超** `maxThinking` 的行名（来自 `MatrixRowView.overCeiling`，不是“改过 thinking”）。 */
 	overCeilingAgents: readonly string[] = [],
+	/** 当前矩阵视图（带实时草稿）——profile 快照要按它算，缺省则不导出任何 agent 条目。 */
+	views: readonly MatrixRowView[] = [],
 ): CommitResult {
 	const messages: string[] = [];
+	const mainChanged = plan.main.changed || plan.main.removal;
+	const agentChanged = plan.changed.length > 0 || plan.removals.length > 0;
+	// main 无改动 ⇒ 传 `undefined`（顶层三键不动）；无条件传 `after` 会把三键全删
+	// （`after` 为 `{}` 时 `writeProjectSettings` 按“缺键即删”处理）。
+	const mainAfter = mainChanged ? plan.main.after : undefined;
+	// profile = **整张矩阵快照**，不是 `plan.overrides`（§16.8）：profile 是“下个项目
+	// `--from` 铺开用的模板”，只导出会写的部分就是残缺模板。必须在 `resetAfterSave`
+	// （下方）之前算，那会重算草稿。
+	const snapshot = result.writeProfile ? profileSnapshot(buildRebuildInputs(session, [...views])) : {};
 	if (result.writeProject) {
 		try {
-			writeProjectAgentOverrides(session.projectRoot.root, plan.overrides);
+			writeProjectSettings(session.projectRoot.root, { overrides: plan.overrides, ...(mainAfter !== undefined ? { main: mainAfter } : {}) });
 			messages.push(`project: ${getProjectSettingsPath(session.projectRoot.root)}`);
+			if (mainChanged) messages.push("main: defaultProvider/defaultModel/defaultThinkingLevel (next pi start)");
 		} catch (e) {
 			return { ok: false, message: e instanceof Error ? e.message : String(e) };
 		}
 	}
 	if (result.writeProfile) {
 		try {
-			const written = writeProfile(getProfilePath(result.profileName, agentDir), plan.overrides);
+			const written = writeProfile(getProfilePath(result.profileName, agentDir), snapshot, mainAfter);
 			messages.push(`profile: ${written.file}`);
 			if (written.strippedModelFalse.length > 0) {
 				messages.push(
@@ -476,7 +634,8 @@ export function commitSave(
 	//  与是否真超 `maxThinking` 无关（会误报）。来源与保存屏一致：`MatrixRowView.overCeiling`。
 	if (overCeilingAgents.length > 0) messages.push(`⚠ thinking above maxThinking for: ${overCeilingAgents.join(", ")} (rejected at run time)`);
 	if (warnings.length > 0) messages.push(`${warnings.length} notice(s) shown before saving`);
-	messages.push("verify with /subagents-models <agent>");
+	if (agentChanged) messages.push("verify with /subagents-models <agent>");
+	if (mainChanged) messages.push("verify by starting pi again in this project");
 	return { ok: true, message: messages.join("; ") };
 }
 
@@ -489,8 +648,17 @@ export function refreshViews(
 ): MatrixRowView[] {
 	const byName = new Map<string, UpstreamAgent>();
 	for (const agent of discovery.baselineAgents ?? []) byName.set(agent.name, agent);
+	// ⚠️ 行归属**只能按 kind**：main 虚拟行与真agent 行可能同名（`buildSession` 是导出 API，
+	// 调用方可直接构造 `{agents:["main"]}`），按 name 找会让两行都命中虚拟行，
+	// 然后 `buildPlan` 把两行一起滤出 `planRebuild` ⇒ 同名 agent 的项目条目变成无主条目被删。
+	const mainEntry = session.rows.find((row) => (row.draft.kind ?? "agent") === "main");
+	const agentRows = new Map<string, RowEntry>();
+	for (const row of session.rows) {
+		if ((row.draft.kind ?? "agent") === "main") continue;
+		agentRows.set(row.name, row);
+	}
 	return views.map((view) => {
-		const entry = session.rows.find((row) => row.name === view.name);
+		const entry = isMainView(view) ? mainEntry : agentRows.get(view.name);
 		if (!entry) return view;
 		return refreshRowView(view, entry, sources, byName.get(view.name));
 	});
@@ -569,7 +737,7 @@ async function runCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, from: 
 	const views = buildRowViews(session.rows, discovery, sources);
 
 	if (!ctx.hasUI) {
-		emit(pi, ctx, summaryLines(ctx, session, views).join("\n"), "info");
+		emit(pi, ctx, summaryLines(ctx, session, views, from).join("\n"), "info");
 		return;
 	}
 
@@ -612,7 +780,7 @@ async function runCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, from: 
 				},
 				onEditJson: async (row) => editRowInExternalEditor(pi, tui, ctx, row),
 				planSave: (rows) => {
-					const { plan, warnings } = buildPlan(session, rows);
+					const { plan, warnings } = buildPlan(session, rows, { registry: sources.registry, models: sources.models });
 					return { plan, warnings, overCeilingAgents: rows.filter((row) => row.overCeiling).map((row) => row.name) };
 				},
 				onSave: async (result, plan, warnings) => {
@@ -624,6 +792,7 @@ async function runCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, from: 
 						agentDir,
 						detection.module,
 						matrix.currentViews().filter((row) => row.overCeiling).map((row) => row.name),
+						matrix.currentViews(),
 					);
 					if (!outcome.ok) emit(pi, ctx, outcome.message, "error");
 					return outcome;
@@ -644,7 +813,9 @@ function collectDetection(module: UpstreamModule | undefined, cwd: string, provi
  * `e` = 外部编辑器（§3.7 的 A/B 两段由 `runExternalEditorRound` 承担）。
  *
  * 编辑的是**整条将写入的条目**（`entryForEditor`）；回填时 `model` / `thinking` 同步
- * 进草稿并标 `touched`（矩阵与 `e` 是同一份数据的两个视图）。
+ * 进草稿并标 `touched`（矩阵与 `e` 是同一份数据的两个视图）。main 行编辑的是
+ * 3 条真实键（`mainEntryForEditor` + 专属注释头），回填走 `applyMainEditedEntry`
+ * （矩阵侧分支，§16.3.4）。
  * 校验结果**只当警告**带回去（保存屏汇总），非法值 / 解析失败都不会被静默改写。
  */
 async function editRowInExternalEditor(
@@ -660,15 +831,22 @@ async function editRowInExternalEditor(
 		emit(pi, ctx, `Cannot resolve the external editor: ${e instanceof Error ? e.message : String(e)}`, "error");
 		return undefined;
 	}
+	// ⚠️ 只按 kind 判，不拿 `row.name === MAIN_ROW_NAME` 兜底（与 `isMainView` / `isMainRow`
+	//   同口径）：虚拟行与真agent 行可能同名，按名字判会用 main 头打开一个 agent 行的编辑器，
+	//   而回填侧按 kind 走 `applyEditedEntry` ⇒ 该行字段被错清空。
+	const main = (row.kind ?? row.draft.kind ?? "agent") === "main";
 	for (;;) {
-		const result = await runExternalEditorRound(tui, { command, content: editorContent(entryForEditor(row), row.name), fileName: "entry.jsonc" });
+		// main 行同样走 reset 冻结后的基底（与 agent 行的 `entryForEditor` = `rowMaterialize` 同口径）：
+		// 按过 `r` 后 `e` 看到的是全局层的值，而不是 reset 前的合并基底。
+		const content = main ? mainEditorContent(row) : editorContent(entryForEditor(row), row.name);
+		const result = await runExternalEditorRound(tui, { command, content, fileName: "entry.jsonc" });
 		if (result.status === "failed" || result.content === undefined) return undefined;
 		const parsed = parseEditedContent(result.content);
 		if (!parsed.ok) {
 			emit(pi, ctx, `Invalid JSON: ${parsed.error}`, "error");
 			continue;
 		}
-		const review = reviewEditedJson(row.name, parsed.value);
+		const review = main ? reviewMainEditedJson(parsed.value) : reviewEditedJson(row.name, parsed.value);
 		if (!review.accepted) {
 			// 只可能是“顶层不是对象”——那种形状存不进 agentOverrides，必须重编
 			for (const error of review.errors) emit(pi, ctx, error, "error");

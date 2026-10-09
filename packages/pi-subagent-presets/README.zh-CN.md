@@ -4,7 +4,7 @@
 
 按**项目**一次性批量配置 [pi-subagents](https://github.com/nicobailon/pi-subagents) 各 agent 的 `model` 与 `thinking`，并把结果导出为可复用的全局 profile 模板。
 
-- **一条命令**：`/subagent-presets` 打开「agent × (model, thinking)」矩阵，一次保存就写出项目级 `subagents.agentOverrides`
+- **一条命令**：`/subagent-presets` 打开「agent × (model, thinking)」矩阵（另有一行虚拟 `main` 行管主会话自己的默认值），一次保存就写出项目级 `subagents.agentOverrides` 与顶层 `defaultProvider` / `defaultModel` / `defaultThinkingLevel`
 - **逐字段合并，而不是覆盖**：全局的 `tools` / `skills` / `acceptanceRole` / `machine` … 会被搬进项目条目，所以新增项目条目**不会**让你在全局配过的字段悄悄消失
 - **所见即所得**：`model` / `thinking` 两列显示的是**将会真正生效的值**，不是当前文件里的字面值
 - **模板可复用**：保存时可同步导出一份全局 profile 到 `~/.pi/agent/profiles/pi-subagents/`，与官方 `/subagents-profiles`、`/subagents-load-profile` 天然互通
@@ -36,8 +36,8 @@ pi -e ./packages/pi-subagent-presets
 ## 用法
 
 ```text
-/subagent-presets                 # 基底 = 项目现有条目 ?? default profile
-/subagent-presets --from work     # 基底 = work 这个 profile（加载指定配置）
+/subagent-presets                 # 基底 = 仅项目现有条目
+/subagent-presets --from work     # 基底 = work 这个 profile，并与全局层合并（--from 整体替换基底）
 ```
 
 | 键 | 动作 |
@@ -45,7 +45,7 @@ pi -e ./packages/pi-subagent-presets
 | `↑` `↓` | 移动选中行 |
 | `enter` | 打开模型选择器（搜索框内联在列表上方，光标常驻、输字即过滤） |
 | `shift+tab` | 环形切换 thinking 档位（该行没有 model 时用 pi 默认全 7 档） |
-| `r` | reset：该 agent 不写项目条目（状态变 `GLOBAL`）；改任一字段后改成“按新内容写” |
+| `r` | reset：该 agent 不写项目条目（状态变 `GLOBAL`）；改任一字段后改成“按新内容写”。在 `main` 行上按 `r` 会一次性删掉顶层三个键 |
 | `e` | 用 `$EDITOR` 编辑**整条将写入的条目**（含 model / thinking；校验只警告） |
 | `S` | 保存 |
 | `esc` | 退出（有未保存改动时二次确认） |
@@ -115,7 +115,7 @@ pi -e ./packages/pi-subagent-presets
 这正是手写项目条目会丢配置的原因。本扩展的解法是把**合并结果**写进去：
 
 ```text
-① 基底   = --from 指定的 profile  |  项目现有条目 ?? default profile（纯命令时）
+① 基底   = --from 指定的 profile  |  项目现有条目（纯命令不再回落 default profile）
 ② 全局   = ~/.pi/agent/settings.json（恒参与）
 ③ frontmatter 的 model + thinking（只用于显示，绝不写盘）
 
@@ -124,11 +124,27 @@ pi -e ./packages/pi-subagent-presets
 
 由于写进项目条目的每个字段都会成为最终值，最终解析结果与「跟随全局」**逐字段完全相等**。没动过的行**不写**，所以它们继续跟随全局。
 
+`default` profile 只有在显式 `--from default` 时才会被使用。不带 `--from` 时，没有项目条目的行显示真正的空白（运行期回落到全局层），也不会被写入。
+
+`--from <name>` 会把模板直接铺下去：矩阵显示的是模板与全局层合并后的值，即使一个字不改，直接按 `S` 也会写进项目。底部 `● unsaved changes` 是唯一的生效性提示——它亮着表示显示的值还没落盘；它不出现时，所见即磁盘上的内容。
+
 ### 固化的代价
 
 合并结果一旦写进项目文件，就不再跟随全局配置：之后对 `~/.pi/agent/settings.json` 的修改不会再影响该项目。保存屏会逐行列出「正在被钉住的字段」，让你按行决定。
 
 对**自定义** agent 尤其要留意：这类 agent 本来就会逐字段合并、跟着全局走，但写入项目后同样拿到一份快照，从此不再跟随全局。
+
+## `main` 行
+
+矩阵首行 `main` 是**主 agent**（跑你当前会话的那个模型）的虚拟行。它改的是项目 settings 的三个顶层键——`defaultProvider` / `defaultModel` / `defaultThinkingLevel`，绝不进 `subagents.agentOverrides`。
+
+- `defaultModel` 存的是**裸 id**（id 自身可含斜杠，如 `opencode/exo-free`）；同时配了 provider 时矩阵显示 `provider/model`。在 UI 里选模型一定成对写入，两个键天然一致；在 `e` 里手改则不做任何配对校验——写劈了是你自己的行为，插件不干涉。
+- 在这一行按 `r` 会一次性删掉项目层的三个键（回落到全局层），没有半删。
+- `e` 打开的恰好就是这三个真实键，所见即落盘。
+- 两条运行期事实：**未 trust** 的项目会整个忽略项目层 settings，所以这三个默认值在那里不生效；它们只对**下次 pi 启动**生效——用 `pi --session` 恢复旧会话时，沿用那个会话记录的模型。
+- pi 会静默忽略用不了的默认值：`defaultModel` 不在模型 registry 里、或 `defaultProvider` 没有配凭证时，静默回落到自动选模型，不报任何错。保存屏会对这两种情况给出警告，但不阻止保存。
+
+profile 把这三个键放在**顶层**（与 `subagents` 并列，绝不在里面——`subagents` 里的 `defaultProvider` 是上游的裸 id 消歧键，同名不同义）。`--from` 会读入它们，保存时会导出它们。
 
 ## 软依赖
 
@@ -170,11 +186,20 @@ pi -e ./packages/pi-subagent-presets
 profile 位于 `~/.pi/agent/profiles/pi-subagents/<name>.json`，与官方工具同一目录。格式：
 
 ```json
-{ "subagents": { "agentOverrides": { "reviewer": { "model": "p/m", "thinking": "high" } } } }
+{
+  "subagents": { "agentOverrides": { "reviewer": { "model": "p/m", "thinking": "high" } } },
+  "defaultProvider": "p",
+  "defaultModel": "m",
+  "defaultThinkingLevel": "high"
+}
 ```
 
 - 名字必须匹配 `^[A-Za-z0-9][A-Za-z0-9._-]*$`；尾部 `.json` 会被剥掉
-- **模板不含顶层 `subagents` 键**（`defaultModel` / `defaultThinking` / `maxThinking` …）。它们不会被 agent 条目遮蔽，所以不导出——新项目里请自行配置
+- **profile 导出的是整张矩阵快照，不是"这次会写的行"**：项目侧只写需要写的（未改动
+  的行不进项目文件），profile 侧则导出矩阵里看到的**全部托管 agent**（含一个改动都没有
+  的行），因为它是"下个项目 `--from` 铺开用的模板"。两者口径故意不同。
+- 模板顶层可带 `main` 行的三个键（`defaultProvider` / `defaultModel` / `defaultThinkingLevel`，都是可选）。它们绝不放在 `subagents` 里面——那里的 `defaultProvider` 是上游的裸 id 消歧键，同名不同义。其余顶层 `subagents` 键（`defaultModel` / `defaultThinking` / `maxThinking` …）**不导出**——新项目里请自行配置
+- `--from <name>` 把 agent 条目**和**顶层三个键一起作为新基底（再与全局层合并）；保存时两者都写回（agent 条目进 `subagents.agentOverrides`，三键写 settings 顶层）。`default` profile 只有显式 `--from default` 时才会被使用
 - 导出前逐字段校验。`model: false` 在项目 settings 侧合法但**在 profile 侧非法**，所以会被剔除并提示；条目变空则整条不导出
 - 读入 profile 时跑同一套校验器；非法即红条并拒绝合并
 
@@ -200,9 +225,9 @@ profile 位于 `~/.pi/agent/profiles/pi-subagents/<name>.json`，与官方工具
 
 - `state` 列只有 `GLOBAL` / `MERGE` / `OVERRIDE`：它由**将要写入对象的逐字段来源**实时计算。`项目条存在 + state === GLOBAL` ⇒ 该条对最终结果零贡献 ⇒ **保存时删除它**（`r` 的作用点）
 - **两种“禁用”行为不同**：合并结果里有 `disabled: true`（你自己配的）⇒ 可编辑，改成 `false` 即启用；四桶里有但合并结果里没有 ⇒ 行为与“上游已无”完全一致（不可编辑、不写盘），仅标记不同
-- 写入**只替换 `subagents.agentOverrides`**。`settings.json` 的其余内容键集合与值相等；JSON 格式（缩进、键序、行尾）会被规范化
+- 写入**只替换 `subagents.agentOverrides` 与顶层 `main` 三键**（`defaultProvider` / `defaultModel` / `defaultThinkingLevel`）。`settings.json` 的其余内容键集合与值相等；JSON 格式（缩进、键序、行尾）会被规范化
 - 写入后**无需 `/reload`**：discovery 缓存指纹包含两个 settings 文件的 `size:mtimeMs`，下次 launch 自动重建；上游可用时我们还会调一次 `clearAgentDiscoveryCache`
-- 用上游的 `/subagents-models <agent>` 复核结果
+- 用上游的 `/subagents-models <agent>` 复核 agent 结果；`main` 的改动请在这个项目里重新启动一次 pi 来验证
 - 项目配置目录名不硬编码：由 pi 的 `CONFIG_DIR_NAME` 解析（pi-subagents 也从自己的 `package.json` 解析同名）
 - 项目根在上游可用时跟随 pi-subagents 的 `findConfiguredProjectRoot`（含 `.agents` 目录候选、home 截断、`projectRootResolution` 策略）；上游不可用时用 `ctx.cwd`，并提示该文件可能不被上游读取
 
