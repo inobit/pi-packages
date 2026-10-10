@@ -55,7 +55,8 @@ export class SaveDialog extends Container implements Focusable {
 	private phase: Phase = "targets";
 	private focus: SaveFocus = "project";
 	private writeProject = true;
-	private writeProfile = true;
+	// profile 默认**不勾选**：导出是独立目的，用户需要时手动 space 勾上
+	private writeProfile = false;
 	private profileName: string;
 	private pendingReasons: string[] = [];
 	/** 焦点/校验的即时提示（“两个目标都没勾” / “名字不合法”）。 */
@@ -125,7 +126,7 @@ export class SaveDialog extends Container implements Focusable {
 		lines.push(t.bold("Save?"));
 		lines.push("");
 		lines.push(`${this.mark("project")} ${this.writeProject ? "[x]" : "[ ]"} project  ${this.opts.projectPath}`);
-		lines.push(`${this.mark("profile")} ${this.writeProfile ? "[x]" : "[ ]"} profile  ${this.opts.profilePath}${this.profileExistsHint()}`);
+		lines.push(`${this.mark("profile")} ${this.writeProfile ? "[x]" : "[ ]"} profile  ${this.currentProfilePath()}${this.profileExistsHint()}`);
 		// profile 语义（§16.8）：导出的是**整张矩阵快照**，不是“这次会写的行”。
 		// 勾选时始终说明一次，避免“只改一行 ⇒ profile 被整张覆盖”的意外。
 		if (this.writeProfile) {
@@ -147,13 +148,23 @@ export class SaveDialog extends Container implements Focusable {
 			lines.push(this.focus === "name" ? t.fg("accent", `${nameText}▏`) : t.fg("muted", nameText));
 		}
 		if (this.statusHint) lines.push(t.fg("warning", this.statusHint));
-		lines.push(t.fg("dim", "space toggle   ↑↓ move   enter confirm   esc cancel"));
+		// name 输入框里 esc 是退回（不是取消），footer 按焦点区分，避免误导
+		lines.push(t.fg("dim", this.focus === "name" ? "type to edit name   ↑↓ move   enter confirm   esc back" : "space toggle   ↑↓ move   enter confirm   esc cancel"));
 		return lines;
 	}
 
 	/** 焦点标记 `→`（只在 targets 阶段用）。 */
 	private mark(where: SaveFocus): string {
 		return this.phase === "targets" && this.focus === where ? "→" : " ";
+	}
+
+	/** 当前输入名字对应的 profile 路径（目录沿用默认路径，文件名随输入实时变）。 */
+	private currentProfilePath(): string {
+		const full = this.opts.profilePath;
+		const idx = Math.max(full.lastIndexOf("/"), full.lastIndexOf("\\"));
+		const dir = idx >= 0 ? full.slice(0, idx) : ".";
+		const name = normalizeProfileName(this.profileName);
+		return name ? `${dir}/${name}.json` : `${dir}/`;
 	}
 
 	private profileExistsHint(): string {
@@ -171,7 +182,7 @@ export class SaveDialog extends Container implements Focusable {
 		lines.push("");
 		for (const line of this.bodyLines(t)) lines.push(line);
 		lines.push("");
-		lines.push(t.fg("dim", "enter confirm   esc cancel"));
+		lines.push(t.fg("dim", "enter confirm   esc back"));
 		return lines;
 	}
 
@@ -266,15 +277,24 @@ export class SaveDialog extends Container implements Focusable {
 		if (this.phase === "name") {
 			if (data === KEY_ENTER) {
 				const name = normalizeProfileName(this.profileName);
+				// 非法名只留在这屏（错误行已标红），不直接取消整个保存屏
 				if (!isSafeProfileName(name) || !name) {
-					this.opts.onCancel();
+					this.invalidate();
 					return;
 				}
 				this.profileName = name;
 				this.enterTargets();
 				return;
 			}
-			if (data === KEY_ESC || data === KEY_CTRL_C) {
+			// esc 回 targets（可取消勾选 / 继续改名），只有 ctrl+c 才整体取消
+			if (data === KEY_ESC) {
+				this.phase = "targets";
+				this.focus = this.writeProfile ? "name" : "profile";
+				this.statusHint = "";
+				this.invalidate();
+				return;
+			}
+			if (data === KEY_CTRL_C) {
 				this.opts.onCancel();
 				return;
 			}
@@ -293,6 +313,15 @@ export class SaveDialog extends Container implements Focusable {
 		// ⚠️ 焦点在 profile name 输入框时，必须**先当文本处理**：j/k 已被用户绑成
 		// 导航键，若先判导航就会把 `j`/`k` 吞掉（打不进名字）。输入框里 j/k 是字符。
 		if (this.focus === "name") {
+			// 输入框里 ↑↓ 照样挪焦点（j/k 仍是字符，见下），否则一旦进来就再也出不去
+			if (data === KEY_UP) {
+				this.moveFocus(-1);
+				return;
+			}
+			if (data === KEY_DOWN) {
+				this.moveFocus(1);
+				return;
+			}
 			if (data === KEY_ENTER) {
 				const name = normalizeProfileName(this.profileName);
 				if (!isSafeProfileName(name) || !name) {
@@ -304,7 +333,14 @@ export class SaveDialog extends Container implements Focusable {
 				this.enterTargets();
 				return;
 			}
-			if (data === KEY_ESC || data === KEY_CTRL_C) {
+			// esc 只退出名字编辑（焦点退到 profile），再按一次 esc 才取消保存屏
+			if (data === KEY_ESC) {
+				this.focus = "profile";
+				this.statusHint = "";
+				this.invalidate();
+				return;
+			}
+			if (data === KEY_CTRL_C) {
 				this.opts.onCancel();
 				return;
 			}

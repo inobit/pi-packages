@@ -839,9 +839,10 @@ describe("SaveDialog（§6.5）", () => {
 
 	it("profile name 是真的可编辑（v1 只画了假光标，任何键都进不了编辑）", () => {
 		const { d } = dialog();
-		// 默认焦点在 project
-		d.handleInput(KEY_DOWN);
-		d.handleInput(KEY_DOWN);
+		// 默认焦点在 project；profile 默认不勾选，先勾上才会出现 name 输入框
+		d.handleInput(KEY_DOWN); // → profile
+		d.handleInput(" "); // 勾上 profile
+		d.handleInput(KEY_DOWN); // → name
 		expect(d.render(100).join("\n")).toContain("default▏"); // 焦点到 name ⇒ 光标在名字后
 		d.handleInput("x");
 		expect(d.render(100).join("\n")).toContain("defaultx");
@@ -852,8 +853,9 @@ describe("SaveDialog（§6.5）", () => {
 	it("回归：焦点在 name 输入框时 j/k 是**字符**而不是导航", () => {
 		// 用户把 j/k 绑到了 tui.select.up/down（keybindings.json）；输入框里必须能打进去。
 		const { d } = dialog();
-		d.handleInput(KEY_DOWN);
-		d.handleInput(KEY_DOWN);
+		d.handleInput(KEY_DOWN); // → profile
+		d.handleInput(" "); // 勾上 profile（默认不勾选）
+		d.handleInput(KEY_DOWN); // → name
 		d.handleInput("j");
 		d.handleInput("k");
 		expect(d.render(100).join("\n")).toContain("defaultjk");
@@ -861,9 +863,8 @@ describe("SaveDialog（§6.5）", () => {
 
 	it("两个目标都未勾选时按 Enter ⇒ 明确提示，不静默无反应", () => {
 		const { d } = dialog();
+		// profile 默认就不勾选，只需取消 project 即达“两个都没勾”
 		d.handleInput(" "); // 取消 project
-		d.handleInput(KEY_DOWN);
-		d.handleInput(" "); // 取消 profile
 		d.handleInput(KEY_ENTER);
 		expect(d.render(100).join("\n")).toMatch(/nothing would be written|Neither target is checked/);
 	});
@@ -924,10 +925,16 @@ describe("SaveDialog（§6.5）", () => {
 		expect(out).toContain("still takes effect");
 	});
 
-	it("无确认项时 enter 直接落盘", () => {
+	it("无确认项时 enter 直接落盘（profile 默认不勾选，只写项目）", () => {
 		const { d, onConfirm } = dialog();
 		d.handleInput(KEY_ENTER);
-		expect(onConfirm).toHaveBeenCalledWith({ writeProject: true, writeProfile: true, profileName: "default" });
+		expect(onConfirm).toHaveBeenCalledWith({ writeProject: true, writeProfile: false, profileName: "default" });
+	});
+
+	it("profile 默认不勾选：首屏即 `[ ] profile`，name 输入框也不出现", () => {
+		const out = dialog().d.render(120).join("\n");
+		expect(out).toContain("[ ] profile");
+		expect(out).not.toContain("profile name:");
 	});
 
 	it("esc 取消", () => {
@@ -938,9 +945,54 @@ describe("SaveDialog（§6.5）", () => {
 
 	it("profile 名非法 ⇒ 进 name 模式重新输入", () => {
 		const { d, onConfirm } = dialog({ defaultProfileName: "../escape" });
+		d.handleInput(KEY_DOWN); // → profile
+		d.handleInput(" "); // 勾上 profile（默认不勾选；不勾时名字根本不校验）
 		d.handleInput(KEY_ENTER);
 		expect(onConfirm).not.toHaveBeenCalled();
 		expect(d.render(120).join("\n")).toContain("invalid profile name");
+	});
+
+	it("改名后 profile 路径行同步变化（目录沿用默认，文件名跟输入走）", () => {
+		const { d } = dialog();
+		d.handleInput(KEY_DOWN); // → profile
+		d.handleInput(" "); // 勾上
+		d.handleInput(KEY_DOWN); // → name
+		d.handleInput("x");
+		const out = d.render(120).join("\n");
+		expect(out).toContain("defaultx.json");
+		expect(out).not.toContain("default.json  (overwrite)");
+	});
+
+	it("name 输入框里 ↑↓ 照样挪焦点（不再卡死），esc 只退回 profile 不取消", () => {
+		const { d, onCancel } = dialog();
+		d.handleInput(KEY_DOWN);
+		d.handleInput(" ");
+		d.handleInput(KEY_DOWN); // → name
+		d.handleInput(KEY_UP); // 回到 profile（以前 ↑ 被当文本吞掉，永远出不来）
+		d.handleInput(KEY_ESC); // 焦点不在 name ⇒ 取消保存屏
+		expect(onCancel).toHaveBeenCalledTimes(1);
+		// 另一条路：name 里直接 esc ⇒ 退到 profile，保存屏还在
+		const second = dialog();
+		second.d.handleInput(KEY_DOWN);
+		second.d.handleInput(" ");
+		second.d.handleInput(KEY_DOWN); // → name
+		second.d.handleInput(KEY_ESC);
+		expect(second.onCancel).not.toHaveBeenCalled();
+		expect(second.d.render(120).join("\n")).toContain("Save?");
+	});
+
+	it("name 阶段 esc 回 targets（不直接取消）；非法名 enter 留屏不取消", () => {
+		const { d, onConfirm, onCancel } = dialog({ defaultProfileName: "../escape" });
+		d.handleInput(KEY_DOWN);
+		d.handleInput(" ");
+		d.handleInput(KEY_ENTER); // 非法名 ⇒ 进 name 阶段
+		expect(onConfirm).not.toHaveBeenCalled();
+		d.handleInput(KEY_ENTER); // 非法名直接 enter ⇒ 留屏（错误行标红），不取消
+		expect(onCancel).not.toHaveBeenCalled();
+		expect(d.render(120).join("\n")).toContain("invalid profile name");
+		d.handleInput(KEY_ESC); // 回 targets，可取消勾选 / 继续改名
+		expect(onCancel).not.toHaveBeenCalled();
+		expect(d.render(120).join("\n")).toContain("esc back");
 	});
 
 	it("notices 不阻止写入（`e` 的校验警告也走这里）", () => {
@@ -1343,9 +1395,12 @@ describe("SaveDialog main 段（§16.3.3）", () => {
 
 	it("§16.8：勾选 profile 时始终说明导出的是整张矩阵快照（不自动取消勾选）", () => {
 		const { plan } = mainRow({ touchModel: "n", touchThinking: "high" });
-		const out = mainDialog(plan).d.render(120).join("\n");
+		const { d } = mainDialog(plan);
+		d.handleInput(KEY_DOWN); // → profile
+		d.handleInput(" "); // 手动勾上（profile 默认不勾选）
+		const out = d.render(120).join("\n");
 		expect(out).toContain("profile: full matrix snapshot (all managed agents), no agent entries changed in this save");
-		// 两个目标仍默认勾选
+		// project 默认勾选，profile 是手动勾上的
 		expect(out).toContain("[x] project");
 		expect(out).toContain("[x] profile");
 	});
@@ -1358,7 +1413,10 @@ describe("SaveDialog main 段（§16.3.3）", () => {
 			whitelist: [],
 		});
 		agentPlan.changed = [{ name: "worker", after: { model: "p/m" }, fields: [], isNew: true }];
-		const out = mainDialog(main, agentPlan).d.render(120).join("\n");
+		const { d } = mainDialog(main, agentPlan);
+		d.handleInput(KEY_DOWN); // → profile
+		d.handleInput(" "); // 手动勾上（profile 默认不勾选）
+		const out = d.render(120).join("\n");
 		expect(out).toContain("profile: full matrix snapshot (all managed agents)");
 		expect(out).not.toContain("only main defaults will be exported");
 	});

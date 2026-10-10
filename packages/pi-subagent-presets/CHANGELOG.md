@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.1] - 2026-10-10
+
+### Fixed
+
+- save dialog no longer checks the profile target by default (exporting is a separate purpose; check it with `space` when needed)
+- the profile path line now follows the name being typed (`<dir>/<name>.json`), instead of always showing the default path
+- the name field is escapable: `↑`/`↓` move focus out of it, `esc` steps back to the target list (press `esc` again to cancel), and an invalid name no longer cancels the whole dialog on `enter`/`esc`
+
 ## [0.2.0] - 2026-10-09
 
 ### Added
