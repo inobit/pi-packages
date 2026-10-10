@@ -18,12 +18,14 @@ import {
   classifySegment as classifyBashSegment,
   collectReadRefs as collectBashReadRefs,
   extractGit,
+  findShellNests,
+  STATIC_UNWRAP_MAX_DEPTH,
   type BashSegment,
   type ParsedCommand,
   type SegmentClassification,
   type SegmentTier,
 } from "./bash.ts";
-import { expandHome, realpathDeep, resolveCwdTarget } from "./path.ts";
+import { expandEnvRef, expandHome, realpathDeep, resolveCwdTarget } from "./path.ts";
 
 /** 规范化后的程序名集合：视为切换工作目录的命令（供决策层跟踪段间 cwd）。
  * push-location 有参时切目录、无参仅入栈；pop-location 弹栈目标不可静态跟踪。 */
@@ -133,6 +135,12 @@ const FIXED_DANGEROUS_PS: ReadonlySet<string> = new Set([
 
 /** 嵌套 shell 解释器：任何形态的调用都不可验证（-Command/-File/-EncodedCommand/交互式）。 */
 const SHELL_INTERPRETERS: ReadonlySet<string> = new Set(["powershell", "pwsh"]);
+
+/** 严重级固定规则（PS，§3.2）：远程执行/持久化中的不可逆项。
+ * `Set-ExecutionPolicy`/`sc` 不在此列（§3.2 定稿 chill 放行，留在 FIXED_DANGEROUS_PS）。 */
+const CRITICAL_FIXED_PS: ReadonlySet<string> = new Set([
+  "invoke-expression", "iex", "invoke-command", "icm",
+]);
 
 /** 内置写命令注册表：末位位置参数为写目标（cp/mv 语义）。 */
 const WRITE_LAST_ARG_PS: ReadonlySet<string> = new Set([
@@ -599,6 +607,14 @@ function stripStatementPrefix(tokens: string[]): { program: string; args: string
     return { program: "", args: [], dynamicCall };
   }
   const head = t[0]!;
+  // & "内层命令"（token 化后引号已去、但含空白）：含空白的程序名必然来自引号字面，重解内层 token，
+  // 便于 chill 看内层是否命中严重级（§2.3）；`& $cmd` 动态目标不含空白，保持不可验证
+  if (/\s/.test(head)) {
+    const inner = tokenizeSegmentPs(head);
+    if (!inner.error && inner.tokens.length > 0) {
+      return { program: normalizeProgram(inner.tokens[0]!), args: inner.tokens.slice(1), dynamicCall: false };
+    }
+  }
   return { program: normalizeProgram(head), args: t.slice(1), dynamicCall };
 }
 
@@ -607,11 +623,6 @@ export function normalizeProgram(head: string): string {
   const base = head.replace(/^.*[\\/]/, "");
   const stem = base.replace(/\.(exe|cmd|bat|com|ps1)$/i, "").toLowerCase();
   return ALIASES[stem] ?? stem;
-}
-
-/** 参数中的 $env:VAR 展开（无法解析时保留原文，后续按外部路径保守处理）。 */
-function expandEnvRef(token: string): string {
-  return token.replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/g, (_, name: string) => process.env[name] ?? `$env:${name}`);
 }
 
 /** 解析 PowerShell 命令为顶层命令段结构。产物形状与 parseBashCommand 一致。 */
@@ -663,6 +674,54 @@ export function parsePowerShellCommand(command: string): ParsedCommand {
  * 含 `-r` 短旗标与 `:$true` 绑定形态——保守方向宁可误报。 */
 const REMOVE_ITEM_RECURSE_FLAGS = /^-(recurse|r)(:.*)?$/i;
 
+/** Remove-Item 严重级黑名单条目（§3.2，镜像 §3.1 规则 1）：Windows 目录（`$env:SystemRoot`
+ * 展开，含 System32）。盘符根（任意盘符 `X:\`）由 `isDriveRoot` 覆盖，用户主目录
+ * （`~` / `$HOME` / `$env:USERPROFILE`）由 `os.homedir()` 覆盖，均不在此列。 */
+const REMOVE_ITEM_CRITICAL_PATHS: readonly string[] = ["$env:SystemRoot"];
+
+/** Windows 路径归一化：`\\` 与 `/` 统一为 `/`、转小写（NTFS 大小写不敏感）、去尾分隔符、`//` 压成 `/`。 */
+function normalizeWinTarget(p: string): string {
+  return p.replace(/\\/g, "/").replace(/\/{2,}/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+/** 盘符根匹配：归一化后为单字母盘符形态（`c:`），只匹配精确盘符根（`C:\Users` 不算）。 */
+function isDriveRoot(p: string): boolean {
+  return /^[a-z]:$/.test(p);
+}
+
+/** 命中 Remove-Item 黑名单：大小写不敏感、`\` `/` 归一、去尾分隔符；等于条目或「条目 + `/`」前缀。
+ * `$env:` 先展开、`~`/`$HOME` 后展开（两层归一，覆盖 `~\$env:SystemRoot` 复合写法）；
+ * 用户主目录与 Windows 目录按宿主实际值（`os.homedir()` / `SystemRoot`，缺省回退 `C:\Windows`）比较。 */
+function hitsRemoveItemBlacklist(target: string): boolean {
+  const t = normalizeWinTarget(expandHome(expandEnvRef(target), os.homedir()));
+  if (isDriveRoot(t)) return true; // 任意盘符根（X:\）
+  const candidates = [
+    normalizeWinTarget(os.homedir()),
+    normalizeWinTarget(expandEnvRef("$env:SystemRoot")),
+    normalizeWinTarget(process.env.SystemRoot ?? "C:\\Windows"),
+    // `$env:USERPROFILE`/`$env:HOMEPATH` 未定义（非 Windows 宿主）时退化为字面量：
+    // 用户主目录黑名单跨宿主靠 `os.homedir()` 兜底，变量缺失不得削弱该覆盖
+    normalizeWinTarget(expandEnvRef("$env:USERPROFILE")),
+    normalizeWinTarget(expandEnvRef("$env:HOMEPATH")),
+  ];
+  for (const e of candidates) {
+    if (e !== "" && (t === e || t.startsWith(`${e}/`))) return true;
+  }
+  return REMOVE_ITEM_CRITICAL_PATHS.some((raw) => {
+    const e = normalizeWinTarget(expandEnvRef(raw));
+    if (e === "" || isDriveRoot(e)) return false; // 盘符根已由 isDriveRoot 覆盖
+    return t === e || t.startsWith(`${e}/`);
+  });
+}
+
+/** Remove-Item 收窄严重级谓词（§3.2，chill 唯一 ask 来源之一）：裸通配（不要求 `-Recurse`），
+ * 或 `-Recurse` + 黑名单（盘符根 / `C:\Windows` / 用户主目录）命中 → critical；非递归单文件一律放行。 */
+function removeItemCriticalChill(recursive: boolean, targets: readonly string[]): boolean {
+  // 裸通配先于递归门判定：无 -Recurse 的通配删除同样 critical（镜像 §3.1 规则 1）
+  if (targets.some((t) => /[*?]/.test(t))) return true;
+  return recursive && targets.some((t) => hitsRemoveItemBlacklist(t));
+}
+
 /** 单段效果分类：R/W/X 三档 + 危险叠加。未知 cmdlet 一律 X（fail-closed）；原生 exe 回退 bash 分类。 */
 export function classifyPowerShellSegment(
   segment: BashSegment,
@@ -674,25 +733,35 @@ export function classifyPowerShellSegment(
   // ---- 空段：纯重定向（如 `> foo`）效果可枚举 → W ----
   if (program === "") {
     const writes = collectWriteTargetsPs(segment);
-    return { tier: writes.length > 0 ? "W" : "R", danger: false, id: "" };
+    return { tier: writes.length > 0 ? "W" : "R", danger: false, critical: false, criticalChill: false, id: "" };
   }
 
   // ---- 危险叠加（凌驾档位）----
-  // wrapper：嵌套解释器 / 调用操作符 / 点源 / 脚本块（解析期已标记）
-  if (segment.wrapper) return { tier: "X", danger: true, id };
-  // 固定危险清单（不可配置）
-  if (FIXED_DANGEROUS_PS.has(program)) return { tier: "X", danger: true, id };
-  // Remove-Item 递归 / glob 目标（镜像 bash rm：裸 -Force 走正常链）
+  // wrapper：嵌套解释器（严重级）/ 调用操作符 / 点源 / 脚本块（标准危险，解析期已标记）
+  // 远程执行原语（iex/icm）即使带脚本块也保持严重级：wrapper 早返不得吞掉固定严重规则
+  if (segment.wrapper) {
+    return { tier: "X", danger: true, critical: SHELL_INTERPRETERS.has(program) || CRITICAL_FIXED_PS.has(program), criticalChill: false, id };
+  }
+  // 固定危险清单（不可配置）；其中远程执行原语为严重级
+  if (FIXED_DANGEROUS_PS.has(program)) {
+    return { tier: "X", danger: true, critical: CRITICAL_FIXED_PS.has(program), criticalChill: false, id };
+  }
+  // Remove-Item 递归 / glob 目标（镜像 bash rm：裸 -Force 走正常链）→ 宽口径 danger；
+  // 严重级走收窄黑名单谓词（criticalChill）：`-Recurse`/裸通配 + 盘符根/Windows 目录/主目录命中
   if (program === "remove-item") {
     const targets = collectWriteTargetsPs(segment);
     const recursive = segment.args.some((a) => REMOVE_ITEM_RECURSE_FLAGS.test(a));
-    if (recursive || targets.some((t) => /[*?]/.test(t))) return { tier: "X", danger: true, id };
+    if (recursive || targets.some((t) => /[*?]/.test(t))) {
+      return { tier: "X", danger: true, critical: true, criticalChill: removeItemCriticalChill(recursive, targets), id };
+    }
   }
   // 二义性下载器（curl/wget 在 PS 5.1 是 Invoke-WebRequest 别名、PS 7 是真 exe）→ 不精确分类，X 兜底
-  if (program === "curl" || program === "wget") return { tier: "X", danger: false, id };
+  if (program === "curl" || program === "wget") return { tier: "X", danger: false, critical: false, criticalChill: false, id };
 
-  // 用户配置的危险清单（PS 命名空间）
-  if (listHasNormalized(config.dangerousPowerShellCommands, program)) return { tier: "X", danger: true, id };
+  // 用户配置的危险清单（PS 命名空间）；严重级清单命中 → chill 唯一 ask 来源之一
+  if (listHasNormalized(config.dangerousPowerShellCommands, program)) {
+    return { tier: "X", danger: true, critical: listHasNormalized(config.criticalPowerShellCommands, program), criticalChill: false, id };
+  }
 
   if (isCmdletish(program)) {
     // ---- cmdlet：查内置/配置白名单 ----
@@ -713,11 +782,11 @@ export function classifyPowerShellSegment(
       tier = collectWriteTargetsPs(segment).length > 0 ? "W" : "R";
     } else {
       // 未识别 cmdlet：不再假定只读（fail-closed）
-      return { tier: "X", danger: false, id };
+      return { tier: "X", danger: false, critical: false, criticalChill: false, id };
     }
     // 写目标含通配符 → 无法穷举 → 降级 X（与 bash 一致）
     if (tier === "W" && collectWriteTargetsPs(segment).some((t) => /[*?]/.test(t))) tier = "X";
-    return { tier, danger: false, id };
+    return { tier, danger: false, critical: false, criticalChill: false, id };
   }
 
   // ---- 原生 exe（git/node/npm 等）：跨 shell 行为一致，回退 bash 分类 ----
@@ -842,6 +911,50 @@ export function hasPipeToShellPs(segments: readonly BashSegment[]): boolean {
   return false;
 }
 
+/**
+ * PS 静态字面载荷展开（chill 处置层专用，§2.3）：`&` 调用符 / 点源 / `{}` 脚本块的内层字面、
+ * `$(...)` 子表达式字面、嵌套 pwsh/powershell 的 `-Command`/`-File` 字面（`-EncodedCommand` 不解码，直接放行）；
+ * 递归上限 2 层；脚本文件路径、变量/动态目标不深挖。
+ */
+export function staticLiteralUnwrapPs(segments: readonly BashSegment[]): BashSegment[] {
+  const out: BashSegment[] = [];
+  const visit = (seg: BashSegment, depth: number): void => {
+    if (depth >= STATIC_UNWRAP_MAX_DEPTH) return;
+    for (const inner of staticPayloadSegmentsPs(seg)) {
+      out.push(inner);
+      visit(inner, depth + 1);
+    }
+  };
+  for (const seg of segments) visit(seg, 0);
+  return out;
+}
+
+/** 单段 PS 静态字面载荷：重解后仅保留可解析的静态内层段。 */
+function staticPayloadSegmentsPs(seg: BashSegment): BashSegment[] {
+  const out: BashSegment[] = [];
+  const reparse = (text: string): void => {
+    const parsed = parsePowerShellCommand(text);
+    if (!parsed.parseError) out.push(...parsed.segments.filter((s) => s.program !== ""));
+  };
+  // `{}` 脚本块：取最外层花括号内的字面（块内 token 即参数，不再当程序位重解）
+  const raw = seg.raw.trim();
+  if (raw.startsWith("{") && raw.endsWith("}")) {
+    reparse(raw.slice(1, -1));
+    return out;
+  }
+  if (seg.wrapper) {
+    // 程序位本身是带空格的引号字面命令（`& "rm -rf /"` 形态，解析期已并入 program）
+    if (/\s/.test(seg.program)) reparse(seg.program);
+    // -Command/-File 的字面参数
+    for (const a of seg.args) {
+      if (!a.startsWith("-")) reparse(a);
+    }
+  }
+  // $(...) 子表达式 / 双引号插值内层
+  for (const nest of findShellNests(seg.raw)) reparse(nest.inner);
+  return out;
+}
+
 /** PowerShell 适配器：接入决策层的通用 shell 核心。 */
 export const POWERSHELL_ADAPTER = {
   id: "powershell",
@@ -850,6 +963,7 @@ export const POWERSHELL_ADAPTER = {
   readRefs: collectReadRefsPs,
   writeTargets: collectWriteTargetsPs,
   pipeToShell: hasPipeToShellPs,
+  staticUnwrap: staticLiteralUnwrapPs,
   /** 切目录跟踪（review C1）：push-location 无参仅入栈 cwd 不变；pop-location 弹栈目标
    * 不可静态跟踪 → 返回 undefined（后续相对路径保守按域外处理）。 */
   resolveCwdChange(program: string, args: readonly string[], current: string | undefined): string | undefined {

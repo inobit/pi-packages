@@ -3,7 +3,7 @@ import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { getAgentDir, loadConfig, type PermissionConfig } from "./config.ts";
+import { getAgentDir, loadConfig, normalizeDefaultMode, type PermissionConfig } from "./config.ts";
 import { decideBashRequest, decidePowerShellRequest, decideToolRequest, type Decision, type WorkMode } from "./decision.ts";
 import { BUILD_SWITCH_NOTICE, ModeStore, PLAN_SYSTEM_PROMPT, registerModeCommands, sessionKey, statusText, YOLO_SWITCH_NOTICE } from "./mode.ts";
 import { registerToolsCommand } from "./tools.ts";
@@ -18,16 +18,16 @@ function crossDomainParentKey(detail: string | undefined): string | undefined {
 }
 
 /** ask 批准的会话级记忆键（细粒度化：危险按 program、敏感按路径、跨域写按父目录；
- * FR-10 额外按模式隔离 —— build 的执行器批准不得泄漏到 plan 只读契约）。 */
+ * FR-4/FR-1 与 FR-10 同样按模式隔离 —— chill 批准不得免问 build 同程序，反之亦然）。 */
 function approvalKey(decision: Decision, toolName: string, detail: string | undefined, mode: string): string {
   const d = detail ?? toolName;
   switch (decision.rule) {
     case "FR-1":
-      return `sensitive:${d}`;
+      return `sensitive:${mode}:${d}`;
     case "FR-3":
       return `external-write:${crossDomainParentKey(d) ?? d}`;
     case "FR-4":
-      return `dangerous:${toolName}:${decision.approvalId ?? d}`;
+      return `dangerous:${mode}:${toolName}:${decision.approvalId ?? d}`;
     case "FR-10":
       // 键含工具名（review P2-2）：powershell 下批准的执行器不得免问 bash 同名 X 程序，反之亦然
       return `unverified:${toolName}:${mode}:${decision.approvalId ?? toolName}`;
@@ -68,6 +68,7 @@ export default function (pi: ExtensionAPI) {
   const configCache = new Map<string, PermissionConfig>();
   const modeStore = new ModeStore();
   // 上次 agent_start 时的模式（FR-8.4b）：plan→build 切换后首个 turn 注入一次 build 公告，常态 build 零注入
+  // （plan→chill 同样复用该公告做只读纠正）
   const lastAgentStartMode = new Map<string, WorkMode>();
   const confirmer: Confirmer = createConfirmer();
   // 会话级批准集合：`<sessionKey>:<approvalKey>`（FR-3/FR-8.3/NFR-5 的 s 语义）
@@ -132,6 +133,7 @@ export default function (pi: ExtensionAPI) {
   // plan/build 命令 + 切换快捷键；快捷键配置读取全局层（trusted=false 跳过项目配置，避免未信任项目影响全局键位）
   registerModeCommands(pi, modeStore, {
     toggleModeShortcut: getConfig(process.cwd(), false).toggleModeShortcut,
+    defaultMode: normalizeDefaultMode(getConfig(process.cwd(), false).defaultMode),
   });
 
   // /readonly-tools：UI 空格多选 readonly tools，session/project/global 三级，每层只改自己
@@ -151,7 +153,7 @@ export default function (pi: ExtensionAPI) {
     try {
       const key = sessionKey(ctx);
       const cfg = getEffectiveConfig(ctx.cwd, ctx.isProjectTrusted(), key);
-      const mode = modeStore.getMode(key);
+      const mode = modeStore.getMode(key, normalizeDefaultMode(cfg.defaultMode));
       const auditor = getAuditor(ctx.cwd, cfg);
 
       let decision: Decision;
@@ -185,7 +187,20 @@ export default function (pi: ExtensionAPI) {
         });
       }
 
-      if (decision.action === "allow") return undefined;
+      if (decision.action === "allow") {
+        // chill 放行审计（§6 定稿方案 b）：只落 debug 流（debugLog 门控，默认不可见），不扩 review 日志
+        if (mode === "chill") {
+          auditor.debug("chill-allow", {
+            mode,
+            toolName,
+            rule: decision.rule,
+            reason: decision.reason,
+            details: decision.details,
+            sessionId: key,
+          });
+        }
+        return undefined;
+      }
 
       // 拒绝反馈（给模型）：决策层 reason 自包含（类别+原因+改道）；用户拒绝（n 键）需携带「User declined」强停信号防变体重试
       const denyFeedback = (decision: Decision, opts: { userDeclined?: boolean } = {}): { block: true; reason: string; terminate: boolean } => {
@@ -266,7 +281,10 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", (event, ctx) => {
     try {
       const key = sessionKey(ctx);
-      const mode = modeStore.getMode(key);
+      const defaultMode = normalizeDefaultMode(getConfig(ctx.cwd, ctx.isProjectTrusted()).defaultMode);
+      const mode = modeStore.getMode(key, defaultMode);
+      // prev 只用于「本轮是否切出上一模式」的公告判定，恒回退 build（不能读 defaultMode，
+      // 否则默认 chill 的会话会永远注入 build 公告）
       const prev = lastAgentStartMode.get(key) ?? "build";
       lastAgentStartMode.set(key, mode);
       if (mode === "plan") {
@@ -275,6 +293,10 @@ export default function (pi: ExtensionAPI) {
       // yolo 仅切入首轮注入一次（首轮即 yolo 也算 build->yolo 的切入），驻留期零注入
       if (mode === "yolo" && prev !== "yolo") {
         return { systemPrompt: `${event.systemPrompt}\n\n${YOLO_SWITCH_NOTICE}` };
+      }
+      // chill 仅 plan→chill 切出只读时复用只读纠正公告；build/yolo→chill 零注入（不闲聊 chill 语义）
+      if (mode === "chill" && prev === "plan") {
+        return { systemPrompt: `${event.systemPrompt}\n\n${BUILD_SWITCH_NOTICE}` };
       }
       // 切回 build：plan->build 与 yolo->build 统一用同一句精简公告
       if (mode === "build" && prev !== "build") {
@@ -286,11 +308,12 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // 会话启动时初始化状态栏显示当前模式（默认 build，无需等 /plan 切换）
+  // 会话启动时初始化状态栏显示当前模式（默认取配置 defaultMode，无需等 /plan 切换）
   pi.on("session_start", (event, ctx) => {
     try {
       const key = sessionKey(ctx);
-      const mode = modeStore.getMode(key);
+      const defaultMode = normalizeDefaultMode(getConfig(ctx.cwd, ctx.isProjectTrusted()).defaultMode);
+      const mode = modeStore.getMode(key, defaultMode);
       ctx.ui.setStatus("pi-permission-mode", statusText(mode));
     } catch {
       // 状态栏初始化失败不影响主流程

@@ -201,6 +201,17 @@
     "add-type", "new-object", "import-module", "invoke-item", "invoke-wmimethod", "invoke-cimmethod",
     "start-job", "receive-job"
   ],
+  "criticalBashCommands": [
+    "dd", "mkfs", "mkfs.ext2", "mkfs.ext3", "mkfs.ext4", "mkfs.xfs",
+    "fdisk", "gdisk", "parted", "wipefs",
+    "shutdown", "reboot", "halt", "poweroff", "init"
+  ],
+  "criticalPowerShellCommands": [
+    "format-volume", "diskpart", "remove-computer",
+    "restart-computer", "stop-computer", "clear-eventlog"
+  ],
+  "chillSensitiveAction": "deny",
+  "defaultMode": "build",
   "trustedExternalPaths": [
     "/tmp"
   ],

@@ -1,7 +1,8 @@
+import os from "node:os";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { decidePowerShellRequest } from "../src/decision.ts";
-import { classifyPowerShellSegment, parsePowerShellCommand } from "../src/powershell.ts";
+import { classifyPowerShellSegment, parsePowerShellCommand, staticLiteralUnwrapPs } from "../src/powershell.ts";
 
 const cfg = DEFAULT_CONFIG;
 const psReq = (mode: "build" | "plan" | "yolo", command: string, cwd = "/proj") =>
@@ -232,5 +233,76 @@ describe("review 回归（C1/M1/M2/P2）", () => {
   it("P2-5: Rename-Item -NewName 参与写目标收集", () => {
     const seg = segOf("Rename-Item -Path old.txt -NewName D:\\outside\\new.txt");
     expect(collectTargets(seg)).toContain("D:\\outside\\new.txt");
+  });
+});
+
+describe("powershell 分类严重级（critical）粒度与共享谓词", () => {
+  it("Remove-Item 递归/通配 → danger+critical；裸删除不拦", () => {
+    expect(classOf("Remove-Item -Recurse C:\\tmp")).toMatchObject({ danger: true, critical: true });
+    expect(classOf("rm -r C:\\tmp")).toMatchObject({ danger: true, critical: true });
+    expect(classOf("Remove-Item C:\\tmp\\*")).toMatchObject({ danger: true, critical: true });
+    expect(classOf("Remove-Item C:\\tmp\\a.txt")).toMatchObject({ danger: false, critical: false });
+  });
+
+  it("Remove-Item 收窄严重级（criticalChill）：递归+黑名单（盘符根/Windows 目录/主目录）或裸通配 → true", () => {
+    const home = os.homedir();
+    const hits = [
+      "Remove-Item -Recurse C:\\",
+      "Remove-Item -Recurse D:\\",
+      "Remove-Item -Recurse C:\\Windows",
+      "Remove-Item -Recurse C:/WINDOWS/system32",
+      "Remove-Item -Recurse c:\\windows\\System32\\drivers",
+      "Remove-Item -Recurse $env:SystemRoot\\System32",
+      "Remove-Item -Recurse ~",
+      "Remove-Item -Recurse ~/",
+      "Remove-Item -Recurse $HOME",
+      `Remove-Item -Recurse ${home}`,
+      `Remove-Item -Recurse ${home}/docs`,
+      "Remove-Item -Recurse C:\\proj\\*.tmp",
+    ];
+    for (const cmd of hits) expect(classOf(cmd), cmd).toMatchObject({ danger: true, critical: true, criticalChill: true });
+    const allows = [
+      "Remove-Item -Recurse C:\\tmp",
+      "Remove-Item -Recurse C:\\Users\\bob\\proj",
+      "Remove-Item C:\\proj\\a.txt",
+      "Remove-Item C:\\Windows\\System32\\drivers\\etc\\hosts",
+      "rm C:\\proj\\a.txt",
+    ];
+    for (const cmd of allows) expect(classOf(cmd), cmd).toMatchObject({ criticalChill: false });
+    // 非黑名单递归仍宽口径 danger（build/plan 现状不动）
+    expect(classOf("Remove-Item -Recurse C:\\tmp")).toMatchObject({ tier: "X", danger: true, critical: true, criticalChill: false });
+    // 黑名单下非递归单文件不进 Remove-Item 早返链，落正常 W 链
+    expect(classOf("Remove-Item C:\\proj\\a.txt")).toMatchObject({ tier: "W", danger: false, critical: false });
+  });
+
+  it("远程执行原语 critical（含脚本块 wrapper 形态）；Set-ExecutionPolicy 与服务族仅 danger", () => {
+    expect(classOf("iex (Get-Content x.ps1 -Raw)")).toMatchObject({ danger: true, critical: true });
+    expect(classOf("Invoke-Expression 'Get-Date'")).toMatchObject({ danger: true, critical: true });
+    expect(classOf("Invoke-Command -ScriptBlock { Get-Date }")).toMatchObject({ danger: true, critical: true });
+    expect(classOf("icm -ScriptBlock { Get-Date }")).toMatchObject({ danger: true, critical: true });
+    expect(classOf("Set-ExecutionPolicy -ExecutionPolicy Bypass")).toMatchObject({ danger: true, critical: false });
+    expect(classOf("Stop-Service spooler")).toMatchObject({ danger: true, critical: false });
+  });
+
+  it("critical 清单 cmdlet 与嵌套解释器命中双标记；-EncodedCommand 不解码但嵌套解释器本身即 critical", () => {
+    expect(classOf("Format-Volume -DriveLetter D")).toMatchObject({ danger: true, critical: true });
+    expect(classOf("diskpart")).toMatchObject({ danger: true, critical: true });
+    expect(classOf("Restart-Computer")).toMatchObject({ danger: true, critical: true });
+    expect(classOf("powershell -Command \"rm -rf C:\\tmp\"")).toMatchObject({ danger: true, critical: true });
+    expect(classOf("pwsh -File deploy.ps1")).toMatchObject({ danger: true, critical: true });
+    // `rm` 别名：解析期归一为 remove-item，POSIX 路径 `/` 不构成盘符根（非递归 rm 亦无递归形态）→ 非 critical
+  expect(classOf("& \"rm -rf /\"")).toMatchObject({ critical: false });
+  // 调用符引号字面：解析期已把内层并入真实程序（`rm` → remove-item，`-rf` 非 -Recurse 形态 → 有界写 W）
+    expect(classOf("& \"rm -rf C:\\tmp\"")).toMatchObject({ tier: "W", danger: false, critical: false });
+    expect(classOf("& $cmd")).toMatchObject({ danger: true, critical: false });
+  });
+
+  it("staticLiteralUnwrapPs：{} 块 / -Command 字面展开，脚本文件与动态目标不深挖", () => {
+    expect(staticLiteralUnwrapPs(parsePowerShellCommand("{ Remove-Item -Recurse C:\\tmp }").segments).map((s) => s.program)).toEqual(["remove-item"]);
+    expect(staticLiteralUnwrapPs(parsePowerShellCommand("pwsh -Command \"Remove-Item -Recurse C:\\tmp\"").segments).map((s) => s.program)).toEqual(["remove-item"]);
+    expect(staticLiteralUnwrapPs(parsePowerShellCommand("Write-Output \"X\"").segments)).toEqual([]);
+    expect(staticLiteralUnwrapPs(parsePowerShellCommand(". ./deploy.ps1").segments)).toEqual([]);
+    // 调用符引号字面在解析期已并入真实程序位，无需再展开
+    expect(staticLiteralUnwrapPs(parsePowerShellCommand("& \"rm -rf C:\\tmp\"").segments)).toEqual([]);
   });
 });

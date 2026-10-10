@@ -1,5 +1,7 @@
+import os from "node:os";
 import path from "node:path";
 import type { PermissionConfig } from "./config.ts";
+import { expandEnvRef, expandHome } from "./path.ts";
 
 /** 重定向目标。 */
 export interface Redirect {
@@ -49,16 +51,6 @@ export interface ParsedCommand {
  * - X 不透明：效果不可从参数推导（解释器、构建工具、未识别程序、解析失败降级）
  */
 export type EffectTier = "R" | "W" | "X";
-
-/** 单段分类结果：效果档位 + 危险叠加标记 + 批准记忆标识。 */
-export interface SegmentClass {
-  /** 效果档位。 */
-  tier: EffectTier;
-  /** 危险叠加命中（凌驾档位之上的产品契约层，如 rm -rf / sudo / git push / wrapper）。 */
-  danger: boolean;
-  /** 会话批准记忆标识：程序名或 `git:<子命令>`。 */
-  approvalId: string;
-}
 
 const GIT_OPTION_WITH_VALUE = new Set([
   "-C", "-c", "--git-dir", "--work-tree", "--exec-path",
@@ -440,6 +432,13 @@ function tokenizeSegment(raw: string): { tokens: string[]; redirects: Redirect[]
       continue;
     }
     if (ch === "\\") {
+      // 盘符路径里的 `\` 是 Windows 分隔符而非转义符：按 POSIX 转义处理会把它连同后一字符一起吃掉
+      // （`C:\Windows\foo` → `C:Windowsfoo`），使黑名单的 Windows 对照无从命中（§3.1 规则 1）
+      if (WINDOWS_PATH_TOKEN.test(current)) {
+        current += ch;
+        i++;
+        continue;
+      }
       escaped = true;
       i++;
       continue;
@@ -632,8 +631,301 @@ export interface SegmentClassification {
   tier: SegmentTier;
   /** 危险叠加命中：wrapper、固定规则（rm -r/-f 等）、危险清单。凌驾于档位之上。 */
   danger: boolean;
+  /** 严重级（critical）命中：主机级不可逆破坏，chill 模式唯一 ask 来源。不变式 `critical ⟹ danger`。 */
+  critical: boolean;
   /** 会话批准记忆键用的程序标识（git 子命令为 `git:<sub>`）。 */
   id: string;
+  /** 收窄的 rm 严重级谓词（§3.1 规则 1 定稿）：递归 + 黑名单前缀命中，或目标含裸 glob → critical；
+   * 其余放行。chill 分支用此窄口径决定 ask；`critical` 保留宽口径（build/plan 的 danger 伴生标记）。
+   * chmod/chown/chgrp 的 `-R` 与数字 0?777 复用同一黑名单谓词（§3.1 规则 2 定稿）。 */
+  criticalChill: boolean;
+}
+
+/** 严重级前缀固定规则（§3.1 规则 3）：`mkfs*` 家族（`mkfs.btrfs` 等未列名变体同样拦）。 */
+const CRITICAL_BASH_PREFIXES = ["mkfs"];
+
+/** 严重级（critical）黑名单固定条目（§3.1 规则 1）：主机级不可逆删除的根级目录（POSIX 15 条 =
+ * Linux 11 条 + macOS 4 条对照）。
+ * `/var` `/srv` `/dev` `/proc` `/sys` `/tmp` `/mnt` 不在内（可接受丢失或属挂载点）；
+ * `/private`（`/etc` `/tmp` `/var` 的 symlink 宿主，加了会误拦 `/private/tmp`）与 `/Volumes`（挂载卷，
+ * 同 `/mnt` 口径）同样不列。
+ * `~` / `$HOME` 展开后归 `/home/*`、`/root`，macOS 上归 `/Users/*`（收尾 `/` 是 `~root` 这类用户目录前缀）；
+ * `~user` 不展开（`os.homedir` 无它用户入口），保持 `~` 字面前缀。
+ * Windows 对照条目见 `RM_CRITICAL_WINDOWS_PATHS`（盘符根 / Windows 目录 / 用户主目录）。 */
+const RM_CRITICAL_PATHS: readonly string[] = [
+  "/", "/bin", "/sbin", "/lib", "/lib64", "/usr", "/etc", "/boot", "/opt", "/root", "/home",
+  "/Users", "/System", "/Library", "/Applications", // macOS 家目录与系统目录（`/usr/local`、`/opt/homebrew` 已被 `/usr`、`/opt` 前缀覆盖）
+  "~", "~/", "$HOME", "$HOME/", "${HOME}", "${HOME}/",
+];
+
+/** rm 严重级黑名单的 Windows 对照条目（§3.1 规则 1 Windows 镜像，口径与 §3.2 的
+ * `REMOVE_ITEM_CRITICAL_PATHS` 一致）：Windows 目录经 `SystemRoot` 展开（含 `System32`，
+ * 缺省回退 `C:\Windows`）、用户主目录经 `$env:USERPROFILE`/`$env:HOMEPATH` 展开
+ * （非 Windows 宿主未定义时退化为字面量，由 `os.homedir()` 兜底）。盘符根不在此列
+ * （任意盘符由 `isWindowsDriveRoot` 覆盖）。 */
+const RM_CRITICAL_WINDOWS_PATHS: readonly string[] = [
+  "$env:SystemRoot",
+  "$env:USERPROFILE",
+  "$env:HOMEPATH",
+];
+
+/** Windows 盘符根：归一化后为单字母盘符形态（`c:`），只匹配精确盘符根（`C:\Users` 不算）。 */
+function isWindowsDriveRoot(p: string): boolean {
+  return /^[a-z]:$/.test(p);
+}
+
+/** 待写入位置处于「Windows 路径 token」内部：token 以盘符 `C:` 或 `$env:VAR` 起始（含其后的各层级）。
+ * 其中的 `\` 是分隔符，不按 POSIX 转义剥离（引号内的 `"C:\Windows\foo"` 同样适用）。 */
+const WINDOWS_PATH_TOKEN = /(?:^|\s)(?:[A-Za-z]:|\$env:[A-Za-z_][A-Za-z0-9_]*)(?:[\\/][^\s]*)?$/;
+
+/** 目标为 Windows 形态（盘符前缀 / 反斜杠 / `$env:` 引用）：命中后走大小写不敏感 + 分隔符归一比较；
+ * 纯 POSIX 目标仍走原大小写敏感比较（POSIX 路径大小写有意义，`~`/`$HOME` 字面同理）。 */
+function isWindowsShapedTarget(target: string): boolean {
+  return /^[A-Za-z]:(?:[\\/]|$)/.test(target) || target.includes("\\") || /\$env:/i.test(target);
+}
+
+/** Windows 路径归一化（与 §3.2 `normalizeWinTarget` 同口径）：`\` 与 `/` 统一为 `/`、`//` 压成 `/`、
+ * 去尾分隔符、转小写（NTFS 大小写不敏感）。 */
+function normalizeWindowsPath(p: string): string {
+  return p.replace(/\\/g, "/").replace(/\/{2,}/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+/** 路径归一化：`//` 压成 `/`、去尾斜杠（保留根 `/` 形态），供黑名单前缀比较。 */
+function normalizeSlashes(p: string): string {
+  const collapsed = p.replace(/\/{2,}/g, "/");
+  if (collapsed.length > 1 && collapsed.endsWith("/")) return collapsed.slice(0, -1);
+  return collapsed;
+}
+
+/** 命中黑名单：`~`/`~user`/`$HOME` 字面归一后比较（`~`/`$HOME` 展开归 `/home/*`、`/root`）；
+ * 目标侧同样展开（`rm -rf "$HOME"` 的引号在 token 化时已剥离）。
+ * 归一化后等于条目或以「条目 + `/`」开头；`/` 只匹配精确根。
+ * Windows 形态目标（盘符 / 反斜杠 / `$env:`）走 §3.2 同口径的大小写不敏感 + 分隔符归一比较：
+ * 盘符根、Windows 目录、用户主目录三条对照（git-bash 下 `C:\` 形态原会被 POSIX 比较整漏）。 */
+function hitsRmBlacklist(target: string): boolean {
+  if (target.startsWith("~")) return true; // `~user` 不可展开（无它用户目录入口）：按字面前缀整体拦
+  const home = os.homedir();
+  if (isWindowsShapedTarget(target)) {
+    const t = normalizeWindowsPath(expandHome(expandEnvRef(target), home));
+    if (isWindowsDriveRoot(t)) return true; // 任意盘符根（X:\ / X:/）
+    const candidates = [
+      normalizeWindowsPath(home), // 用户主目录（Windows 宿主即 `C:\Users\<user>`）
+      normalizeWindowsPath(process.env.SystemRoot ?? "C:\\Windows"), // Windows 目录，缺省回退
+      ...RM_CRITICAL_WINDOWS_PATHS.map((raw) => normalizeWindowsPath(expandEnvRef(raw))),
+    ];
+    return candidates.some((e) => e !== "" && !isWindowsDriveRoot(e) && (t === e || t.startsWith(`${e}/`)));
+  }
+  const norm = (p: string): string => {
+    const n = normalizeSlashes(path.posix.normalize(expandHome(p, home)));
+    return n === "." ? "." : n; // 相对目标（`./dist`）不参与黑名单
+  };
+  const t = norm(target);
+  return RM_CRITICAL_PATHS.some((raw) => {
+    const e = norm(raw);
+    return t === e || (e !== "/" && t.startsWith(`${e}/`));
+  });
+}
+
+/** rm 收窄严重级谓词（§3.1 规则 1，chill 唯一 ask 来源之一）：目标含裸 glob（`rm -rf *`、`rm *.log`，
+ * 不要求递归），或递归 + 黑名单前缀命中 → critical；其余放行（含黑名单下非递归单文件）。 */
+function rmCriticalChill(recursive: boolean, targets: readonly string[]): boolean {
+  // 裸 glob 先于递归门判定：无递归的通配删除同样 critical
+  if (targets.some((t) => /[*?]/.test(t))) return true;
+  return recursive && targets.some((t) => hitsRmBlacklist(t));
+}
+
+/** chill 静态展开上限：递归最多 2 层（sudo/su 剥离线不计入预算）。 */
+export const STATIC_UNWRAP_MAX_DEPTH = 2;
+
+/** 解释器字面载荷的求值旗标（§3.1 规则 6 共享谓词）。 */
+const INTERPRETER_EVAL_FLAGS = new Set(["-c", "-e", "--eval"]);
+
+/** 带 `-c`/`-e` 字面载荷的脚本解释器。 */
+const SCRIPT_INTERPRETERS = new Set(["python", "python2", "python3", "ruby", "perl", "node", "nodejs"]);
+
+/** 解释器启动器：透传后找 `-c`/`-e`（仅字面）。 */
+const INTERPRETER_LAUNCHERS = new Set(["uv", "npx", "bunx", "pnpm"]);
+const INTERPRETER_LAUNCHER_SUBCOMMANDS = new Set(["run", "exec", "dlx"]);
+
+/** 有效危险清单（并集匹配，§5.1b）：`dangerousBashCommands ∪ criticalBashCommands`。 */
+function isDangerListed(config: PermissionConfig, name: string): boolean {
+  return config.dangerousBashCommands.includes(name) || config.criticalBashCommands.includes(name);
+}
+
+/** 严重级清单命中：chill 唯一 ask 来源的配置部分。 */
+function isCriticalListed(config: PermissionConfig, name: string): boolean {
+  return config.criticalBashCommands.includes(name);
+}
+
+/** chmod 数字形态 0?777（`777`/`0777`/`7777` 等裸数字 token，整 token 匹配）；符号形态（`a+rwx`）
+ * 与含数字的文件名（`chmod 644 report777.md`）一律不拦。
+ * §3.1 规则 2 终版：此为 chill 下 chmod 唯一 critical 口径，位置/黑名单/`-R` 均不限。 */
+function hasChmod777NumericMode(args: readonly string[]): boolean {
+  return args.some((a) => !a.startsWith("-") && /^0?7{3,}$/.test(a));
+}
+
+/** 重解一段命令文本为可判定段（解析失败或空段丢弃）。 */
+function reparseCommand(text: string): BashSegment[] {
+  const parsed = parseBashCommand(text);
+  if (parsed.parseError) return [];
+  return parsed.segments.filter((s) => s.program !== "");
+}
+
+/** token 重拼回命令文本：含空白或 shell 元字符的 token 用单引号包裹（内嵌单引号按 POSIX 转义）。
+ * 保持 `bash -c "rm -rf /"` 经 sudo 剥离后仍是严格两参形态。 */
+function requoteTokens(tokens: readonly string[]): string {
+  return tokens
+    .map((t) => (/[\s"'$`\\*?()|&;<>{}#~!\[\]]/.test(t) ? `'${t.replaceAll("'", "'\\''")}'` : t))
+    .join(" ");
+}
+
+/** sudo/su 剥离线（§2.3）：跳过自身旗标后重解内层命令，剥离不计入 2 层预算。 */
+function sudoInnerSegments(args: readonly string[]): BashSegment[] {
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i]!;
+    if (a === "-u" || a === "-g" || a === "-p" || a === "-C" || a === "-T" || a === "-r" || a === "-t") {
+      i += 2;
+      continue;
+    }
+    if (a.startsWith("-")) {
+      i++;
+      continue;
+    }
+    break;
+  }
+  return reparseCommand(requoteTokens(args.slice(i)));
+}
+
+/** 抽取代码字面中的字符串字面内容（单引号整体；双引号内反斜杠转义）。 */
+function extractStringLiterals(code: string): string[] {
+  const out: string[] = [];
+  let current = "";
+  let quote: "'" | '\"' | undefined;
+  for (let i = 0; i < code.length; i++) {
+    const ch = code[i]!;
+    if (quote === undefined) {
+      if (ch === "'" || ch === '\"') {
+        quote = ch;
+        current = "";
+      }
+      continue;
+    }
+    if (quote === '\"' && ch === "\\" && i + 1 < code.length) {
+      current += code[i + 1];
+      i++;
+      continue;
+    }
+    if (ch === quote) {
+      out.push(current);
+      quote = undefined;
+      continue;
+    }
+    current += ch;
+  }
+  return out;
+}
+
+/** 解释器字面载荷：透过启动器（`uv run python -c` / `npx node -e`）找 `-c`/`-e` 后的静态代码。 */
+function interpreterLiteralPayload(program: string, args: readonly string[]): string | undefined {
+  let tokens = args;
+  if (INTERPRETER_LAUNCHERS.has(program)) {
+    const sub = tokens.findIndex((a) => INTERPRETER_LAUNCHER_SUBCOMMANDS.has(a));
+    const rest = sub >= 0 ? tokens.slice(sub + 1) : tokens;
+    const interp = rest.findIndex((a) => !a.startsWith("-"));
+    if (interp < 0 || !SCRIPT_INTERPRETERS.has(rest[interp]!)) return undefined;
+    tokens = rest.slice(interp + 1);
+  } else if (!SCRIPT_INTERPRETERS.has(program)) {
+    return undefined;
+  }
+  for (let i = 0; i < tokens.length; i++) {
+    if (INTERPRETER_EVAL_FLAGS.has(tokens[i]!)) return tokens[i + 1];
+  }
+  return undefined;
+}
+
+/** 解释器字面载荷中的 critical 命中（§3.1 规则 6 共享谓词，全模式生效；混淆/编码载荷放行）。 */
+function interpreterPayloadCritical(segment: BashSegment, config: PermissionConfig, depth: number): boolean {
+  if (depth >= STATIC_UNWRAP_MAX_DEPTH) return false;
+  const payload = interpreterLiteralPayload(segment.program, segment.args);
+  if (payload === undefined) return false;
+  for (const literal of extractStringLiterals(payload)) {
+    for (const inner of reparseCommand(literal)) {
+      if (classifySegmentAt(inner, config, depth + 1).critical) return true;
+    }
+  }
+  // 整段载荷重解兜底（§2.2「先看穿 wrapper 再解 -c 字面」）：外层 token 化已吃掉内层引号时
+  // （`bash -c "python3 -c 'rm -rf /'"` 的内层）字面扫描为空，直接按命令文本重解整段再判段。
+  for (const inner of reparseCommand(payload)) {
+    if (classifySegmentAt(inner, config, depth + 1).critical) return true;
+  }
+  return false;
+}
+
+/** xargs 载荷：跳过 xargs 自身旗标后取被调命令（`{}` 归一为通配占位）。 */
+function xargsInnerSegments(seg: BashSegment): BashSegment[] {
+  if (seg.program !== "xargs") return [];
+  let i = 0;
+  while (i < seg.args.length && seg.args[i]!.startsWith("-")) i++;
+  if (i >= seg.args.length) return [];
+  return reparseCommand(requoteTokens(seg.args.slice(i).map((t) => (t === "{}" ? "*" : t))));
+}
+
+/** find 的 `-exec`/`-execdir`/`-ok` 载荷：取到 `;`/`+` 为止的 token（`{}` 归一为通配占位）。 */
+function findExecInnerSegments(seg: BashSegment): BashSegment[] {
+  if (seg.program !== "find") return [];
+  const out: BashSegment[] = [];
+  for (let i = 0; i < seg.args.length; i++) {
+    const a = seg.args[i]!;
+    if (a !== "-exec" && a !== "-execdir" && a !== "-ok" && a !== "-exec+") continue;
+    const tokens: string[] = [];
+    for (let j = i + 1; j < seg.args.length; j++) {
+      const t = seg.args[j]!;
+      if (t === ";" || t === "+" || t === "\\\\;") break;
+      tokens.push(t === "{}" ? "*" : t);
+    }
+    if (tokens.length > 0) out.push(...reparseCommand(requoteTokens(tokens)));
+  }
+  return out;
+}
+
+/** 单段静态字面载荷（chill 处置层展开的一层来源；脚本文件/编码/动态目标不进此层）。 */
+function staticPayloadSegments(seg: BashSegment): BashSegment[] {
+  if (WRAPPER_SHELLS.has(seg.program) && seg.args.length === 2 && seg.args[0] === "-c") {
+    return reparseCommand(seg.args[1]!);
+  }
+  if (seg.program === "eval") return reparseCommand(seg.args.join(" "));
+  const out: BashSegment[] = [];
+  for (const nest of findShellNests(seg.raw)) out.push(...reparseCommand(nest.inner));
+  out.push(...xargsInnerSegments(seg));
+  out.push(...findExecInnerSegments(seg));
+  return out;
+}
+
+/**
+ * 静态字面载荷展开（§2.3 覆盖表，chill 分支专用处置层）：`bash -c`/`eval`/`$(…)`/反引号/
+ * `xargs`/`find -exec` 的静态内层重解为可判定段；递归上限 2 层（`sudo`/`su` 剥离线不计预算）；
+ * 脚本文件、编码载荷、变量拼接、动态目标与超限嵌套一律不产出（并入放行）。
+ */
+export function staticLiteralUnwrap(segments: readonly BashSegment[]): BashSegment[] {
+  const out: BashSegment[] = [];
+  const visit = (seg: BashSegment, depth: number): void => {
+    if (seg.program === "sudo" || seg.program === "su") {
+      for (const inner of sudoInnerSegments(seg.args)) {
+        // 纯 wrapper（`sudo su` 无内层命令）不产出可判定段：chill 下它只是危险叠加，按放行处理
+        if (inner.program !== "sudo" && inner.program !== "su") out.push(inner);
+        visit(inner, depth); // 剥离线不计 2 层预算
+      }
+      return;
+    }
+    if (depth >= STATIC_UNWRAP_MAX_DEPTH) return;
+    for (const inner of staticPayloadSegments(seg)) {
+      out.push(inner);
+      visit(inner, depth + 1);
+    }
+  };
+  for (const seg of segments) visit(seg, 0);
+  return out;
 }
 
 const DANGEROUS_BRANCH_FLAGS = /^-[dDmMcC]$|^--(delete|move|copy|create-reflog)/;
@@ -972,36 +1264,43 @@ function parseWgetArgs(args: string[]): FetchParse {
   return r;
 }
 
-/** 命令段效果分类：R/W/X 三档 + 危险叠加。
+/** 命令段效果分类：R/W/X 三档 + 危险/严重级叠加（统一解析的唯一出口）。
  * 判定轴是「副作用能否从参数完整推导」而非程序名认识与否；未识别程序一律 X（fail-closed）。
+ * 不变式：`critical ⟹ danger`（critical 命中处同时置 danger）。
  * 前缀已在 parseBashCommand 中剥离，此处看到的是真实程序。 */
 export function classifySegment(segment: BashSegment, config: PermissionConfig): SegmentClassification {
+  return classifySegmentAt(segment, config, 0);
+}
+
+/** classifySegment 实现：`depth` 限制解释器字面载荷的递归判定（§3.1 规则 6 共享谓词）。 */
+function classifySegmentAt(segment: BashSegment, config: PermissionConfig, depth: number): SegmentClassification {
   const { program } = segment;
   const id = program === "git" && segment.gitSubcommand ? `git:${segment.gitSubcommand}` : program;
 
   // ---- 空段：纯重定向（如 `> foo`）效果为截断/创建且可枚举 → W；裸赋值无文件副作用 → R ----
   if (program === "") {
     const writes = collectWriteTargets(segment);
-    return { tier: writes.length > 0 ? "W" : "R", danger: false, id: "" };
+    return { tier: writes.length > 0 ? "W" : "R", danger: false, critical: false, criticalChill: false, id: "" };
   }
 
   // ---- 危险叠加 ----
   let danger = false;
+  let critical = false;
   if (segment.wrapper) {
-    return { tier: "X", danger: true, id };
+    return { tier: "X", danger: true, critical: false, criticalChill: false, id };
   }
   if (program === "git") {
     const sub = segment.gitSubcommand;
     // 裸 git：交互式，不可证 → X
-    if (!sub) return { tier: "X", danger: false, id };
-    // 危险清单命中的子命令：只读形态豁免叠加，否则叠加 + X
-    if (config.dangerousBashCommands.includes(`git ${sub}`)) {
+    if (!sub) return { tier: "X", danger: false, critical: false, criticalChill: false, id };
+    // 危险/严重清单命中的子命令：只读形态豁免叠加，否则叠加 + X
+    if (isDangerListed(config, `git ${sub}`)) {
       const danger = !isGitReadonlyForm(segment, sub);
-      return { tier: danger ? "X" : "R", danger, id };
+      return { tier: danger ? "X" : "R", danger, critical: danger && isCriticalListed(config, `git ${sub}`), criticalChill: false, id };
     }
     // 未识别子命令不再假定只读（X）；已知只读子命令 → R
-    if (!GIT_READONLY_SUBS.has(sub)) return { tier: "X", danger: false, id };
-    return { tier: "R", danger: false, id };
+    if (!GIT_READONLY_SUBS.has(sub)) return { tier: "X", danger: false, critical: false, criticalChill: false, id };
+    return { tier: "R", danger: false, critical: false, criticalChill: false, id };
   }
   if (program === "rm") {
     const { before: flags } = splitDashDash(segment.args);
@@ -1010,27 +1309,41 @@ export function classifySegment(segment: BashSegment, config: PermissionConfig):
       (/^-[^-]+$/.test(a) && /[rR]/.test(a)),
     ); // 短 flag 束含 r/R；`--force` 等长选项天然排除
     const targets = collectWriteTargets(segment);
-    if (recursive || targets.some((t) => /[*?]/.test(t))) return { tier: "X", danger: true, id };
+    // 递归或通配目标：宽口径 danger（build/plan 现状不动，§3.1 规则 1）
+    if (recursive || targets.some((t) => /[*?]/.test(t))) {
+      return { tier: "X", danger: true, critical: true, criticalChill: rmCriticalChill(recursive, targets), id };
+    }
     // 其余落正常 W 链（rm ∈ WRITE_ALL_ARGS）
+  } else if (program === "chmod" && hasChmod777NumericMode(segment.args)) {
+    // 数字形态 0?777（§3.1 规则 2 终版）：chill 唯一 ask 来源，位置/黑名单/`-R` 均不限
+    return { tier: "X", danger: true, critical: true, criticalChill: true, id };
   } else if (
     (program === "chmod" || program === "chown" || program === "chgrp") &&
     segment.args.some((a) => a.startsWith("-") && (a.includes("R") || a === "--recursive"))
   ) {
-    return { tier: "X", danger: true, id };
+    // 宽口径 critical 仅 build/plan 生效（chill 下 -R 递归一律放行）
+    return { tier: "X", danger: true, critical: true, criticalChill: false, id };
   }
-  if (config.dangerousBashCommands.includes(program)) return { tier: "X", danger: true, id };
+  if (isCriticalListed(config, program) || CRITICAL_BASH_PREFIXES.some((p) => program === p || program.startsWith(`${p}.`))) {
+    // 严重级清单 / mkfs* 前缀固定规则：磁盘分区销毁
+    return { tier: "X", danger: true, critical: true, criticalChill: false, id };
+  }
+  if (config.dangerousBashCommands.includes(program)) return { tier: "X", danger: true, critical: false, criticalChill: false, id };
 
   // ---- curl/wget 按方法与目标分（F2/F3）：解析器为单一可信源 ----
   if (program === "curl") {
     const fetched = parseCurlArgs(segment.args);
-    if (fetched.unknown || fetched.missing || fetched.send) return { tier: "X", danger: true, id };
-    return { tier: fetched.targets.length > 0 ? "W" : "R", danger: false, id };
+    if (fetched.unknown || fetched.missing || fetched.send) return { tier: "X", danger: true, critical: false, criticalChill: false, id };
+    return { tier: fetched.targets.length > 0 ? "W" : "R", danger: false, critical: false, criticalChill: false, id };
   }
   if (program === "wget") {
     const fetched = parseWgetArgs(segment.args);
-    if (fetched.unknown || fetched.missing) return { tier: "X", danger: true, id };
-    return { tier: fetched.targets.length > 0 ? "W" : "R", danger: false, id };
+    if (fetched.unknown || fetched.missing) return { tier: "X", danger: true, critical: false, criticalChill: false, id };
+    return { tier: fetched.targets.length > 0 ? "W" : "R", danger: false, critical: false, criticalChill: false, id };
   }
+  // ---- 解释器字面载荷命中严重级谓词（§3.1 规则 6 共享谓词，全模式生效）----
+  critical = interpreterPayloadCritical(segment, config, depth);
+  danger = danger || critical;
 
   // ---- 档位判定 ----
   // 有界写者注册表（W 种子）：tar 移出（解压目标不可枚举）；sed 特殊（仅 -i 升 W）
@@ -1044,11 +1357,12 @@ export function classifySegment(segment: BashSegment, config: PermissionConfig):
     // 读种子 + 写动作扫描（重定向/sort -o/find 写 flag）→ 升级 W；否则保持 R
     tier = writeTargets.length > 0 ? "W" : "R";
   } else {
-    return { tier: "X", danger: false, id };
+    // 未识别程序恒 X（fail-closed）；此处的 danger/critical 来自上面的共享谓词（如解释器字面载荷），不可丢弃
+    return { tier: "X", danger: critical, critical, criticalChill: critical, id };
   }
   // W 目标含 glob（* ?）→ 无法穷举 → 降级 X（保守：plan 落⑤ ask，build 域内仍③放行）
   if (tier === "W" && writeTargets.some((t) => /[*?]/.test(t))) tier = "X";
-  return { tier, danger: false, id };
+  return { tier, danger, critical, criticalChill: critical, id };
 }
 
 /** 命中危险清单的 git 子命令中，仅列表演示的形态仍视为只读（避免误伤 git branch/stash list/remote -v）。 */

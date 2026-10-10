@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { BUILTIN_WRITE_TOOLS, type PermissionConfig } from "./config.ts";
+import { BUILTIN_WRITE_TOOLS, normalizeChillSensitiveAction, type PermissionConfig } from "./config.ts";
 import {
   classifySegment,
   collectReadRefs,
@@ -10,6 +10,7 @@ import {
   parseBashCommand,
   reparseSegment,
   scrubShellNests,
+  staticLiteralUnwrap,
   WRAPPER_SHELLS,
   type BashSegment,
   type ParsedCommand,
@@ -30,7 +31,7 @@ export interface Decision {
   approvalId?: string;
 }
 
-export type WorkMode = "build" | "plan" | "yolo";
+export type WorkMode = "build" | "plan" | "yolo" | "chill";
 
 export interface ToolDecisionRequest {
   mode: WorkMode;
@@ -65,6 +66,12 @@ export interface ShellAdapter {
   /** 管道到 shell 检测（FR-4 等价叠加）。 */
   pipeToShell(segments: readonly BashSegment[]): boolean;
   /**
+   * 静态字面载荷展开（chill 处置层专用）：`bash -c`/`eval`/`$(…)`/反引号/
+   * 解释器 `-c`/`-e`/`xargs`/`find -exec` 的静态内层重解为可判定段（递归上限 2 层，sudo/su 剥离线不计）。
+   * 脚本文件、编码载荷、变量拼接与动态目标一律不进此层。
+   */
+  staticUnwrap(segments: readonly BashSegment[]): BashSegment[];
+  /**
    * 解析某段执行后的有效工作目录（C1：切目录语义由适配器全权负责）。
    * 返回 current 表示 cwd 不变（非切目录命令，或 push-location 无参仅入栈）；
    * 返回 undefined 表示无法静态跟踪（如 pop-location、cd -），后续相对路径保守按域外处理。
@@ -75,6 +82,11 @@ export interface ShellAdapter {
 interface SegmentClassLike {
   tier: "R" | "W" | "X";
   danger: boolean;
+  /** 严重级（critical）命中：`critical ⟹ danger` 由 classify 各返回点构造保证。 */
+  critical: boolean;
+  /** 收窄的 rm/Remove-Item 严重级谓词（§3.1 规则 1 / §3.2）：递归 + 黑名单前缀命中或裸 glob；
+   * chill 分支用此窄口径决定 ask，`critical` 保留宽口径供 build/plan。 */
+  criticalChill: boolean;
   id: string;
 }
 
@@ -86,6 +98,7 @@ const BASH_ADAPTER: ShellAdapter = {
   readRefs: collectReadRefs,
   writeTargets: collectWriteTargets,
   pipeToShell: hasPipeToShell,
+  staticUnwrap: staticLiteralUnwrap,
   resolveCwdChange(program, args, current) {
     if (program !== "cd") return current;
     const positional = args.filter((a) => !a.startsWith("-"))[0];
@@ -222,6 +235,19 @@ export function decideToolRequest(req: ToolDecisionRequest): Decision {
     return { action: "ask", rule: "FR-8", reason: `${label} plan mode unknown tool requires confirmation`, details: [`tool:${toolName}`] };
   }
 
+  // chill：敏感文件 deny（`chillSensitiveAction: "ask"` 时改弹窗），其余一律放行
+  if (mode === "chill") {
+    const sensitive = sensitiveDecision(paths, cwd, config, readTool ? paths : [], label);
+    if (sensitive) {
+      const details = [...(sensitive.details ?? []), `tool:${toolName}`];
+      if (normalizeChillSensitiveAction(config.chillSensitiveAction) === "ask") {
+        return { ...sensitive, details };
+      }
+      return { action: "deny", rule: "FR-1", reason: `${label} sensitive file access blocked in chill mode`, details };
+    }
+    return { action: "allow", rule: "FR-5", reason: `${label} chill mode, non-sensitive operation allowed` };
+  }
+
   // build 模式
   // 1. 敏感文件 ask（工具层无敏感操作概念，最前）
   const sensitive = sensitiveDecision(paths, cwd, config, readTool ? paths : [], label);
@@ -263,6 +289,9 @@ function failClosed(mode: WorkMode, label: string, kind: string, command?: strin
 
 /** 纯变量赋值前缀段（如 `OLD=""`）：B3 净化后仅剩此类内容直接丢弃（视同 R）。 */
 const PURE_ASSIGN_SEGMENT = /^([A-Za-z_][A-Za-z0-9_]*=("[^"]*"|'[^']*'|[^\s]*)\s*)+$/;
+
+/** chill 下只看收窄谓词（criticalChill）的程序：宽口径 critical 在这些程序上一律放行（§3.1/§3.2）。 */
+const CHILL_NARROWED_PROGRAMS = new Set(["rm", "remove-item", "chmod", "chown", "chgrp"]);
 
 /** 段内嵌套是否非平衡（切分残留的半边 span，如反引号内的 `&&` 切分产物）：是则门直接回退。
  * 单引号 span 与转义先剥离；双引号内的括号为字面（不计），`$(` 与反引号在双引号内仍会执行故计入。 */
@@ -404,6 +433,65 @@ function resolveSegmentCwds(
   return result;
 }
 
+/**
+ * chill 分支专用处置（§2.2 判定顺序定稿，插在 yolo 早返回与 parseError fail-closed 之间）：
+ * ① 顶层段敏感 → deny（`chillSensitiveAction: "ask"` 时改 ask，FR-1）；
+ * ② 静态字面载荷敏感 → 同上（脚本文件/编码/动态载荷不进此层）；
+ * ③ critical（含管道到 shell）→ ask（FR-4，approvalId 取首个 critical 段，不走 rankOf）；
+ * ④ 其余一律 allow（不可展开/不可解析并入放行，审计落 debug 流）。
+ * 非 critical 的 wrapper danger（如 `sudo ls`）在此降级：处置差异，不动解析。
+ */
+function chillShellDecision(req: BashDecisionRequest, adapter: ShellAdapter, label: string): Decision {
+  const { config, cwd, command } = req;
+  const parsed = adapter.parse(command);
+  const sensitiveAction = normalizeChillSensitiveAction(config.chillSensitiveAction);
+  const chillSensitive = (hit: Decision): Decision => {
+    const details = [...(hit.details ?? []), shellDetail(adapter.id, command, parsed)];
+    if (sensitiveAction === "ask") return { ...hit, details };
+    return { action: "deny", rule: "FR-1", reason: `${label} sensitive file access blocked in chill mode`, details };
+  };
+  const scanSensitive = (segs: readonly BashSegment[], cwds: readonly (string | undefined)[]): Decision | undefined => {
+    for (let i = 0; i < segs.length; i++) {
+      const seg = segs[i]!;
+      const readRefs = adapter.readRefs(seg);
+      const writeTargets = adapter.writeTargets(seg);
+      const hit = sensitiveDecision([...readRefs, ...writeTargets], cwds[i] ?? cwd, config, readRefs, label);
+      if (hit) return hit;
+    }
+    return undefined;
+  };
+  // ① 顶层段敏感
+  const topHit = scanSensitive(parsed.segments, resolveSegmentCwds(parsed.segments, cwd, adapter));
+  if (topHit) return chillSensitive(topHit);
+  // ② 静态字面载荷层敏感（`staticUnwrap` 仅产静态可证内层）
+  const payloads = adapter.staticUnwrap(parsed.segments);
+  if (payloads.length > 0) {
+    const payloadHit = scanSensitive(payloads, resolveSegmentCwds(payloads, cwd, adapter));
+    if (payloadHit) return chillSensitive(payloadHit);
+  }
+  // ③ critical 唯一 ask 来源（管道到 shell 计入顶层与载荷两处）
+  // rm/remove-item 段只看收窄黑名单谓词（criticalChill），其余 critical 固定规则/清单原样生效；
+  // chmod/chown/chgrp 亦只看 criticalChill（§3.1 规则 2 终版）：仅数字 0?777 的 chmod 会置位，
+  // -R 递归与 chown/chgrp 全部走宽口径 critical（只对 build/plan 生效，chill 一律放行）
+  const candidates = [...parsed.segments, ...payloads];
+  const kinds = candidates.map((seg) => adapter.classify(seg, config));
+  const isChillCritical = (k: SegmentClassLike, program: string): boolean =>
+    k.criticalChill || (k.critical && !CHILL_NARROWED_PROGRAMS.has(program));
+  const criticalIndex = kinds.findIndex((k, i) => isChillCritical(k, candidates[i]!.program));
+  const criticalAny = criticalIndex >= 0 || adapter.pipeToShell(parsed.segments) || adapter.pipeToShell(payloads);
+  if (criticalAny) {
+    return {
+      action: "ask",
+      rule: "FR-4",
+      reason: `${label} critical operation requires confirmation`,
+      details: [shellDetail(adapter.id, command, parsed)],
+      approvalId: criticalIndex >= 0 ? kinds[criticalIndex]!.id : undefined,
+    };
+  }
+  // ④ 放行
+  return { action: "allow", rule: "FR-5", reason: `${label} chill mode relaxed checks, allowed`, details: [shellDetail(adapter.id, command, parsed)] };
+}
+
 /** bash 级决策。
 /** 通用 shell 级决策核心：bash 与 powershell 共用（适配器提供解析/分类实现）。
  * plan（不分 cwd 内外）：明确写/敏感操作 deny → 敏感文件 ask → read 白名单 allow → other ask/deny(strict)
@@ -435,6 +523,9 @@ export function decideShellRequest(req: BashDecisionRequest, adapter: ShellAdapt
     // 即使含复杂语法/管道也放行（yolo bypass）
     return { action: "allow", rule: "yolo", reason: `[yolo] yolo mode, all operations allowed` };
   }
+
+  // chill：只拦敏感文件（默认 deny）与 critical 清单（唯一 ask 来源），其余一律放行（含解析失败）
+  if (mode === "chill") return chillShellDecision(req, adapter, label);
 
   // FR-7 fail-closed：语法无法解析 / 含复杂语法 → build=ask、plan=deny
   if (parsed.parseError) return failClosed(mode, label, "unparseable", command, adapter.id);

@@ -1,3 +1,4 @@
+import os from "node:os";
 import { describe, expect, it } from "vitest";
 import {
   classifySegment,
@@ -5,10 +6,17 @@ import {
   collectWriteTargets,
   hasPipeToShell,
   parseBashCommand,
+  staticLiteralUnwrap,
 } from "../src/bash.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 
 const cfg = DEFAULT_CONFIG;
+
+/** 还原测试期间临时改写的环境变量（未设置过则删除）。 */
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
 
 describe("parseBashCommand 顶层切分", () => {
   it("切分链式命令", () => {
@@ -453,5 +461,215 @@ describe("分类器加固（issue #1 复审回归）", () => {
     expect(cls("find -name '*.tmp' -delete")).toMatchObject({ tier: "W" });
     const plan = decidePlanFallback();
     function decidePlanFallback() { return "see decision.test"; }
+  });
+});
+
+describe("classifySegment 严重级（critical）粒度与共享谓词", () => {
+  const cls = (cmd: string) => classifySegment(parseBashCommand(cmd).segments[0]!, cfg);
+
+  it("danger 与 critical 双标记：wrapper 只置 danger，critical 处同时置 danger", () => {
+    expect(cls("sudo ls")).toMatchObject({ danger: true, critical: false });
+    expect(cls("rm -rf /")).toMatchObject({ danger: true, critical: true });
+    expect(cls("rm x")).toMatchObject({ danger: false, critical: false });
+    expect(cls("ls")).toMatchObject({ danger: false, critical: false });
+    expect(cls("git push")).toMatchObject({ danger: true, critical: false });
+  });
+
+  it("rm 收窄严重级（criticalChill）：递归+黑名单前缀或裸 glob → true；其余放行", () => {
+    const home = os.homedir();
+    const hits = [
+      "rm -rf /",
+      "rm -rf //",
+      "rm -rf /etc",
+      "rm -rf /etc/",
+      "rm -rf /usr/local",
+      "rm -rf /home",
+      "rm -rf /home/other",
+      `rm -rf ${home}`,
+      "rm -rf ~",
+      "rm -rf ~/",
+      "rm -rf $HOME",
+      "rm -rf \"$HOME/\"",
+      "rm -rf ~root",
+      "rm -rf -- /boot",
+      "rm -rf /var/../etc",
+      // macOS 对照（§3.1 规则 1）：家目录与系统目录；`/usr/local`、`/opt/homebrew` 已被 `/usr`、`/opt` 前缀覆盖
+      "rm -rf /Users",
+      "rm -rf /Users/alice",
+      "rm -rf /System/Library",
+      "rm -rf /Library/Caches",
+      "rm -rf /Applications",
+      "rm -rf /usr/local/bin",
+      "rm -rf /opt/homebrew",
+    ];
+    for (const cmd of hits) expect(cls(cmd), cmd).toMatchObject({ danger: true, critical: true, criticalChill: true });
+    const allows = [
+      "rm -rf /tmp/x",
+      "rm -rf ./dist",
+      "rm -rf node_modules",
+      "rm /etc/hosts",
+      "rm /bin/bash",
+      "rm -f a.txt",
+      "rm x",
+      // macOS 故意不加的路径：`/private` 是 `/etc` `/tmp` `/var` 的 symlink 宿主，`/Volumes` 是挂载卷（同 `/mnt` 口径）
+      "rm -rf /private/tmp/x",
+      "rm -rf /private/var/folders",
+      "rm -rf /Volumes/disk",
+      "rm -rf /Volumes/disk/proj",
+    ];
+    for (const cmd of allows) expect(cls(cmd), cmd).toMatchObject({ criticalChill: false });
+    // 非黑名单递归仍宽口径 danger（build/plan 现状不动）
+    expect(cls("rm -rf ./dist")).toMatchObject({ tier: "X", danger: true, critical: true, criticalChill: false });
+    // 黑名单下非递归单文件不进 rm 早返链，落正常 W 链
+    expect(cls("rm /etc/hosts")).toMatchObject({ tier: "W", danger: false, critical: false });
+  });
+
+  it("rm 黑名单 Windows 对照（§3.1 规则 1 Windows 镜像）：git-bash 盘符根/Windows 目录/主目录 → criticalChill", () => {
+    const prev = { sr: process.env.SystemRoot, up: process.env.USERPROFILE, hp: process.env.HOMEPATH };
+    process.env.USERPROFILE = "C:\\Users\\alice";
+    try {
+      // SystemRoot 缺省 → 回退 `C:\Windows`（与 §3.2 同口径）
+      restoreEnv("SystemRoot", undefined);
+      const hits = [
+        "rm -rf C:\\", // 盘符根（任意盘符精确根）
+        "rm -rf D:\\",
+        "rm -rf C:\\Windows",
+        "rm -rf C:\\Windows\\foo",
+        "rm -rf c:/windows/system32",
+        "rm -rf $env:SystemRoot\\System32",
+        "rm -rf C:\\Users\\alice", // 用户主目录（$env:USERPROFILE 展开）
+        "rm -rf C:\\Users\\alice\\docs",
+        `rm -rf ${os.homedir()}`,
+      ];
+      for (const cmd of hits) expect(cls(cmd), cmd).toMatchObject({ danger: true, critical: true, criticalChill: true });
+      const allows = [
+        "rm -rf /tmp",
+        "rm -rf C:\\Temp",
+        "rm -rf C:\\proj\\dist",
+        "rm -rf c:/temp/build",
+        "rm C:\\Windows\\win.ini", // 非递归单文件不进收窄口径
+      ];
+      for (const cmd of allows) expect(cls(cmd), cmd).toMatchObject({ criticalChill: false });
+      // 原生 exe / wrapper（`bash -c` 内 rm）自身分类不变：chill 命中来自静态字面展开后的内层段
+      expect(cls("bash -c \"rm -rf C:\\Windows\\foo\"")).toMatchObject({ tier: "X", danger: true, critical: false, criticalChill: false });
+      const unwrapped = staticLiteralUnwrap(parseBashCommand("bash -c \"rm -rf C:\\Windows\\foo\"").segments);
+      const inner = unwrapped.find((s) => s.program === "rm");
+      expect(inner, "bash -c 载荷应展开出 rm 段").toBeDefined();
+      expect(classifySegment(inner!, cfg)).toMatchObject({ danger: true, critical: true, criticalChill: true });
+      // SystemRoot 环境变量优先于缺省回退值
+      process.env.SystemRoot = "D:\\Win";
+      expect(cls("rm -rf D:\\Win\\drivers")).toMatchObject({ criticalChill: true });
+      expect(cls("rm -rf C:\\Windows")).toMatchObject({ criticalChill: false });
+    } finally {
+      restoreEnv("SystemRoot", prev.sr);
+      restoreEnv("USERPROFILE", prev.up);
+      restoreEnv("HOMEPATH", prev.hp);
+    }
+  });
+
+  it("chmod 收窄严重级（criticalChill）：数字 0?777 一律拦（位置/黑名单/-R 不限）；其余 chmod/chown/chgrp 放行", () => {
+    const hits = [
+      "chmod 777 f",
+      "chmod 777 ./run.sh",
+      "chmod -R 777 /usr/bin",
+      "chmod 777 /usr/local/bin/tool",
+      "chmod 0777 /etc/passwd",
+      "chmod 7777 ./x",
+      "chmod -R 777 /tmp/x",
+    ];
+    for (const cmd of hits) expect(cls(cmd), cmd).toMatchObject({ danger: true, critical: true, criticalChill: true });
+    const allows = [
+      "chmod -R 755 ./dist",
+      "chmod -R 755 /etc",
+      "chmod -R 755 ~",
+      "chown -R alice /home",
+      "chown -R alice $HOME",
+      "chgrp -R staff /root",
+      "chmod 755 file",
+      "chown alice file.txt",
+      "chgrp staff ./dir",
+      "chmod a+rwx f",
+      "chmod -R u=rwx ./dist",
+      "chmod 644 report777.md",
+      "chmod 755 ./logs/777.txt",
+    ];
+    for (const cmd of allows) expect(cls(cmd), cmd).toMatchObject({ criticalChill: false });
+    // 非 777 的 -R 仍宽口径 danger（build/plan 现状不动，chill 只看 criticalChill 放行）
+    expect(cls("chmod -R 755 ./dist")).toMatchObject({ tier: "X", danger: true, critical: true, criticalChill: false });
+    expect(cls("chown -R alice /home")).toMatchObject({ tier: "X", danger: true, critical: true, criticalChill: false });
+  });
+
+  it("chmod 数字形态 0?777：仅裸数字 token 命中，文件名里的 777 不误伤", () => {
+    for (const cmd of ["chmod 777 f", "chmod 0777 f", "chmod 7777 f"]) {
+      expect(cls(cmd), cmd).toMatchObject({ danger: true, critical: true, criticalChill: true });
+    }
+    expect(cls("chmod 644 report777.md")).toMatchObject({ danger: false, critical: false, criticalChill: false });
+    expect(cls("chmod 755 ./logs/777.txt")).toMatchObject({ danger: false, critical: false, criticalChill: false });
+  });
+
+  it("chmod 数字形态 0?777 → critical；符号形态与 644 一律不拦", () => {
+    expect(cls("chmod 777 f")).toMatchObject({ danger: true, critical: true });
+    expect(cls("chmod 0777 f")).toMatchObject({ danger: true, critical: true });
+    expect(cls("chmod 7777 f")).toMatchObject({ danger: true, critical: true });
+    expect(cls("chmod a+rwx f")).toMatchObject({ danger: false, critical: false });
+    expect(cls("chmod +rwx f")).toMatchObject({ danger: false, critical: false });
+    expect(cls("chmod u=rwx,go=rwx f")).toMatchObject({ danger: false, critical: false });
+    expect(cls("chmod 644 f")).toMatchObject({ danger: false, critical: false });
+    expect(cls("chmod -R 755 d")).toMatchObject({ danger: true, critical: true });
+  });
+
+  it("磁盘/分区销毁与停机：critical 清单 + mkfs* 前缀固定规则", () => {
+    const cmds = [
+      "dd if=/dev/zero of=/dev/sda",
+      "mkfs /dev/sda",
+      "mkfs.btrfs /dev/sda",
+      "fdisk -l",
+      "parted /dev/sda",
+      "wipefs -a /dev/sda",
+      "shutdown now",
+      "reboot",
+      "halt",
+      "poweroff",
+      "init 0",
+    ];
+    for (const cmd of cmds) expect(cls(cmd), cmd).toMatchObject({ danger: true, critical: true });
+    // mount 属危险清单（非严重级）：chill 放行
+    expect(cls("mount /dev/sdb /mnt")).toMatchObject({ danger: true, critical: false });
+  });
+
+  it("危险清单命中仅置 danger（chill 放行）", () => {
+    expect(cls("iptables -L")).toMatchObject({ danger: true, critical: false });
+    expect(cls("setcap cap_net_raw+ep x")).toMatchObject({ danger: false, critical: false });
+  });
+
+  it("解释器 -c 字面载荷命中 critical；混淆/编码/脚本文件形态不拦", () => {
+    expect(cls("python3 -c \"os.system('rm -rf /')\"")).toMatchObject({ danger: true, critical: true });
+    expect(cls("node -e \"require('child_process').exec('dd if=/dev/zero of=/dev/sda')\"")).toMatchObject({ danger: true, critical: true });
+    expect(cls("uv run python -c \"os.system('shutdown now')\"")).toMatchObject({ danger: true, critical: true });
+    // 已知限制：参数以列表形态给出（run(['rm','-rf','/'])）的字面量单独重解不构成命令 → 浅层网不覆盖
+    expect(cls("python3 -c \"__import__('subprocess').run(['rm','-rf','/'])\"")).toMatchObject({ critical: false });
+    expect(cls("python3 -c \"base64.b64decode('cnQgLXJmIC8=')\"")).toMatchObject({ danger: false, critical: false });
+    expect(cls("python3 -c \"x='r'+'m'\"")).toMatchObject({ danger: false, critical: false });
+    expect(cls("python run.py")).toMatchObject({ danger: false, critical: false });
+    // wrapper 内的解释器字面（`bash -c "python3 -c 'rm -rf /'"`）：内层引号被外层 token 化吃掉后
+    // 靠整段载荷重解兜底命中，chill 不会因一层 wrapper 被绕过（超 2 层预算的 bash 嵌套仍放行）
+    const unwrapped = staticLiteralUnwrap(parseBashCommand("bash -c \"python3 -c 'rm -rf /'\"").segments);
+    const python = unwrapped.find((s) => s.program === "python3");
+    expect(python).toBeDefined();
+    expect(classifySegment(python!, cfg)).toMatchObject({ danger: true, critical: true });
+  });
+
+  it("staticLiteralUnwrap：递归上限 2 层，sudo/su 剥离线不计预算", () => {
+    expect(staticLiteralUnwrap(parseBashCommand("sudo rm -rf /").segments).map((s) => s.program)).toEqual(["rm"]);
+    expect(staticLiteralUnwrap(parseBashCommand("sudo bash -c \"rm -rf /tmp/x\"").segments).map((s) => s.program)).toEqual(["bash", "rm"]);
+    expect(staticLiteralUnwrap(parseBashCommand("echo \"unclosed").segments)).toEqual([]);
+    expect(staticLiteralUnwrap(parseBashCommand("xargs rm -rf").segments).map((s) => s.program)).toEqual(["rm"]);
+    expect(staticLiteralUnwrap(parseBashCommand("find / -exec rm -rf {} +").segments).map((s) => s.program)).toEqual(["rm"]);
+    expect(staticLiteralUnwrap(parseBashCommand("find . -exec rm {} ;").segments).map((s) => s.program)).toEqual(["rm"]);
+    // 预算 2 层：外层 bash 载荷 + 内层 bash 载荷，第三层不再产出
+    expect(staticLiteralUnwrap(parseBashCommand("bash -c \"bash -c 'rm -rf /'\"").segments).map((s) => s.program)).toEqual(["bash", "rm"]);
+    // 脚本文件 / 动态目标 / 纯 wrapper 不深挖
+    expect(staticLiteralUnwrap(parseBashCommand("sh deploy.sh").segments)).toEqual([]);
+    expect(staticLiteralUnwrap(parseBashCommand("sudo su").segments)).toEqual([]);
   });
 });

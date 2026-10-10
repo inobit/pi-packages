@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.2.0] - 2026-10-10
+
+### Added
+
+- **`chill` mode (`/chill`)**: a relaxed tier between `build` and `yolo` — *chill* means "relaxed", not "cold". It only asks for **critical** operations (host-level irreversible damage: `rm`/`Remove-Item` recursion on a blacklisted path or wildcard target — the bash blacklist is the 15 POSIX roots (Linux 11 plus the macOS counterparts `/Users` `/System` `/Library` `/Applications`) plus the `~`/`$HOME` literals and, for Windows-shaped targets (git-bash `C:\` forms), the same three counterparts PowerShell already had: any drive root, `$env:SystemRoot` with a `C:\Windows` fallback, and the user home — `chmod` numeric `0?777` only, `dd`, `mkfs*`, `fdisk`/`gdisk`/`parted`/`wipefs`, `shutdown`/`reboot`/`halt`/`poweroff`/`init`, `curl|sh`, `Format-Volume`/`diskpart`/`Remove-Computer`/`Restart-Computer`/`Stop-Computer`/`Clear-Eventlog`, `iex`/`Invoke-Expression`/`icm`, nested `pwsh`, and interpreter literal payloads) and still **denies** sensitive files. Everything else is allowed, including unparseable syntax — known trade-off: recursive `chmod`/`chown` on system paths (`chmod -R 755 /etc`, `chown -R alice /home`) is not stopped in chill. `Alt+P` now cycles `plan → build → chill → plan`; the status bar shows `Chill` in the `warning` theme color; only a `plan → chill` switch reuses the one-shot `BUILD_SWITCH_NOTICE` to lift read-only mode (`build → chill` / `yolo → chill` inject nothing).
+- **Critical severity lists**: new `criticalBashCommands` / `criticalPowerShellCommands` config fields (one level above `dangerous*`). Array fields are union-merged across layers; the effective dangerous set at match time is `dangerous ∪ critical`, so a critical entry also asks in `build`. Defaults are subsets of the existing dangerous defaults (bash 15/15, PowerShell 6/6 overlap) — the added value is user-appended entries plus the shared fixed rules.
+- **`chillSensitiveAction`** (`deny` default, `ask` opt-in) and **`defaultMode`** (`build` default, `chill` opt-in). `yolo`/`plan` and invalid values fall back to `build` with a `debugLog`-gated warning; `normalizeChillSensitiveAction` / `normalizeDefaultMode` normalize both.
+- **`staticLiteralUnwrap`** (bash) / **`staticLiteralUnwrapPs`** (powershell): chill-only static payload expansion — `bash -c`/`eval`, `$(...)`/backticks, `xargs`, `find -exec/-execdir/-ok` (`{}` normalized to a wildcard placeholder), `&`/dot-source/`{}` blocks, nested `pwsh -Command`, recursion capped at 2 levels; `sudo`/`su` peeling does not consume the budget. Script files, encoded payloads, variable concatenation and dynamic targets are deliberately **not** unwrapped.
+
+### Changed
+
+- **Behavior change (build)**: two fixed rules are now shared across all modes — bare `chmod 777 <file>` (numeric `0?777` only, matched as a whole token; symbolic forms such as `a+rwx` and filenames that merely contain `777` are not matched) and interpreter literal payloads that hit a critical predicate (`python3 -c "os.system('rm -rf /')"`, `node -e "require('child_process').exec('dd ...')"`). Both were silently allowed in build before and now `ask` (and `deny` in plan). Obfuscated/encoded payloads keep the existing X chain.
+- **Classification output gained a `critical` flag**: `danger` = the full dangerous predicate set, `critical` = the critical subset, with the invariant `critical ⟹ danger` enforced at every return point. The unused `SegmentClass` type was removed.
+- **Approval keys are mode-scoped for `FR-4` and `FR-1`** (`dangerous:<mode>:<tool>:<id>`, `sensitive:<mode>:<path>`), matching the pre-existing `FR-10` isolation: a chill approval no longer waives the same program in build.
+- Chill allows are audited to the **debug** stream only (`auditor.debug("chill-allow", ...)`, gated by `debugLog`, invisible by default); the review log is unchanged.
+- Config header comment corrected: array fields are union-merged across layers (not replaced).
+
+### Fixed
+
+- Array fields given a non-array value no longer break `loadConfig` (previously a `TypeError` when spreading): the layer is skipped with a `debugLog`-gated warning and defaults apply.
+
 ## [1.1.2] - 2026-09-24
 
 ### Added

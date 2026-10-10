@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createAuditor, redact } from "../src/audit.ts";
-import { DEFAULT_CONFIG, loadConfig } from "../src/config.ts";
+import { classifySegment, parseBashCommand } from "../src/bash.ts";
+import { DEFAULT_CONFIG, loadConfig, normalizeChillSensitiveAction } from "../src/config.ts";
 
 describe("config 加载与合并", () => {
   it("无配置文件时使用默认值", () => {
@@ -72,6 +73,67 @@ describe("config 加载与合并", () => {
     const cfg = loadConfig(dir, { globalPath });
     expect(cfg.readonlyTools).toContain("my_reader");
     expect(cfg.readonlyTools).toContain("read");
+  });
+
+  it("critical 数组跨层并集，默认条目删不掉", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-cfg-"));
+    const globalPath = path.join(dir, "config.json");
+    fs.writeFileSync(globalPath, JSON.stringify({ criticalBashCommands: ["nvme", "hdparm"], criticalPowerShellCommands: ["clear-recyclebin"] }));
+    const cfg = loadConfig(dir, { globalPath });
+    expect(cfg.criticalBashCommands).toEqual(expect.arrayContaining(["nvme", "hdparm", "dd", "shutdown"]));
+    expect(cfg.criticalPowerShellCommands).toEqual(expect.arrayContaining(["clear-recyclebin", "format-volume"]));
+  });
+
+  it("critical 条目进入有效危险并集（classify 命中即 danger+critical）", () => {
+    const cfg = { ...DEFAULT_CONFIG, criticalBashCommands: [...DEFAULT_CONFIG.criticalBashCommands, "nvme"] };
+    expect(classifySegment(parseBashCommand("nvme format /dev/nvme0").segments[0]!, cfg)).toMatchObject({ danger: true, critical: true });
+    // 不在 dangerous 也不在 critical 的程序保持不危险
+    expect(classifySegment(parseBashCommand("ls").segments[0]!, cfg)).toMatchObject({ danger: false, critical: false });
+  });
+
+  it("defaultMode 非数组替换语义 + 非法值回退 build", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-cfg-"));
+    const globalPath = path.join(dir, "g.json");
+    const projectPath = path.join(dir, "p.json");
+    fs.writeFileSync(globalPath, JSON.stringify({ defaultMode: "chill" }));
+    fs.writeFileSync(projectPath, JSON.stringify({ defaultMode: "yolo" }));
+    expect(loadConfig(dir, { globalPath }).defaultMode).toBe("chill");
+    // 项目层不受信任时忽略；受信任时 yolo 非法 → 回退 build
+    expect(loadConfig(dir, { globalPath, projectPath, trusted: false }).defaultMode).toBe("chill");
+    expect(loadConfig(dir, { globalPath, projectPath, trusted: true }).defaultMode).toBe("build");
+    expect(loadConfig(dir, { globalPath: path.join(dir, "nope.json") }).defaultMode).toBe("build");
+  });
+
+  it("normalizeChillSensitiveAction：非法值回退 deny（含注入告警）", () => {
+    const warnings: string[] = [];
+    const warn = (m: string) => warnings.push(m);
+    expect(normalizeChillSensitiveAction("ask", warn)).toBe("ask");
+    expect(normalizeChillSensitiveAction("deny", warn)).toBe("deny");
+    expect(normalizeChillSensitiveAction("block", warn)).toBe("deny");
+    expect(normalizeChillSensitiveAction(undefined, warn)).toBe("deny");
+    expect(warnings).toHaveLength(2);
+    const loadWarnings: string[] = [];
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-cfg-"));
+    const globalPath = path.join(dir, "config.json");
+    fs.writeFileSync(globalPath, JSON.stringify({ chillSensitiveAction: "nope", debugLog: true }));
+    const spy = vi.spyOn(console, "warn").mockImplementation((m: unknown) => loadWarnings.push(String(m)));
+    try {
+      const cfg = loadConfig(dir, { globalPath });
+      expect(cfg.chillSensitiveAction).toBe("deny");
+      expect(loadWarnings.join(" ")).toContain("chillSensitiveAction");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("新数组字段给非数组值时守卫不抛且按默认生效", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-cfg-"));
+    const globalPath = path.join(dir, "config.json");
+    fs.writeFileSync(globalPath, JSON.stringify({ criticalBashCommands: "dd", criticalPowerShellCommands: 42, sensitivePatterns: null }));
+    const cfg = loadConfig(dir, { globalPath });
+    expect(cfg.criticalBashCommands).toEqual(expect.arrayContaining(["dd", "shutdown"]));
+    expect(cfg.criticalPowerShellCommands).toEqual(expect.arrayContaining(["format-volume"]));
+    expect(cfg.sensitivePatterns).toContain("*.env");
   });
 
   it("default.json 与内置默认一致", () => {

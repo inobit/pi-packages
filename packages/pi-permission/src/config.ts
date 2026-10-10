@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-/** 插件配置，全部字段有内置默认值，支持全局/项目 config.json 逐字段覆盖（数组整体替换，readonlyTools 取并集）。 */
+/** 插件配置，全部字段有内置默认值，支持全局/项目 config.json 逐字段覆盖（数组字段跨层并集，非数组字段高层覆盖）。 */
 export interface PermissionConfig {
   /** 敏感文件清单（FR-1 / D2），glob 模式；含 `/` 的匹配绝对路径，否则匹配文件名。 */
   sensitivePatterns: string[];
@@ -14,7 +14,9 @@ export interface PermissionConfig {
    * 危险操作统一清单（FR-4，仅作用于 bash 工具），命中即 ask（build）/ deny（plan）。
    * 条目两种格式：纯命令名（如 `sudo`、`dd`）或 `git <子命令>`（如 `git commit`、`git push`）。
    * 不在清单中的 git 子命令视为只读（status/diff/log 等静默放行）；
-   * 固定规则不可配置：rm 递归（-r/-R/--recursive）与通配目标、chmod -R、chown -R、curl/wget 管道到 shell、wrapper 命令（bash -c/eval/sudo/xargs/find -exec）。
+   * 固定规则不可配置：rm 递归（-r/-R/--recursive）与通配目标、chmod/chown/chgrp -R、
+   * curl/wget 管道到 shell、wrapper 命令（bash -c/eval/sudo/xargs/find -exec）、
+   * chmod 数字形态 0?777、解释器 -c/-e 字面载荷命中严重级谓词。
    */
   dangerousBashCommands: string[];
   /** PowerShell 只读 cmdlet 白名单（FR-5 等价），规范名命中即视为只读；别名在分类前已归一化。 */
@@ -25,6 +27,18 @@ export interface PermissionConfig {
    * Remove-Item -Recurse/-Force、嵌套 pwsh/powershell 解释器、调用操作符 & / 点源 / 脚本块、irm|iex 类管道执行。
    */
   dangerousPowerShellCommands: string[];
+  /**
+   * 严重级（critical）bash 命令清单：主机级不可逆破坏，高 `dangerousBashCommands` 一级。
+   * chill 模式拿它做唯一 ask 来源；build 的有效危险数组为 `dangerousBashCommands ∪ criticalBashCommands`（并集匹配）。
+   * 条目格式同 `dangerousBashCommands`；并集语义下默认条目删不掉（要删改 `DEFAULT_CONFIG`）。
+   */
+  criticalBashCommands: string[];
+  /** 严重级 PowerShell 命令清单（chill 唯一 ask 来源之一；build 与 `dangerousPowerShellCommands` 取并集匹配）。 */
+  criticalPowerShellCommands: string[];
+  /** chill 模式命中敏感文件时的动作：默认 `deny`（与 yolo 同严）；置 `ask` 改为弹窗。 */
+  chillSensitiveAction: "deny" | "ask";
+  /** 新会话默认模式：仅开放 `build` / `chill`（显式 opt-in）；`yolo`/`plan` 与非法值回退 `build` 并告警。 */
+  defaultMode: "build" | "chill";
   /** trusted 外部路径前缀（FR-9）：落在前缀下的外部读写直接放行（如 `/tmp` 临时文件）；
    * realpath 双形态防软链逃逸；仅作用于目录放行层面，不改变危险/敏感判定的优先级。 */
   trustedExternalPaths: string[];
@@ -142,6 +156,23 @@ export const DEFAULT_CONFIG: PermissionConfig = {
     // 后台作业（脚本块任意执行，wrapper 已兜底，显式列出便于配置感知）
     "start-job", "receive-job",
   ],
+  criticalBashCommands: [
+    // 磁盘/分区销毁
+    "dd", "mkfs", "mkfs.ext2", "mkfs.ext3", "mkfs.ext4", "mkfs.xfs",
+    "fdisk", "gdisk", "parted", "wipefs",
+    // 断电/停机
+    "shutdown", "reboot", "halt", "poweroff", "init",
+  ],
+  criticalPowerShellCommands: [
+    // 磁盘/机器级破坏
+    "format-volume", "diskpart", "remove-computer",
+    // 断电/重启/日志清除
+    "restart-computer", "stop-computer", "clear-eventlog",
+  ],
+  // chill 敏感文件动作：默认 deny（与 yolo 一致，严于 build 的 ask）
+  chillSensitiveAction: "deny",
+  // 默认模式 build：存量行为不变，chill 需显式 opt-in
+  defaultMode: "build",
   // trusted 外部路径：默认 `/tmp`（运行时并入 os.tmpdir() 系统临时目录），可配置追加
   trustedExternalPaths: ["/tmp"],
   // 附加项目根：默认空，由用户按需配置；另有 findGitRoot 自动识别（path.ts）
@@ -164,12 +195,31 @@ const ARRAY_FIELDS = new Set<keyof PermissionConfig>([
   "sensitivePatterns",
   "readonlyBashCommands",
   "dangerousBashCommands",
+  "criticalBashCommands",
   "readonlyPowerShellCommands",
   "dangerousPowerShellCommands",
+  "criticalPowerShellCommands",
   "trustedExternalPaths",
   "additionalProjectRoots",
   "readonlyTools",
 ]);
+/** chill 敏感文件动作归一：非法值回退 `deny`（唯一安全默认），并在 debugLog 开启时告警。 */
+export function normalizeChillSensitiveAction(
+  value: unknown,
+  warn: (message: string) => void = () => {},
+): "deny" | "ask" {
+  if (value === "deny" || value === "ask") return value;
+  warn(`[pi-permission] invalid chillSensitiveAction ${JSON.stringify(value)}, falling back to "deny"`);
+  return "deny";
+}
+
+/** 默认模式归一：仅开放 build/chill；`yolo`/`plan` 与非法值回退 `build`（避免旁路 /yolo 的 UI 确认门与 plan 工具集接线）。 */
+export function normalizeDefaultMode(value: unknown, warn: (message: string) => void = () => {}): "build" | "chill" {
+  if (value === "build" || value === "chill") return value;
+  warn(`[pi-permission] invalid defaultMode ${JSON.stringify(value)}, falling back to "build"`);
+  return "build";
+}
+
 /** 与 pi 核心 getAgentDir() 对齐的 agent 根（尊重 PI_CODING_AGENT_DIR）。 */
 export function getAgentDir(): string {
   const env = process.env.PI_CODING_AGENT_DIR ?? process.env.PI_AGENT_DIR;
@@ -196,6 +246,7 @@ export function loadConfig(cwd: string, options: LoadConfigOptions = {}): Permis
   const projectPath = options.projectPath ?? path.join(cwd, ".pi", "extensions", "pi-permission", "config.json");
 
   const merged: PartialConfig = {};
+  const arrayGuardWarnings: string[] = [];
   for (const file of [globalPath, options.trusted === true ? projectPath : undefined]) {
     if (!file) continue;
     try {
@@ -207,6 +258,9 @@ export function loadConfig(cwd: string, options: LoadConfigOptions = {}): Permis
           // 数组字段：与既有值（已含 default/更低层）并集去重
           const base = merged[key] as string[] | undefined;
           (merged as Record<string, unknown>)[key] = [...new Set([...(base ?? []), ...(value as string[])])];
+        } else if (ARRAY_FIELDS.has(key)) {
+          // 数组字段给非数组值：跳过该层 + 告警，按默认生效（不抛，不污染后续展开）
+          arrayGuardWarnings.push(`[pi-permission] config field "${key}" must be an array, ignoring value from ${path.basename(file)}`);
         } else {
           (merged as Record<string, unknown>)[key] = value;
         }
@@ -226,5 +280,12 @@ export function loadConfig(cwd: string, options: LoadConfigOptions = {}): Permis
       ];
     }
   }
+  // 非数组标量字段归一（非法值回退安全默认，debugLog 开启时才告警）
+  const warnIfDebug = (message: string) => {
+    if (config.debugLog === true) console.warn(message);
+  };
+  config.chillSensitiveAction = normalizeChillSensitiveAction(config.chillSensitiveAction, warnIfDebug);
+  config.defaultMode = normalizeDefaultMode(config.defaultMode, warnIfDebug);
+  for (const message of arrayGuardWarnings) warnIfDebug(message);
   return config;
 }

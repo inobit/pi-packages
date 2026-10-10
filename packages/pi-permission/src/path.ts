@@ -13,6 +13,12 @@ export function expandHome(p: string, home: string): string {
   return p;
 }
 
+/** 展开 token 里的 `$env:VAR` 引用（PowerShell 形态，无法解析时保留原文供保守处理）。
+ * bash 侧同样需要：git-bash 下 `rm -rf $env:SystemRoot\...` 这类 Windows 目标要参与 §3.1 黑名单比较。 */
+export function expandEnvRef(token: string): string {
+  return token.replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/g, (_, name: string) => process.env[name] ?? `$env:${name}`);
+}
+
 /** 将路径归一化为绝对路径（相对路径按 cwd 解析，`~` 按 home 展开）。 */
 export function normalizePath(p: string, cwd: string, home: string): string {
   return path.resolve(cwd, expandHome(p, home));

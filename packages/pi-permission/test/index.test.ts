@@ -79,7 +79,7 @@ describe("index.ts 工厂装配", () => {
     expect(pi.commands.has("build")).toBe(true);
   });
 
-  it("注册 Alt+P 快捷键在 plan/build 间切换", async () => {
+  it("注册 Alt+P 快捷键按 plan → build → chill 循环", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-factory-"));
     const pi = makePi(dir);
     factory(pi as never);
@@ -94,7 +94,12 @@ describe("index.ts 工厂装配", () => {
       input: { filePath: "x" },
     };
 
-    // 默认 build：Alt+P 进入只读 plan，写工具被拒绝
+    // 默认 build：Alt+P 进入 chill（写仍放行，非敏感即 allow）
+    await toggle.handler(ctx as never);
+    const chillAllowed = await pi.emit("tool_call", writeCall as never, makeCtx(dir));
+    expect(chillAllowed).toBeUndefined();
+
+    // 再按 Alt+P 进入只读 plan，写工具被拒绝
     await toggle.handler(ctx as never);
     const denied = await pi.emit("tool_call", writeCall as never, makeCtx(dir));
     expect(denied).toMatchObject({ block: true });
@@ -210,6 +215,57 @@ describe("index.ts 工厂装配", () => {
 
     // build 常态：再次 turn 不注入（单次公告，无累积）
     expect(await pi.emit("before_agent_start", event, ctx)).toBeUndefined();
+  });
+
+  it("plan→chill 注入 build 公告（只读纠正），build/yolo→chill 零注入", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-factory-"));
+    const pi = makePi(dir);
+    factory(pi as never);
+    const ctx = makeCtx(dir);
+    const event = { type: "before_agent_start", prompt: "hi", systemPrompt: "BASE", systemPromptOptions: {} };
+
+    // build 首轮不注入
+    expect(await pi.emit("before_agent_start", event, ctx)).toBeUndefined();
+
+    // 进入 plan：注入只读提示
+    await pi.commands.get("plan")!.handler("", ctx as never);
+    expect(await pi.emit("before_agent_start", event, ctx)).toMatchObject({
+      systemPrompt: expect.stringContaining("PLAN mode — read-only"),
+    });
+
+    // plan→chill：复用只读纠正公告
+    await pi.commands.get("chill")!.handler("", ctx as never);
+    expect(await pi.emit("before_agent_start", event, ctx)).toMatchObject({
+      systemPrompt: expect.stringContaining("Plan mode off. Normal permission checks restored."),
+    });
+
+    // chill 驻留零注入
+    expect(await pi.emit("before_agent_start", event, ctx)).toBeUndefined();
+
+    // chill→build 注入 build 公告；驻留后 build→chill 仍零注入
+    await pi.commands.get("build")!.handler("", ctx as never);
+    expect(await pi.emit("before_agent_start", event, ctx)).toMatchObject({
+      systemPrompt: expect.stringContaining("Plan mode off. Normal permission checks restored."),
+    });
+    expect(await pi.emit("before_agent_start", event, ctx)).toBeUndefined();
+    await pi.commands.get("chill")!.handler("", ctx as never);
+    expect(await pi.emit("before_agent_start", event, ctx)).toBeUndefined();
+  });
+
+  it("yolo→chill 零注入（仅 plan 切出时复用只读纠正公告）", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-factory-"));
+    const pi = makePi(dir);
+    factory(pi as never);
+    const event = { type: "before_agent_start", prompt: "hi", systemPrompt: "BASE", systemPromptOptions: {} };
+    const ctxYolo = makeCtx(dir, { hasUI: true, ui: { notify: () => {}, select: async () => "y: confirm yolo", setStatus: () => {} } });
+    expect(await pi.emit("before_agent_start", event, ctxYolo)).toBeUndefined();
+    await pi.commands.get("yolo")!.handler("", ctxYolo as never);
+    expect(await pi.emit("before_agent_start", event, ctxYolo)).toMatchObject({
+      systemPrompt: expect.stringContaining("Yolo on: prompts bypassed"),
+    });
+    // yolo→chill：无 chill 切入公告
+    await pi.commands.get("chill")!.handler("", ctxYolo as never);
+    expect(await pi.emit("before_agent_start", event, ctxYolo)).toBeUndefined();
   });
 
   it("isToolCallEventType 类型收窄可用", () => {
@@ -503,7 +559,7 @@ describe("index.ts 工厂装配", () => {
     expect(ok).toBeUndefined();
   });
 
-  it("yolo 模式状态栏显示 Yolo（warning 色）", async () => {
+  it("yolo 模式状态栏显示 Yolo（error 色）", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-factory-"));
     const statuses = new Map<string, string>();
     const pi = makePi(dir);
@@ -733,5 +789,108 @@ describe("FR-10 批准键模式隔离（回归：build 批准不得泄漏到 pla
     };
     await pi.emit("tool_call", planEvent, ctx);
     expect(asked).toBe(true);
+  });
+});
+
+describe("defaultMode 接线与批准键模式隔离（chill）", () => {
+  /** 在临时 agent 根写全局配置并切 PI_CODING_AGENT_DIR，返回还原函数。 */
+  const withAgentDir = (config: Record<string, unknown>): (() => void) => {
+    const prev = process.env.PI_CODING_AGENT_DIR;
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-agent-"));
+    fs.mkdirSync(path.join(agentDir, "extensions", "pi-permission"), { recursive: true });
+    fs.writeFileSync(
+      path.join(agentDir, "extensions", "pi-permission", "config.json"),
+      JSON.stringify(config),
+    );
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    return () => {
+      if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prev;
+    };
+  };
+
+  it("defaultMode: chill → 会话启动状态栏 Chill，/build 后变 Build（prev 回退不失真）", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-factory-"));
+    const restore = withAgentDir({ defaultMode: "chill" });
+    try {
+      const statuses = new Map<string, string>();
+      const pi = makePi(dir);
+      factory(pi as never);
+      const ctx = makeCtx(dir, {
+        ui: { notify: () => {}, setStatus: (k: string, v: string | undefined) => statuses.set(k, v ?? "") },
+      });
+      await pi.emit("session_start", { type: "session_start" }, ctx);
+      expect(statuses.get("pi-permission-mode")).toBe("Chill");
+      await pi.commands.get("build")!.handler("", ctx as never);
+      expect(statuses.get("pi-permission-mode")).toBe("Build");
+    } finally {
+      restore();
+    }
+  });
+
+  it("FR-4 批准键含模式：chill 批准 rm 后 build 下同程序仍 ask", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-factory-"));
+    const pi = makePi(dir);
+    factory(pi as never);
+    const ctx = makeCtx(dir, { hasUI: true });
+    ctx.ui.select = async () => "s: allow session";
+    await pi.commands.get("chill")!.handler("", ctx);
+    const chillEvent = { type: "tool_call", toolCallId: "c1", toolName: "bash", input: { command: "rm -rf /tmp/pi-permission-x" } };
+    await pi.emit("tool_call", chillEvent as never, ctx);
+    // 同会话切 build：同 critical 程序必须重新 ask（chill 的会话级批准不得泄漏）
+    await pi.commands.get("build")!.handler("", ctx);
+    let asked = false;
+    ctx.ui.select = async () => {
+      asked = true;
+      return "n: deny";
+    };
+    await pi.emit("tool_call", { ...chillEvent, toolCallId: "b1" } as never, ctx);
+    expect(asked).toBe(true);
+  });
+
+  it("FR-1 批准键含模式：chillSensitiveAction=ask 下 chill 批准敏感文件后 build 下仍 ask", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-factory-"));
+    fs.writeFileSync(path.join(dir, ".env"), "KEY=1");
+    const restore = withAgentDir({ chillSensitiveAction: "ask" });
+    try {
+      const pi = makePi(dir);
+      factory(pi as never);
+      const ctx = makeCtx(dir, { hasUI: true });
+      ctx.ui.select = async () => "s: allow session";
+      await pi.commands.get("chill")!.handler("", ctx);
+      const readEvent = { type: "tool_call", toolCallId: "r1", toolName: "read", input: { path: ".env" } };
+      await pi.emit("tool_call", readEvent as never, ctx);
+      await pi.commands.get("build")!.handler("", ctx);
+      let asked = false;
+      ctx.ui.select = async () => {
+        asked = true;
+        return "n: deny";
+      };
+      await pi.emit("tool_call", { ...readEvent, toolCallId: "r2" } as never, ctx);
+      expect(asked).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it("chill 放行只写 debug 流（review 日志不记录放行）", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-factory-"));
+    const restore = withAgentDir({ defaultMode: "chill", debugLog: true });
+    try {
+      const pi = makePi(dir);
+      factory(pi as never);
+      const ctx = makeCtx(dir, { hasUI: false });
+      await pi.emit("session_start", { type: "session_start" }, ctx);
+      await pi.emit("tool_call", {
+        type: "tool_call",
+        toolCallId: "d1",
+        toolName: "bash",
+        input: { command: "git status" },
+      }, ctx);
+      const reviewFile = path.join(dir, "logs", "pi-permission", path.basename(dir), "pi-permission-review.jsonl");
+      expect(fs.existsSync(reviewFile)).toBe(false);
+    } finally {
+      restore();
+    }
   });
 });
