@@ -473,11 +473,31 @@ function chillShellDecision(req: BashDecisionRequest, adapter: ShellAdapter, lab
   // rm/remove-item 段只看收窄黑名单谓词（criticalChill），其余 critical 固定规则/清单原样生效；
   // chmod/chown/chgrp 亦只看 criticalChill（§3.1 规则 2 终版）：仅数字 0?777 的 chmod 会置位，
   // -R 递归与 chown/chgrp 全部走宽口径 critical（只对 build/plan 生效，chill 一律放行）
+  // rm/remove-item 的 trusted 豁免：全部写目标落在 trusted 前缀内则该段不计 critical（草稿区损失自担）；
+  // 敏感检查在前（①②），/tmp/.env 之类照样先 deny；chmod 777 与宽口径 critical 不在此列。
   const candidates = [...parsed.segments, ...payloads];
+  const candidateCwds = [
+    ...resolveSegmentCwds(parsed.segments, cwd, adapter),
+    ...resolveSegmentCwds(payloads, cwd, adapter),
+  ];
   const kinds = candidates.map((seg) => adapter.classify(seg, config));
   const isChillCritical = (k: SegmentClassLike, program: string): boolean =>
     k.criticalChill || (k.critical && !CHILL_NARROWED_PROGRAMS.has(program));
-  const criticalIndex = kinds.findIndex((k, i) => isChillCritical(k, candidates[i]!.program));
+  const trustedPrefixList = trustedPrefixes(config);
+  const isTrustedRm = (index: number): boolean => {
+    const seg = candidates[index]!;
+    if (seg.program !== "rm" && seg.program !== "remove-item") return false;
+    if (!kinds[index]!.criticalChill) return false;
+    const targets = adapter.writeTargets(seg);
+    if (targets.length === 0) return false;
+    const segCwd = candidateCwds[index] ?? cwd;
+    return targets.every((t) => {
+      // cd 失跟踪（`cd -` 等）时相对路径保守按非 trusted（与 build 侧同口径）
+      if (candidateCwds[index] === undefined && !path.isAbsolute(t)) return false;
+      return isTrustedPath(t, trustedPrefixList, segCwd, home());
+    });
+  };
+  const criticalIndex = kinds.findIndex((k, i) => isChillCritical(k, candidates[i]!.program) && !isTrustedRm(i));
   const criticalAny = criticalIndex >= 0 || adapter.pipeToShell(parsed.segments) || adapter.pipeToShell(payloads);
   if (criticalAny) {
     return {

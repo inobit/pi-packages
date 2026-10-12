@@ -83,15 +83,17 @@ chill 取英文"放松"义（chill = relaxed），不是"冷/冻结"。它位于
 其余（危险叠加、跨域引用、wrapper、X 程序、不可解析、未知）  → allow（FR-5）
 ```
 
-严重集合是危险谓词集中"主机级、难以逆转"的子集（不变式 `critical ⟹ danger`），因此**每个 critical 命令在 build 也 ask、在 plan 也 deny**。chill 的弹窗范围是该集合的收窄子集：`rm`/`Remove-Item` 仅当递归（`-r`/`-R`/`--recursive`）命中下列黑名单路径或通配目标时才 ask，`chmod` 仅数字 token `0?777` 命中时 ask。chill 会弹窗的默认清单全文：
+严重集合是危险谓词集中"主机级、难以逆转"的子集（不变式 `critical ⟹ danger`），因此**每个 critical 命令在 build 也 ask、在 plan 也 deny**。chill 的弹窗范围是该集合的收窄子集：`rm`/`Remove-Item` 仅当递归（`-r`/`-R`/`--recursive`）命中下列黑名单路径或通配目标时才 ask，`chmod` 仅数字 token `0?777` 命中时 ask。`rm`/`Remove-Item` 另有 trusted 豁免：该段**全部**写目标落在 trusted 前缀内（`trustedExternalPaths` ∪ `os.tmpdir()`，如 `/tmp`）则不弹窗——草稿区损失自担；敏感文件优先，`/tmp/.env` 照样先 deny。chill 会弹窗的默认清单全文：
 
 ```
 bash   rm -r/-R/--recursive 命中黑名单路径或通配目标、chmod 777/0777/7777、
        dd、mkfs*、fdisk、gdisk、parted、wipefs、shutdown、reboot、halt、poweroff、init、管道执行（curl|sh 等）
 PS     Format-Volume、diskpart、Remove-Computer、Restart-Computer、Stop-Computer、Clear-Eventlog、
-       Remove-Item -Recurse 命中黑名单路径或通配目标、iex/Invoke-Expression、icm/Invoke-Command、嵌套 pwsh/powershell
+       Remove-Item -Recurse 命中黑名单路径或通配目标（*）、iex/Invoke-Expression、icm/Invoke-Command、嵌套 pwsh/powershell
 共用   解释器 -c/-e 字面载荷命中 critical 谓词（rm -rf /、dd、shutdown 等）
 ```
+
+（*）trusted 豁免：该段全部写目标落在 trusted 前缀内（glob 按字面前缀判，相对路径按段 cwd 经 `cd` 跟踪后解析）则不弹窗——`rm -rf /tmp/*`、cwd 在 `/tmp` 下的 `rm -f tl_*.json` 放行；项目内的 `rm *.log`、`rm -rf ~/scratch`、混合命令（一段 trusted、一段域外）、`cd -` 失跟踪后的相对路径照样 ask。仅 `rm`/`remove-item` 豁免，`chmod 777`、`dd`/`mkfs*` 等恒弹窗。
 
 两套 `rm`/`Remove-Item` 黑名单全文（清单之外一律不在黑名单内）：
 

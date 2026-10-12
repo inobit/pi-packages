@@ -673,12 +673,41 @@ describe("chill 模式（§2.1 语义矩阵）", () => {
     ]) {
       expect(bashReq("chill", command).action, command).toBe("ask");
     }
-    // 裸 glob 与 `~` 展开后的 `/home/*` 前缀都算命中
-    expect(bashReq("chill", "rm -rf /tmp/*").action).toBe("ask");
+    // 裸 glob 与 `~` 展开后的 `/home/*` 前缀都算命中；但全目标落在 trusted 内（默认含 /tmp）则豁免
+    expect(bashReq("chill", "rm -rf /tmp/*").action).toBe("allow");
     expect(bashReq("chill", "rm -rf ~/scratch").action).toBe("ask");
     // 裸 glob 不要求递归（§3.1 规则 1）；`find . -exec rm {} ;` 的 `{}` 归一为通配占位同理
     expect(bashReq("chill", "rm *.log").action).toBe("ask");
     expect(bashReq("chill", "find . -exec rm {} ;").action).toBe("ask");
+  });
+
+  it("chill bash：rm trusted 豁免——全目标在 trusted 内放行，混合/域外仍 ask，敏感先行", () => {
+    // 绝对路径 trusted：glob 与递归黑名单外目标一律放行
+    for (const command of [
+      "rm -f /tmp/lsptest/tl_*.json /tmp/lsptest/daemon.log",
+      "rm -rf /tmp/lsptest",
+      "rm -rf /tmp/*",
+      "bash -c \"rm -rf /tmp/*\"", // 静态载荷层同样豁免
+      "sudo rm -rf /tmp/*", // sudo 剥离后的内层同样豁免
+    ]) {
+      const d = bashReq("chill", command);
+      expect(d.action, command).toBe("allow");
+      expect(d.rule, command).toBe("FR-5");
+    }
+    // 相对路径按段 cwd 解析：cwd 在 trusted 内才放行
+    const dir = tmpdir(); // os.tmpdir() 下，天然 trusted
+    expect(bashReq("chill", "rm -f tl_*.json", dir).action).toBe("allow");
+    expect(bashReq("chill", "rm -f tl_*.json", "/proj").action).toBe("ask");
+    // cd 跟踪：切进 trusted 后相对 glob 放行；`cd -` 失跟踪时保守仍 ask
+    expect(bashReq("chill", "cd /tmp/lsptest && rm -f tl_*.json", "/proj").action).toBe("allow");
+    expect(bashReq("chill", "cd - && rm -f tl_*.json", dir).action).toBe("ask");
+    // 混合命令：一段 trusted、一段域外 → 仍 ask
+    expect(bashReq("chill", "rm /tmp/*.log; rm -rf /etc").action).toBe("ask");
+    // 敏感先行：trusted 内的敏感文件照样 deny（FR-1 在 critical 之前）
+    fs.writeFileSync(path.join(dir, ".env"), "KEY=1");
+    const d = bashReq("chill", "rm -f /tmp/x.log", dir);
+    expect(d.action).toBe("allow"); // 非敏感文件名仅 trusted 豁免
+    expect(bashReq("chill", "rm -f .env", dir).action).toBe("deny");
   });
 
   it("chill bash：rm 黑名单 Windows 对照（§3.1 规则 1 Windows 镜像）——git-bash 形态盘符根/Windows 目录/主目录 ask", () => {
@@ -795,6 +824,17 @@ describe("chill 模式（§2.1 语义矩阵）", () => {
       expect(psReq("chill", command).action, command).toBe("ask");
     }
   });
+
+  it("chill powershell：Remove-Item trusted 豁免——全目标在 trusted 内放行（bash rm 镜像）", () => {
+    const dir = tmpdir(); // os.tmpdir() 下，天然 trusted
+    for (const command of [`Remove-Item ${dir}/*`, `Remove-Item -Recurse ${dir}`]) {
+      const d = psReq("chill", command);
+      expect(d.action, command).toBe("allow");
+      expect(d.rule, command).toBe("FR-5");
+    }
+    // 混合命令：一段 trusted、一段黑名单 → 仍 ask
+    expect(psReq("chill", `Remove-Item ${dir}/*; Remove-Item -Recurse C:\\`).action).toBe("ask");
+  });
 });
 
 describe("build 提级回归（§3.3 两类共享谓词）", () => {
@@ -819,7 +859,7 @@ describe("critical ⟹ danger 子集不变式（§2 统一解析）", () => {
   const criticalBashFixtures = [
     "rm -rf /",
     "rm -rf /etc",
-    "rm -rf /tmp/*",
+    "rm -rf /etc/*", // trusted 豁免后 /tmp/* 在 chill 下放行，此处用域外 glob 保持不变式覆盖
     "chmod 777 /usr/local/bin/tool",
     "chmod 777 ./run.sh",
     "dd if=/dev/zero of=/dev/sda",

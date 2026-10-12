@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.3.0] - 2026-10-12
+
+### Fixed
+
+- **Test isolation**: `index.test.ts` now points `PI_CODING_AGENT_DIR` at an empty temp dir, so the factory no longer reads the machine's real global config (`defaultMode`, etc.) or writes to the real log dir — previously 12 cases failed on machines whose global config sets `defaultMode: "chill"`.
+
+### Changed
+
+- **Chill `rm`/`Remove-Item` trusted exemption**: in chill mode, an `rm`/`remove-item` segment hitting the narrowed predicate (bare glob / recursive + blacklisted path) no longer asks when **every** write target of the segment resolves under a trusted prefix (`trustedExternalPaths` ∪ `os.tmpdir()`, `/tmp` by default) — scratch-area loss is yours to accept (FR-5 allow). Globs match literally by prefix; relative paths resolve against the per-segment cwd after `cd` tracking, and stay conservative (ask) when the cwd is untracked (e.g. after `cd -`); mixed commands (one trusted segment, one outside) still ask; the sensitive check runs first, so `/tmp/.env` is still denied (FR-1). Wide criticals (`chmod 777`, `dd`/`mkfs*`, …), interpreter literal payloads and pipe-to-shell are unaffected and always ask. `rm -rf /tmp/*` changes from ask to allow in chill; all other modes are untouched.
+
 ## [1.2.0] - 2026-10-10
 
 ### Added

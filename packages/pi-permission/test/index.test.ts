@@ -7,6 +7,12 @@ import factory from "../src/index.ts";
 
 type EventHandler = (event: unknown, ctx: unknown) => unknown;
 
+// 测试隔离：factory 在运行时经 getAgentDir() 读取真实全局配置
+//（`~/.pi/agent/extensions/pi-permission/config.json`，本机可能设了 `defaultMode: "chill"` 之类），
+// 会污染“默认 build”的用例假设；同时审计日志也会写进真实 log 目录。
+// 指向空临时目录后全局层不存在，全部回退内置默认，且日志落临时目录。
+process.env.PI_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-agent-"));
+
 function makeCtx(cwd: string, overrides: Record<string, unknown> = {}) {
   return {
     cwd,
@@ -80,7 +86,8 @@ describe("index.ts 工厂装配", () => {
   });
 
   it("注册 Alt+P 快捷键按 plan → build → chill 循环", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-permission-factory-"));
+    // 用固定非 trusted 路径：mkdtemp 落在 os.tmpdir() 下天然 trusted，plan 会把写当 scratch 放行，测不出 deny
+    const dir = "/proj-index-toggle";
     const pi = makePi(dir);
     factory(pi as never);
     expect(pi.shortcuts.has("alt+p")).toBe(true);
@@ -91,7 +98,7 @@ describe("index.ts 工厂装配", () => {
       type: "tool_call",
       toolCallId: "1",
       toolName: "write",
-      input: { filePath: "x" },
+      input: { path: "x" },
     };
 
     // 默认 build：Alt+P 进入 chill（写仍放行，非敏感即 allow）

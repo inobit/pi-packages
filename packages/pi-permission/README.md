@@ -86,15 +86,22 @@ everything else (danger overlay, cross-domain refs, wrappers,    -> allow (FR-5)
   X programs, unparseable, unknown)
 ```
 
-The critical set is the host-level, hard-to-reverse slice of the dangerous predicate set (`critical ⟹ dangerous`), so **every critical command asks in `build` and `deny`s in `plan` too**. Chill's ask scope is a narrowed subset of that set — `rm`/`Remove-Item` only ask when recursion (`-r`/`-R`/`--recursive`) targets one of the blacklisted paths enumerated below or a wildcard target, and `chmod` only on the numeric `0?777` token. Full default contents of what chill asks for:
+The critical set is the host-level, hard-to-reverse slice of the dangerous predicate set (`critical ⟹ dangerous`), so **every critical command asks in `build` and `deny`s in `plan` too**. Chill's ask scope is a narrowed subset of that set — `rm`/`Remove-Item` only ask when recursion (`-r`/`-R`/`--recursive`) targets one of the blacklisted paths enumerated below or a wildcard target, and `chmod` only on the numeric `0?777` token. `rm`/`Remove-Item` are additionally exempt when **every** write target of the segment falls under a trusted prefix (`trustedExternalPaths` plus `os.tmpdir()`, e.g. `/tmp`): scratch-area loss is yours to accept. Sensitive files still win — `/tmp/.env` is denied before the exemption is even considered. Full default contents of what chill asks for:
 
 ```
-Bash   rm -r/-R/--recursive on a blacklisted path or with a wildcard target, chmod 777/0777/7777,
+Bash   rm -r/-R/--recursive on a blacklisted path or with a wildcard target (*), chmod 777/0777/7777,
        dd, mkfs*, fdisk, gdisk, parted, wipefs, shutdown, reboot, halt, poweroff, init, pipe-to-shell
 PS     Format-Volume, diskpart, Remove-Computer, Restart-Computer, Stop-Computer, Clear-Eventlog,
-       Remove-Item -Recurse on a blacklisted path or with a wildcard target,
+       Remove-Item -Recurse on a blacklisted path or with a wildcard target (*),
        iex/Invoke-Expression, icm/Invoke-Command, nested pwsh/powershell
 Shared interpreter -c/-e literal payload hitting a critical predicate (rm -rf /, dd, shutdown, ...)
+
+(*) trusted exemption: a segment whose every write target resolves under a trusted prefix
+    (`trustedExternalPaths` ∪ `os.tmpdir()`, glob patterns matched literally, relative paths resolved
+    against the segment cwd after `cd` tracking) does not ask — `rm -rf /tmp/*` and `rm -f tl_*.json`
+    with cwd under `/tmp` are allowed, while `rm *.log` in a project dir, `rm -rf ~/scratch`,
+    `rm /tmp/*.log; rm -rf /etc` (mixed) and `cd - && rm -f tl_*.json` (untracked cwd) still ask.
+    Only `rm`/`remove-item` are exempt; `chmod 777`, `dd`/`mkfs*` and the rest always ask.
 ```
 
 Both `rm`/`Remove-Item` blacklists in full — nothing outside them is blacklisted:
