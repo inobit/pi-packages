@@ -23,6 +23,59 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { NvimConfig } from "./config.ts";
+import { truncateError } from "./result.ts";
+
+/** daemon 启动日志文件名（stderr 重定向，启动健康检查用） */
+export const DAEMON_LOG_NAME = "daemon.log";
+
+/** 启动健康只看日志尾部行数（有界读取，防大日志） */
+export const DAEMON_LOG_TAIL_LINES = 20;
+
+/** 启动错误行匹配（nvim 配置报错特征；命中即 degraded，不 throw） */
+export const DAEMON_LOG_ERROR_RE = /Error detected while processing|^E\d+:/;
+
+/**
+ * 日志尾部 degraded 行提取（纯函数，可单测）：取末 tailN 行，命中错误正则的逐行走错误截断。
+ * 调用方读文件后调此函数；文件缺失/为空即 []（healthy）。
+ */
+export function degradedLinesFromLog(logText: string, tailN: number = DAEMON_LOG_TAIL_LINES): string[] {
+	if (!logText) return [];
+	const lines = logText.split("\n");
+	const tail = lines.slice(Math.max(0, lines.length - tailN));
+	return tail.filter((l) => DAEMON_LOG_ERROR_RE.test(l)).map((l) => truncateError(l));
+}
+
+/**
+ * degraded 下次 ensure 是否强制 fresh 重起（纯函数，可单测）：瘸配置修完即生效，
+ * 修不好则每次重起后仍 degraded（调用方照常 surface degraded，不隐藏）。
+ */
+export function shouldForceFresh(prevDegraded: boolean): boolean {
+	return prevDegraded;
+}
+
+/** 同步读日志尾 degraded 行（文件缺失即 healthy，不抛错） */
+export function readDegradedLines(logPath: string, tailN: number = DAEMON_LOG_TAIL_LINES): string[] {
+	try {
+		// 有界尾读：只读最后 64KB（病态刷屏日志不进内存），再取尾 tailN 行
+		const fd = fs.openSync(logPath, "r");
+		try {
+			const size = fs.fstatSync(fd).size;
+			const start = Math.max(0, size - 65536);
+			const buf = Buffer.alloc(size - start);
+			fs.readSync(fd, buf, 0, buf.length, start);
+			return degradedLinesFromLog(buf.toString("utf8"), tailN);
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return [];
+	}
+}
+
+/** daemon 日志路径（随 socket 目录，GC/退出时同目录回收） */
+export function logPathFor(sockDir: string): string {
+	return path.join(sockDir, DAEMON_LOG_NAME);
+}
 
 /** 请求种类（桥接入口名一一对应） */
 export type BridgeFn = "diagnose" | "format";
@@ -141,6 +194,10 @@ export interface DaemonHandles {
 	sockPath: string;
 	readyPath: string;
 	pidPath: string;
+	/** daemon stderr 日志（启动健康检查读尾 20 行） */
+	logPath: string;
+	/** 启动健康 degraded 行（healthy 为空；content 头行＋details 同源，走错误截断） */
+	degradedLines?: string[];
 	childPid?: number;
 }
 
@@ -157,6 +214,8 @@ export class DaemonManager {
 	private readonly mutex = new DaemonMutex();
 	private handles?: DaemonHandles;
 	private ensuredKey?: string;
+	/** 上次 ensure 是否 degraded（degraded 下次 ensure 强制 fresh 重起，瘸配置修完即生效） */
+	private prevDegraded = false;
 
 	constructor(
 		private cfg: NvimConfig,
@@ -169,6 +228,7 @@ export class DaemonManager {
 		this.cfg = cfg;
 		this.handles = undefined;
 		this.ensuredKey = undefined;
+		this.prevDegraded = false;
 	}
 
 	getConfig(): NvimConfig {
@@ -188,6 +248,8 @@ export class DaemonManager {
 			sockPath: sockPathFor(sockDir),
 			readyPath: path.join(sockDir, "ready"),
 			pidPath: path.join(sockDir, "daemon.pid"),
+			logPath: logPathFor(sockDir),
+			degradedLines: undefined,
 			childPid: undefined,
 		};
 		this.ensuredKey = key;
@@ -199,17 +261,42 @@ export class DaemonManager {
 		return this.mutex.runExclusive(fn);
 	}
 
-	/** ensure：connect 通即复用；否则 unlink 僵尸后 spawn＋等就绪（ready＋connect 双条件） */
+/**
+	 * ensure 三档：healthy（就绪＋日志干净）／degraded（就绪但日志尾 20 行命中报错特征，
+	 * surface 给模型，不 throw）／failed（spawn 失败 throw 不变）。
+	 * connect 通即复用（复用也要读日志定档）；degraded 下次 ensure 强制 fresh 重起。
+	 */
 	async ensure(opts: EnsureOptions): Promise<DaemonHandles> {
 		const h = this.prepare(opts.sessionId);
-		if (await probeSocket(h.sockPath)) return h;
+		if (shouldForceFresh(this.prevDegraded)) {
+			// 上次 degraded：强制 fresh（瘸配置修完即生效；修不好则本次仍 degraded，照常 surface）
+			await this.killStuck(h).catch(() => undefined);
+			unlinkIfExists(h.sockPath);
+			await this.spawnDaemon(h, opts.cwd);
+			await this.waitReady(h);
+			await this.gcSiblings(opts.sessionId, h.sockDir).catch(() => undefined);
+			this.refreshHealth(h);
+			return h;
+		}
+		if (await probeSocket(h.sockPath)) {
+			this.refreshHealth(h);
+			return h;
+		}
 		// 僵尸或从未启动：unlink 后重起（pid 复用撞名天然覆盖）
 		unlinkIfExists(h.sockPath);
 		await this.spawnDaemon(h, opts.cwd);
 		await this.waitReady(h);
 		// spawn 成功后 GC 同 session 兄弟目录（connect 已死的才整目录删）
 		await this.gcSiblings(opts.sessionId, h.sockDir).catch(() => undefined);
+		this.refreshHealth(h);
 		return h;
+	}
+
+	/** 就绪后读日志尾 20 行定档（healthy/degraded；failed 走 throw 不经此） */
+	private refreshHealth(h: DaemonHandles): void {
+		const lines = readDegradedLines(h.logPath);
+		h.degradedLines = lines.length > 0 ? lines : undefined;
+		this.prevDegraded = lines.length > 0;
 	}
 
 	private async spawnDaemon(h: DaemonHandles, cwd: string): Promise<void> {
@@ -221,6 +308,7 @@ export class DaemonManager {
 		}
 		unlinkIfExists(h.readyPath);
 		unlinkIfExists(h.pidPath);
+		// stderr 重定向进 daemon.log（启动健康读尾 20 行；随 socket 目录 GC/退出回收）
 		const env: NodeJS.ProcessEnv = {
 			...process.env,
 			PI_NVIM_SOCK_DIR: h.sockDir,
@@ -240,15 +328,39 @@ export class DaemonManager {
 			`luafile ${h.bridgePath.replaceAll(" ", "\\ ")}`,
 		];
 		await new Promise<void>((resolve, reject) => {
+			let logFd = -1;
+			try {
+				// P1-1：必须 "w"（fresh 日志）：append 会让修好配置后的 daemon 仍读到旧报错，degraded 恒真、每次 ensure 强制重起
+			logFd = fs.openSync(h.logPath, "w");
+			} catch {
+				logFd = -1;
+			}
+			const closeLogFd = (): void => {
+				if (logFd >= 0) {
+					try {
+						fs.closeSync(logFd);
+					} catch {
+						// 忽略
+					}
+					logFd = -1;
+				}
+			};
 			const child = spawn(this.cfg.nvimPath, args, {
 				cwd,
 				env,
 				detached: true,
-				stdio: ["ignore", "ignore", "ignore"],
+				stdio: logFd >= 0 ? ["ignore", "ignore", logFd] : ["ignore", "ignore", "ignore"],
 			});
-			child.on("error", reject);
+			child.on("error", (err) => {
+				closeLogFd();
+				// spawn 失败 throw 不变（failed 档）；异常文走错误截断（非结构化、前重后轻）
+				reject(new Error(truncateError(`@inobit/pi-nvim: daemon spawn 失败：${err.message}`)));
+			});
 			// 先等 spawn 成功再 resolve：否则 ENOENT 类错误在 resolve 后触发即被吞。
-			child.on("spawn", () => resolve());
+			child.on("spawn", () => {
+				closeLogFd();
+				resolve();
+			});
 			// 启动即脱离：stdio EOF 级联回收靠 :qa!，spawn 侧 unref 不留守
 			child.unref();
 			h.childPid = child.pid;
@@ -263,8 +375,10 @@ export class DaemonManager {
 			if (ready && (await probeSocket(h.sockPath))) return;
 			if (Date.now() >= deadline) {
 				throw new Error(
-					`@inobit/pi-nvim: daemon 启动超时（${this.cfg.timeouts.spawnMs}ms，sock=${h.sockPath}）；` +
-						"请确认 nvim 可用且用户配置可 headless 加载。",
+					truncateError(
+						`@inobit/pi-nvim: daemon 启动超时（${this.cfg.timeouts.spawnMs}ms，sock=${h.sockPath}）；` +
+							"请确认 nvim 可用且用户配置可 headless 加载。",
+					),
 				);
 			}
 			await sleep(this.cfg.timeouts.pollMs);
@@ -296,10 +410,12 @@ export class DaemonManager {
 			await this.kickDaemon(h, fn, reqPath, resPath);
 			const raw = await this.waitResult(resPath, signal);
 			const parsed: unknown = JSON.parse(raw);
-			// Lua 侧异常／关闭中：{ error } 结果转抛错（绝不误报 clean）
+			// Lua 侧异常／关闭中：{ error } 结果转抛错（绝不误报 clean；信封文走错误截断）
 			if (parsed && typeof parsed === "object" && "error" in parsed) {
 				const msg = (parsed as { error?: unknown }).error;
-				throw new Error(`@inobit/pi-nvim: daemon 回错：${typeof msg === "string" ? msg : "unknown"}`);
+				throw new Error(
+					truncateError(`@inobit/pi-nvim: daemon 回错：${typeof msg === "string" ? msg : "unknown"}`),
+				);
 			}
 			return parsed;
 		} finally {
@@ -324,7 +440,9 @@ export class DaemonManager {
 			child.on("error", (err) => {
 				reject(
 					new Error(
-						`@inobit/pi-nvim: sender 发起失败（判 daemon 死）：${err.message}；下次调用将重起 daemon。`,
+						truncateError(
+							`@inobit/pi-nvim: sender 发起失败（判 daemon 死）：${err.message}；下次调用将重起 daemon。`,
+						),
 					),
 				);
 			});
@@ -333,7 +451,7 @@ export class DaemonManager {
 				else
 					reject(
 						new Error(
-							`@inobit/pi-nvim: sender 退出码 ${String(code)}（判 daemon 死）；下次调用将重起 daemon。`,
+							truncateError(`@inobit/pi-nvim: sender 退出码 ${String(code)}（判 daemon 死）；下次调用将重起 daemon。`),
 						),
 					);
 			});
@@ -344,7 +462,7 @@ export class DaemonManager {
 		const deadline = Date.now() + this.cfg.timeouts.requestMs;
 		for (;;) {
 			if (signal?.aborted) {
-				throw new DaemonAbortedError("请求被中断（signal aborted），返回 partial。");
+				throw new DaemonAbortedError(truncateError("请求被中断（signal aborted），返回 partial。"));
 			}
 			try {
 				// P2-8 已知残留：writefile 与 readFileSync 理论有部分读窗口；小文件风险极低，JSON.parse 失败抛错可重试
@@ -354,7 +472,7 @@ export class DaemonManager {
 			}
 			if (Date.now() >= deadline) {
 				throw new DaemonTimeoutError(
-					`daemon 请求超时（${this.cfg.timeouts.requestMs}ms）；已判卡死，下次调用将杀重建。`,
+					truncateError(`daemon 请求超时（${this.cfg.timeouts.requestMs}ms）；已判卡死，下次调用将杀重建。`),
 				);
 			}
 			await sleep(this.cfg.timeouts.pollMs);

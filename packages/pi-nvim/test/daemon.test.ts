@@ -3,11 +3,18 @@
  * daemon 真机行为（spawn/探活/轮询）不进单测，靠冒烟验证。
  */
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	DaemonMutex,
+	degradedLinesFromLog,
+	logPathFor,
+	readDegradedLines,
 	remoteSendKeys,
 	sanitizeSessionId,
+	shouldForceFresh,
 	siblingPrefix,
 	sockBaseDir,
 	socketDirFor,
@@ -90,5 +97,60 @@ describe("DaemonMutex", () => {
 		).rejects.toThrow("boom");
 		const out = await m.runExclusive(async () => 42);
 		expect(out).toBe(42);
+	});
+});
+
+describe("degradedLinesFromLog（启动健康纯函数）", () => {
+	it("空日志即 healthy", () => {
+		expect(degradedLinesFromLog("")).toEqual([]);
+		expect(degradedLinesFromLog("ready\nlistening\n")).toEqual([]);
+	});
+	it("Error detected while processing 命中", () => {
+		const out = degradedLinesFromLog("ok\nError detected while processing init.lua:42\nok\n");
+		expect(out).toHaveLength(1);
+		expect(out[0]).toContain("Error detected while processing");
+	});
+	it("^E\\d+: 命中（E123/E492 等）", () => {
+		const out = degradedLinesFromLog("ok\nE492: Not an editor command\n");
+		expect(out).toEqual(["E492: Not an editor command"]);
+	});
+	it("只看尾 20 行（旧报错不翻旧账）", () => {
+		const head = "Error detected while processing early\n";
+		const tail = Array.from({ length: 25 }, () => "ok line\n").join("");
+		expect(degradedLinesFromLog(head + tail)).toEqual([]);
+	});
+	it("尾 20 行内命中照常 surface", () => {
+		const filler = Array.from({ length: 25 }, () => "ok line\n").join("");
+		expect(degradedLinesFromLog(filler + "E123: late boom\n")).toHaveLength(1);
+	});
+	it("超长 degraded 行走错误截断", () => {
+		const out = degradedLinesFromLog(`E1: ${"x".repeat(2500)}\n`);
+		expect(out[0]).toContain("…(truncated ");
+	});
+});
+
+describe("shouldForceFresh（degraded 重起语义）", () => {
+	it("degraded 下次 ensure 强制 fresh", () => {
+		expect(shouldForceFresh(true)).toBe(true);
+	});
+	it("healthy 复用（不强制重起）", () => {
+		expect(shouldForceFresh(false)).toBe(false);
+	});
+});
+
+describe("启动健康 IO", () => {
+	it("logPath 随 socket 目录", () => {
+		expect(logPathFor("/s/pi-nvim-a-1")).toBe("/s/pi-nvim-a-1/daemon.log");
+	});
+	it("缺失日志文件即 healthy（不抛错）", () => {
+		expect(readDegradedLines("/definitely/missing/pi-nvim-daemon.log")).toEqual([]);
+	});
+	it("大日志只读尾部（有界，不整文件进内存）", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nvim-biglog-"));
+		const log = path.join(dir, "daemon.log");
+		const filler = "x".repeat(100000);
+		fs.writeFileSync(log, filler + "\nError detected while processing BufReadPost\n");
+		expect(readDegradedLines(log)).toHaveLength(1);
+		fs.rmSync(dir, { recursive: true, force: true });
 	});
 });

@@ -25,6 +25,12 @@ local DEF_ATTACH_MS = tonumber(vim.fn.getenv("PI_NVIM_ATTACH_MS")) or 20000
 local DEF_DIAG_MS = tonumber(vim.fn.getenv("PI_NVIM_DIAG_MS")) or 10000
 local DEF_FORMAT_MS = tonumber(vim.fn.getenv("PI_NVIM_FORMAT_MS")) or 20000
 
+-- 批级诊断落定参数（P0 校准依据：本地 headless 实测冷启动 edit→首诊断
+-- ts ~2.5s（3 次：2475/2477/2505ms，attach 后 ~2.0s）、go ~0.6s、py ~0.3s；
+-- ts 最慢，故最小时间线取 3s（覆盖 ts 冷启动＋余量），静默期 0.5s 防诊断分波到达）。
+local MIN_SETTLE_MS = tonumber(vim.fn.getenv("PI_NVIM_MIN_SETTLE_MS")) or 3000
+local QUIET_MS = 500
+
 local function sock_path(name)
   return SOCK_DIR .. "/" .. name
 end
@@ -185,33 +191,43 @@ local function counts_equal(a, b)
   return true
 end
 
--- 诊断落定等待（push/pull 兼容）：计数连续两次采样不变即提前返回，硬上界 budget；
--- 全零诊断文件只多付 ~200ms，不付满 budget（最坏延迟有界，见包内注释）。
+-- 批级诊断落定（push/pull 兼容）：attach 全齐后，对整批 buffer 只做一次等待。
+-- 语义：有新诊断到达即续（last_change 重置）；无新诊断持续 QUIET_MS 且已过
+-- 最小时间线 MIN_SETTLE_MS 才收；硬上界 budget（diagMs，per-request 覆盖保留）。
+-- 背景（P0）：旧逻辑“计数连续两次采样不变即返”把“还没开始（暂 0）”当成“真干净”——
+-- ts 冷启动 attach 后 ~2s 才出首诊断，首调必 miss。全零真干净文件多付
+-- MIN_SETTLE_MS＋QUIET_MS（~3.5s），不付满 budget；慢诊断按到达即续，最坏延迟有界。
+-- 注意：diagMs 若小于 MIN_SETTLE_MS，最小线永不到，按 budget 到期返回（budget 恒为上界）。
 local function wait_diag_settled(bufnrs, budget_ms)
-  -- 刻意防御上限：诊断落定通常 <2s；配再大也只加最坏延迟、不加检出率，故钳在 10s（配置失真是有意为之）
-  local deadline = math.min(budget_ms, 10000)
+  if #bufnrs == 0 then
+    return
+  end
+  local budget = budget_ms or DEF_DIAG_MS
   local start = vim.uv.now()
   local last = diag_counts(bufnrs)
-  local stable = 0
-  while vim.uv.now() - start < deadline do
+  local last_change = start
+  while true do
     if PiNvim._shutdown then
+      return
+    end
+    local now = vim.uv.now()
+    if now - start >= budget then
+      return
+    end
+    if now - start >= MIN_SETTLE_MS and now - last_change >= QUIET_MS then
       return
     end
     vim.wait(100)
     local cur = diag_counts(bufnrs)
-    if counts_equal(cur, last) then
-      stable = stable + 1
-    else
+    if not counts_equal(cur, last) then
       last = cur
-      stable = 0
-    end
-    if stable >= 2 then
-      return
+      last_change = vim.uv.now()
     end
   end
 end
 
--- vim.diagnostic → 结果 shape（截断在 pi 侧；此处只搬运，不含文件内容）
+-- vim.diagnostic → 结果 shape（诊断全量搬运，不含文件内容；severity 优先排序：
+-- error→warning→info→hint 再按行列，阅读优先级，非截断服务——诊断本就不截断）
 local function collect_diags(bufnr)
   local out = {}
   for _, d in ipairs(vim.diagnostic.get(bufnr)) do
@@ -223,6 +239,15 @@ local function collect_diags(bufnr)
       message = d.message or "",
     })
   end
+  table.sort(out, function(a, b)
+    if a.severity ~= b.severity then
+      return a.severity < b.severity
+    end
+    if a.line ~= b.line then
+      return a.line < b.line
+    end
+    return a.col < b.col
+  end)
   return out
 end
 
@@ -253,8 +278,10 @@ local function ensure_current(entry)
     and vim.api.nvim_buf_get_name(entry.buf) == entry.file
 end
 
--- 单文件 format＝模拟用户按 :w（四态：formatted 由写前写后比较得出）
-local function format_one(entry, diag_budget_ms)
+-- 单文件写盘＝模拟用户按 :w（只管门控＋写盘＋内容比较；不等待不收诊断——
+-- per-file settle 会把“还没开始（暂 0）”当成“真干净”，诊断由批级 settle 后统一 collect）。
+-- 返回写盘元信息（_buf/_keep 为批组装用，组装后剥除再落结果文件）。
+local function format_write(entry)
   local t0 = vim.uv.now()
   local finish = function(result)
     result.ms = vim.uv.now() - t0
@@ -266,7 +293,6 @@ local function format_one(entry, diag_budget_ms)
       formatted = false,
       reason = "format-error",
       changed_lines = 0,
-      diags = {},
       error = entry.edit_error,
     })
   end
@@ -276,21 +302,19 @@ local function format_one(entry, diag_budget_ms)
       formatted = false,
       reason = "format-error",
       changed_lines = 0,
-      diags = {},
+      _buf = entry.buf,
     })
   end
   local buf = entry.buf
   -- 门控：无 formatting client 记 no-formatter（buf.format 无 client 仅 notify，必须显式分支）
   local formatters = vim.lsp.get_clients({ bufnr = buf, method = "textDocument/formatting" })
   if #formatters == 0 then
-    wait_diag_settled({ buf }, diag_budget_ms)
     return finish({
       file = entry.file,
       formatted = false,
       reason = "no-formatter",
       changed_lines = 0,
-      diags = collect_diags(buf),
-      no_client = #vim.lsp.get_clients({ bufnr = buf }) == 0 or nil,
+      _buf = buf,
     })
   end
   local before = buf_lines(buf)
@@ -307,19 +331,18 @@ local function format_one(entry, diag_budget_ms)
       formatted = false,
       reason = "write-error",
       changed_lines = count_changed(before, after),
-      diags = collect_diags(buf),
+      _buf = buf,
       _keep = true,
     })
   end
   local after = buf_lines(buf)
   local changed = count_changed(before, after)
-  wait_diag_settled({ buf }, diag_budget_ms)
   return finish({
     file = entry.file,
     formatted = changed > 0,
-    reason = "ok",
+    reason = changed > 0 and "ok" or "unchanged",
     changed_lines = changed,
-    diags = collect_diags(buf),
+    _buf = buf,
   })
 end
 
@@ -353,8 +376,9 @@ function PiNvim.diagnose(req_path, res_path)
     local diag_ms = req.diagMs or DEF_DIAG_MS
     local entries = edit_batch(files)
     wait_attach(entries, attach_ms)
-    -- 诊断落定（push/pull 兼容）：冷启动 attach 后诊断异步到达，不等即大概率空结果；
-    -- 计数稳定即提前返回，全零文件只多付 ~200ms（有界，不付满 budget）
+    -- 批级落定（push/pull 兼容）：冷启动 attach 后诊断异步到达，不等即大概率空结果；
+    -- 整批 buffer 只做一次 settle 等待（有新诊断到达即续，无新诊断持续 QUIET_MS 且过
+    -- 最小时间线 MIN_SETTLE_MS 才收），然后逐文件直接 collect（diagnose/format 同路径）。
     local settle = {}
     for _, e in ipairs(entries) do
       if e.buf ~= nil and vim.api.nvim_buf_is_valid(e.buf) then
@@ -400,16 +424,38 @@ function PiNvim.format(req_path, res_path)
     local entries = edit_batch(files)
     -- 先全 edit 再统一等 attach（并发冷启动）；按 formatting 能力等，防误判 no-formatter
     wait_attach(entries, attach_ms, "textDocument/formatting")
+    -- 先逐文件写盘（不管诊断），再整批只做一次 settle，最后逐文件直接 collect
+    -- （diagnose/format 同走批级落定路径；per-file settle 已删）
+    local pending = {}
+    for _, e in ipairs(entries) do
+      table.insert(pending, format_write(e))
+    end
+    local settle = {}
+    for _, r in ipairs(pending) do
+      if r._buf ~= nil and vim.api.nvim_buf_is_valid(r._buf) then
+        table.insert(settle, r._buf)
+      end
+    end
+    wait_diag_settled(settle, diag_ms)
     local per_file = {}
     local wipe = {}
-    for _, e in ipairs(entries) do
-      local one = format_one(e, diag_ms)
-      local keep = one._keep
-      one._keep = nil
-      table.insert(per_file, one)
+    for _, r in ipairs(pending) do
+      if r._buf ~= nil and vim.api.nvim_buf_is_valid(r._buf) then
+        r.diags = collect_diags(r._buf)
+        if #vim.lsp.get_clients({ bufnr = r._buf }) == 0 then
+          r.no_client = true
+        end
+      else
+        r.diags = r.diags or {}
+      end
+      local keep = r._keep
+      local buf = r._buf
+      r._keep = nil
+      r._buf = nil
+      table.insert(per_file, r)
       -- 写失败留现场不 wipe，下次碰到报残留；其余批末 wipe
-      if not keep and e.buf ~= nil then
-        table.insert(wipe, e.buf)
+      if not keep and buf ~= nil then
+        table.insert(wipe, buf)
       end
     end
     wipe_buffers(wipe)

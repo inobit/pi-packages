@@ -5,9 +5,10 @@
  * - `nvim_format`（写盘格式化）：逐文件 `withFileMutationQueue(file, fn)` 包裹后调 daemon
  *   （Phase 1 逐文件往返；批量单往返为后续优化项）。
  * - 对外靠 `executionMode: "sequential"` 串行，对内靠 daemon 互斥队列串行。
- * - execute 返回 `{ content（截断后文本）, details（完整 JSON 重建用） }`；失败 throw；
+ * - execute 返回 `{ content（全量诊断文本）, details（完整 JSON 重建用） }`；失败 throw；
  *   `signal.aborted` 跳过剩余文件返回 partial（注：execute 返回无 isError 位，
  *   中断以正文 partial 注记＋details.aborted 表达，真失败才 throw）。
+ * - 诊断全量（结构化、可再生，不截断）；错误文本统一走 truncateError（见 result.ts）。
  */
 
 import type {
@@ -23,14 +24,15 @@ import {
 	DaemonTimeoutError,
 } from "./daemon.ts";
 import {
-	budgetsOf,
+	degradedHeader,
 	parseDiagnosePayload,
 	parseFormatPayload,
 	renderFormatContent,
 	renderLspContent,
-	truncateBatch,
+	type DiagnoseFileResult,
 	type FormatFileResult,
 } from "./result.ts";
+import { partitionFiles } from "./scope.ts";
 
 export const NvimFilesParams = Type.Object(
 	{
@@ -61,23 +63,23 @@ function cwdOf(ctx: ExtensionContext): string {
 	return typeof ctx.cwd === "string" && ctx.cwd !== "" ? ctx.cwd : process.cwd();
 }
 
-/** nvim_lsp details：完整诊断（未截断）＋截断计数 */
+/** nvim_lsp details：全量诊断（不截断诊断数组；错误文走错误截断） */
 export interface NvimLspDetails {
 	kind: "nvim_lsp";
-	files: Array<{ file: string; diags: unknown[]; no_client?: boolean; error?: string }>;
-	shown: number;
-	total: number;
+	files: DiagnoseFileResult[];
 	aborted?: boolean;
+	/** 启动健康 degraded 行（healthy 时缺省；逐行走错误截断） */
+	degraded_lines?: string[];
 }
 
-/** nvim_format details：完整 per-file 四态（未截断）＋截断计数 */
+/** nvim_format details：完整 per-file 五态（不截断诊断数组；错误文走错误截断） */
 export interface NvimFormatDetails {
 	kind: "nvim_format";
 	files: FormatFileResult[];
-	shown: number;
-	total: number;
 	aborted?: boolean;
 	partial?: boolean;
+	/** 启动健康 degraded 行（healthy 时缺省；逐行走错误截断） */
+	degraded_lines?: string[];
 }
 
 function textResult(text: string, details: NvimLspDetails | NvimFormatDetails): {
@@ -97,9 +99,10 @@ export const NVIM_FORMAT_DESCRIPTION =
 	"Format the given files with your Neovim LSP formatters and write the result back, then return remaining diagnostics. MODIFIES files on disk.";
 
 const NVIM_GUIDELINES = [
-	"After editing files, check them with nvim_lsp once in a single batch call.",
-	"Call nvim_format only when formatting is explicitly needed; it MODIFIES files.",
-	"Never call these tools in a per-file loop; always batch ALL files in ONE call.",
+	"nvim_lsp returns LSP diagnostics without modifying files; suitable for verifying edited files.",
+	"nvim_format formats through your Neovim setup and writes back; use it only when formatting is explicitly needed.",
+	"Both tools accept multiple files in ONE call; per-file loops are unnecessary.",
+	"Scope is allowlisted (diagnostics cover code plus md/Dockerfile, format covers code only); out-of-scope files return per-file skipped and are not executed.",
 ];
 
 async function ensureHandles(deps: NvimToolDeps, ctx: ExtensionContext): Promise<{
@@ -111,6 +114,17 @@ async function ensureHandles(deps: NvimToolDeps, ctx: ExtensionContext): Promise
 	return { sessionId, handles };
 }
 
+/** degraded 头行 prepend（healthy 时原样返回） */
+function withDegraded(text: string, degraded: string[] | undefined): string {
+	if (!degraded || degraded.length === 0) return text;
+	return `${degradedHeader(degraded)}\n${text}`;
+}
+
+function degradedDetails(degraded: string[] | undefined): { degraded_lines?: string[] } {
+	if (!degraded || degraded.length === 0) return {};
+	return { degraded_lines: [...degraded] };
+}
+
 export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 	pi.registerTool({
 		name: "nvim_lsp",
@@ -120,41 +134,51 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 		parameters: NvimFilesParams,
 		executionMode: "sequential",
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const budgets = budgetsOf(deps.cfg.truncation);
+			// 调用守卫（TS 侧、ensure() 之前）：存在→是文件→可读文本→本工具白名单；
+			// 本地项行内表达，daemon-bound 走整批单调用，最后按请求原序合并单次返回。
+			const scope = partitionFiles(params.files, "diagnostics", deps.cfg.whitelist);
+			const localOf = (file: string): DiagnoseFileResult | undefined => {
+				const local = scope.locals.get(file);
+				if (!local) return undefined;
+				if (local.skipped) return { file, diags: [], ms: 0, skipped: local.skipped };
+				return { file, diags: [], ms: 0, error: local.error ?? "unreadable file" };
+			};
+			if (scope.daemonFiles.length === 0) {
+				// 全拦截：根本不 ensure()（daemon 零惊动，冷启动不变量）
+				const full = params.files.map((f) => localOf(f) ?? { file: f, diags: [], ms: 0 });
+				return textResult(renderLspContent(full), {
+					kind: "nvim_lsp",
+					files: full,
+				});
+			}
 			const { handles } = await deps.daemon.runExclusive(() => ensureHandles(deps, ctx));
 			let payload: unknown;
 			try {
 				payload = await deps.daemon.runExclusive(() =>
-					deps.daemon.request(handles, "diagnose", [...params.files], signal),
+					deps.daemon.request(handles, "diagnose", [...scope.daemonFiles], signal),
 				);
 			} catch (err) {
 				if (err instanceof DaemonTimeoutError) {
 					await deps.daemon.killStuck(handles).catch(() => undefined);
 				}
 				if (err instanceof DaemonAbortedError) {
-					return textResult("nvim_lsp aborted before any result (partial: 0 files checked).", {
+					return textResult(withDegraded("nvim_lsp aborted before any result (partial: 0 files checked).", handles.degradedLines), {
 						kind: "nvim_lsp",
 						files: [],
-						shown: 0,
-						total: 0,
 						aborted: true,
+						...degradedDetails(handles.degradedLines),
 					});
 				}
 				throw err;
 			}
 			const parsed = parseDiagnosePayload(payload);
-			// 按请求文件补齐：daemon 未回的文件记空诊断（不虚构 no_client）
+			// 按请求原序合并：本地项（error/skipped）行内表达，daemon 未回的文件记空诊断（不虚构 no_client）
 			const byFile = new Map(parsed.map((p) => [p.file, p]));
-			const full = params.files.map((f) => byFile.get(f) ?? { file: f, diags: [], ms: 0 });
-			const { shown, total } = truncateBatch(
-				full.map((f) => ({ file: f.file, diags: f.diags })),
-				budgets,
-			);
-			return textResult(renderLspContent(full, budgets), {
+			const full = params.files.map((f) => localOf(f) ?? byFile.get(f) ?? { file: f, diags: [], ms: 0 });
+			return textResult(withDegraded(renderLspContent(full), handles.degradedLines), {
 				kind: "nvim_lsp",
 				files: full,
-				shown,
-				total,
+				...degradedDetails(handles.degradedLines),
 			});
 		},
 	});
@@ -167,61 +191,77 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 		parameters: NvimFilesParams,
 		executionMode: "sequential",
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const budgets = budgetsOf(deps.cfg.truncation);
+			// 调用守卫（TS 侧、ensure() 之前）：本地项行内表达，daemon-bound 逐文件走
+			// per-file mutation queue 环，最后按请求原序合并单次返回。
+			const scope = partitionFiles(params.files, "format", deps.cfg.whitelist);
+			const localFormatOf = (file: string): FormatFileResult | undefined => {
+				const local = scope.locals.get(file);
+				if (!local) return undefined;
+				// P2-8 注记：skipped 是“未执行”（白名单短路），借用 unchanged 槽位是因为 FormatReason 无空转值；渲染优先 skipped 分支，details 语义以 skipped 字段为准
+				if (local.skipped) return { file, formatted: false, reason: "unchanged", changed_lines: 0, diags: [], ms: 0, skipped: local.skipped };
+				return { file, formatted: false, reason: "format-error", changed_lines: 0, diags: [], ms: 0, error: local.error ?? "unreadable file" };
+			};
 			const results: FormatFileResult[] = [];
 			let aborted = false;
-			// 整批占住 daemon 互斥（串行），逐文件再走 per-file mutation queue
-			await deps.daemon.runExclusive(async () => {
-				const { handles } = await ensureHandles(deps, ctx);
-				for (const file of params.files) {
-					if (signal?.aborted) {
-						aborted = true;
-						break;
-					}
-					try {
-						const one = await withFileMutationQueue(file, () =>
-							deps.daemon.request(handles, "format", [file], signal),
-						);
-						const parsed = parseFormatPayload(one);
-						const got = parsed.find((p) => p.file === file);
-						results.push(
-							got ?? {
-								file,
-								formatted: false,
-								reason: "format-error",
-								changed_lines: 0,
-								diags: [],
-								ms: 0,
-							},
-						);
-					} catch (err) {
-						if (err instanceof DaemonAbortedError) {
+			let degraded: string[] | undefined;
+			if (scope.daemonFiles.length === 0) {
+				// 全拦截：根本不 ensure()（daemon 零惊动），本地项按原序单次聚合返回
+				for (const file of params.files) results.push(localFormatOf(file) ?? { file, formatted: false, reason: "format-error", changed_lines: 0, diags: [], ms: 0, error: "unreadable file" });
+			} else {
+			// 整批占住 daemon 互斥（串行），daemon-bound 逐文件再走 per-file mutation queue
+				await deps.daemon.runExclusive(async () => {
+					const { handles } = await ensureHandles(deps, ctx);
+					degraded = handles.degradedLines ? [...handles.degradedLines] : undefined;
+					for (const file of params.files) {
+						const local = localFormatOf(file);
+						if (local) {
+							results.push(local);
+							continue;
+						}
+						if (signal?.aborted) {
 							aborted = true;
 							break;
 						}
-						if (err instanceof DaemonTimeoutError) {
-							await deps.daemon.killStuck(handles).catch(() => undefined);
+						try {
+							const one = await withFileMutationQueue(file, () =>
+								deps.daemon.request(handles, "format", [file], signal),
+							);
+							const parsed = parseFormatPayload(one);
+							const got = parsed.find((p) => p.file === file);
+							results.push(
+								got ?? {
+									file,
+									formatted: false,
+									reason: "format-error",
+									changed_lines: 0,
+									diags: [],
+									ms: 0,
+								},
+							);
+						} catch (err) {
+							if (err instanceof DaemonAbortedError) {
+								aborted = true;
+								break;
+							}
+							if (err instanceof DaemonTimeoutError) {
+								await deps.daemon.killStuck(handles).catch(() => undefined);
+							}
+							throw err;
 						}
-						throw err;
 					}
-				}
-			});
-			let text = renderFormatContent(results, budgets);
+				});
+			}
+			let text = withDegraded(renderFormatContent(results), degraded);
 			if (aborted) {
 				const missing = params.files.length - results.length;
 				text += `\n…aborted (partial: ${results.length}/${params.files.length} files, ${missing} skipped)`;
 			}
-			const { shown, total } = truncateBatch(
-				results.map((f) => ({ file: f.file, diags: f.diags })),
-				budgets,
-			);
 			return textResult(text, {
 				kind: "nvim_format",
 				files: results,
-				shown,
-				total,
 				aborted: aborted ? true : undefined,
 				partial: aborted ? true : undefined,
+				...degradedDetails(degraded),
 			});
 		},
 	});
