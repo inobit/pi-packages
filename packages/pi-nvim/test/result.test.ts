@@ -40,7 +40,8 @@ describe("truncateError（唯一截断）", () => {
 		const parsed = parseDiagnosePayload({ per_file: [{ file: "a.ts", raw: "x".repeat(2500), note: "mid-request change" }] }, 100);
 		expect(parsed[0]?.raw).toHaveLength(100 + "…(truncated 2400 chars)".length);
 		const text = renderLspContent([{ file: "a.ts", diags: [], raw: parsed[0]?.raw, note: "mid-request change" }], 100);
-		expect(text).toContain("? a.ts — unrecognized (mid-request change)");
+		expect(text).toContain("failed (1):");
+		expect(text).toContain("- a.ts: unrecognized (mid-request change)");
 	});
 	it("已带注记不再二次截断（parse＋render 双层调用注记一致）", () => {
 		const once = truncateError("z".repeat(2500));
@@ -166,7 +167,7 @@ describe("renderLspContent", () => {
 	});
 	it("error 文件渲染 error 行（超长走错误截断）", () => {
 		const text = renderLspContent([{ file: "a.ts", diags: [], error: "e".repeat(2500) }]);
-		expect(text).toContain("a.ts: error (");
+		expect(text).toContain("- a.ts: eeee");
 		expect(text).toContain("…(truncated 500 chars)");
 	});
 	it("渲染不含文件内容", () => {

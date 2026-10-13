@@ -152,7 +152,9 @@ describe("normalizeConfig whitelist", () => {
 	});
 	it("diagMs 被 overlay 抬过 requestMs 时钳住（防健康 daemon 被误判卡死）", () => {
 		const merged = applyOverlay(DEFAULT_CONFIG, { timeouts: { diagMs: 999999 } } as never);
-		expect(merged.timeouts.diagMs).toBe(merged.timeouts.requestMs);
+		// attach(20000, 默认)＋diag 之和不得超 request(60000)：diagMs 被压到 40000，而非 requestMs
+		expect(merged.timeouts.diagMs).toBe(40000);
+		expect(merged.timeouts.attachMs + merged.timeouts.diagMs).toBeLessThanOrEqual(merged.timeouts.requestMs);
 	});
 	it("全非法后缀回 undefined（保留底包值，不清空表）", () => {
 		// asExtension 只认非空字符串：123（非串）/""/"." 全被过滤 → 空表回 undefined
@@ -170,7 +172,7 @@ describe("result skipped 行渲染", () => {
 			{ file: "b.ts", diags: [], error: "file not found" },
 		]);
 		expect(text).toContain("a.ts: skipped (not in whitelist)");
-		expect(text).toContain("b.ts: error (file not found)");
+		expect(text).toContain("- b.ts: file not found");
 	});
 	it("format skipped 非错误行", () => {
 		const text = renderFormatContent([
@@ -230,7 +232,7 @@ describe("工具层调用守卫", () => {
 		expect(requested.length).toBe(0);
 		const text = (res.content[0] as { text: string }).text;
 		expect(text).toContain(`skipped (${SCOPE_SKIP_REASON})`);
-		expect(text).toContain("error (file not found)");
+		expect(text).toContain("missing.ts: file not found");
 		fs.rmSync(dir, { recursive: true, force: true });
 	});
 	it("lsp 混合聚合保原序（daemon 仅收命中文件）", async () => {

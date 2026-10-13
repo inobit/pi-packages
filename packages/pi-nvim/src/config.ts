@@ -211,6 +211,9 @@ export function normalizeConfig(raw: Record<string, unknown> | undefined): NvimC
 		}
 	}
 	if (out.timeouts.diagMs > out.timeouts.requestMs) out.timeouts.diagMs = out.timeouts.requestMs;
+	if (out.timeouts.attachMs + out.timeouts.diagMs > out.timeouts.requestMs) {
+		out.timeouts.diagMs = Math.max(1000, out.timeouts.requestMs - out.timeouts.attachMs);
+	}
 	const idleMs = asPositiveInt(raw["idleMs"]);
 	if (idleMs !== undefined) out.idleMs = idleMs;
 	const parentPollMs = asPositiveInt(raw["parentPollMs"]);
@@ -289,9 +292,16 @@ export function applyOverlay(base: NvimConfig, overlay: Partial<NvimConfig>): Nv
 				}
 			: base.whitelist,
 	};
-	// P2-2：diagMs 若被 overlay 抬过 requestMs，健康 daemon 会被误判卡死丢温；钳住
+	// P2-2：diagMs 若被 overlay 抬过 requestMs，健康 daemon 会被误判卡死丢温；钳住。
+	// 另保证 attach+diag 之和不超过 request（单请求内串行相加的上界）。
 	if (merged.timeouts.diagMs > merged.timeouts.requestMs) {
 		merged.timeouts = { ...merged.timeouts, diagMs: merged.timeouts.requestMs };
+	}
+	if (merged.timeouts.attachMs + merged.timeouts.diagMs > merged.timeouts.requestMs) {
+		merged.timeouts = {
+			...merged.timeouts,
+			diagMs: Math.max(1000, merged.timeouts.requestMs - merged.timeouts.attachMs),
+		};
 	}
 	return merged;
 }

@@ -22,6 +22,7 @@ import {
 	DaemonAbortedError,
 	DaemonManager,
 	DaemonTimeoutError,
+	listenAbort,
 } from "./daemon.ts";
 import {
 	degradedHeader,
@@ -162,9 +163,11 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 					await deps.daemon.killStuck(handles).catch(() => undefined);
 				}
 				if (err instanceof DaemonAbortedError) {
-					return textResult(withDegraded("nvim_lsp aborted before any result (partial: 0 files checked).", handles.degradedLines), {
+					const failedNow = scope.daemonFiles.map((file) => ({ file, diags: [], ms: 0, error: "aborted before processing" }));
+					const full = params.files.map((f) => localOf(f) ?? failedNow.find((x) => x.file === f) ?? { file: f, diags: [], ms: 0 });
+					return textResult(withDegraded(renderLspContent(full, deps.cfg.errorCap), handles.degradedLines), {
 						kind: "nvim_lsp",
-						files: [],
+						files: full,
 						aborted: true,
 						...degradedDetails(handles.degradedLines),
 					});
@@ -203,7 +206,11 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 			};
 			const results: FormatFileResult[] = [];
 			let aborted = false;
+			const offAbort = listenAbort(signal, () => {
+				aborted = true;
+			});
 			let degraded: string[] | undefined;
+			try {
 			if (scope.daemonFiles.length === 0) {
 				// 全拦截：根本不 ensure()（daemon 零惊动），本地项按原序单次聚合返回
 				for (const file of params.files) results.push(localFormatOf(file) ?? { file, formatted: false, reason: "format-error", changed_lines: 0, diags: [], ms: 0, error: "unreadable file" });
@@ -218,8 +225,7 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 							results.push(local);
 							continue;
 						}
-						if (signal?.aborted) {
-							aborted = true;
+						if (aborted) {
 							break;
 						}
 						try {
@@ -251,10 +257,17 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 					}
 				});
 			}
+			if (aborted) {
+				const seen = new Set(results.map((r) => r.file));
+				for (const file of params.files) {
+					if (!seen.has(file)) {
+						results.push({ file, formatted: false, reason: "format-error", changed_lines: 0, diags: [], ms: 0, error: "aborted before processing" });
+					}
+				}
+			}
 			let text = withDegraded(renderFormatContent(results, deps.cfg.errorCap), degraded);
 			if (aborted) {
-				const missing = params.files.length - results.length;
-				text += `\n…aborted (partial: ${results.length}/${params.files.length} files, ${missing} skipped)`;
+				text += `\n…aborted (partial: ${params.files.length} files attempted, see failed section)`;
 			}
 			return textResult(text, {
 				kind: "nvim_format",
@@ -263,6 +276,9 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 				partial: aborted ? true : undefined,
 				...degradedDetails(degraded),
 			});
+			} finally {
+				offAbort();
+			}
 		},
 	});
 }

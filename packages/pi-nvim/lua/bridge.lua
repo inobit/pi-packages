@@ -16,6 +16,11 @@ local PiNvim = {}
 -- 状态（先立 flag：begin_shutdown 后 process 直接回错，见 Correctness-3）
 PiNvim._shutdown = false
 PiNvim._busy = false
+-- 在途请求登记：_current 为请求 id（req-<n>，TS 生成），_reqs 记其 buffers 供 abort 释放。
+-- 全局量安全的唯一前提：TS 侧 DaemonMutex 保证同一 daemon 同时最多一个在途请求。
+PiNvim._current = nil
+PiNvim._aborted = false
+PiNvim._reqs = {}
 PiNvim._last_req_ms = vim.uv.now()
 
 local SOCK_DIR = vim.fn.getenv("PI_NVIM_SOCK_DIR") or ""
@@ -47,12 +52,18 @@ local function read_json_file(path)
   return val, nil
 end
 
+-- 结束标记＝结果文件本身：出现即完工（正常 per_file／异常 {error} 信封二选一）。
+-- 原子写（tmp＋rename）：扩展侧以“文件存在”判完工，半写文件会造成部分读；
+-- rename 保证要么没有、要么完整。唯一无文件的情形是 daemon 中途崩溃——
+-- 那是扩展侧超时＋杀重建兜底的，不在此处处理。
 local function write_json_file(path, val)
   local ok, encoded = pcall(vim.fn.json_encode, val)
   if not ok then
     encoded = '{"per_file":[],"total_ms":0,"error":"json encode failed"}'
   end
-  vim.fn.writefile({ encoded }, path)
+  local tmp = path .. ".tmp"
+  vim.fn.writefile({ encoded }, tmp)
+  os.rename(tmp, path)
 end
 
 local function write_error(res_path, msg, total_ms)
@@ -154,6 +165,56 @@ local function recognize(bufnr, snap)
   return "noclient", cur
 end
 
+-- 请求登记：记 id＋其 buffers（abort 时精确释放本单资源）。
+-- abort 收尾：wipe 登记 buffers（半成品未交付一律清；写失败残留同理——
+-- 本次调用整体作废，重调重建），删登记，不写 res（TS 侧已回 partial，写了也是孤儿）。
+local function reg_request(id)
+  if id == nil then
+    return
+  end
+  PiNvim._current = id
+  PiNvim._aborted = false
+  PiNvim._reqs[id] = { bufs = {} }
+end
+
+local function unreg_request(id)
+  if id == nil then
+    return
+  end
+  PiNvim._reqs[id] = nil
+  if PiNvim._current == id then
+    PiNvim._current = nil
+    PiNvim._aborted = false
+  end
+end
+
+local function reg_bufs(id, entries)
+  local rec = id ~= nil and PiNvim._reqs[id] or nil
+  if rec == nil then
+    return
+  end
+  for _, e in ipairs(entries) do
+    if e.buf ~= nil then
+      table.insert(rec.bufs, e.buf)
+    end
+  end
+end
+
+local function abort_cleanup(id)
+  if id == nil then
+    return
+  end
+  local rec = PiNvim._reqs[id]
+  if rec ~= nil then
+    for _, b in ipairs(rec.bufs) do
+      if vim.api.nvim_buf_is_valid(b) then
+        pcall(vim.api.nvim_buf_delete, b, { force = true })
+      end
+    end
+  end
+  unreg_request(id)
+end
+
 -- 打开一批文件，返回 { buf = bufnr }（edit 失败记 error）
 local function edit_batch(files)
   local out = {}
@@ -175,7 +236,7 @@ end
 local function wait_attach(entries, budget_ms, method)
   -- 阶段一：等任一 client 到达（保冷启动正确性；diagnose 到此即返）
   vim.wait(budget_ms, function()
-    if PiNvim._shutdown then
+    if PiNvim._shutdown or PiNvim._aborted then
       return true
     end
     for _, e in ipairs(entries) do
@@ -193,7 +254,7 @@ local function wait_attach(entries, budget_ms, method)
   -- 阶段二：有 client 但无目标能力 client 的条目二次有界等待（慢 formatter 防误判
   -- no-formatter；上界 min(budget,5s），无 formatter 文件不再付满整档预算）
   vim.wait(math.min(budget_ms, 5000), function()
-    if PiNvim._shutdown then
+    if PiNvim._shutdown or PiNvim._aborted then
       return true
     end
     for _, e in ipairs(entries) do
@@ -245,7 +306,7 @@ local function wait_diag_settled(bufnrs, budget_ms)
   local last = diag_counts(bufnrs)
   local last_change = start
   while true do
-    if PiNvim._shutdown then
+    if PiNvim._shutdown or PiNvim._aborted then
       return
     end
     local now = vim.uv.now()
@@ -413,6 +474,8 @@ function PiNvim.diagnose(req_path, res_path)
     local attach_ms = req.attachMs or DEF_ATTACH_MS
     local diag_ms = req.diagMs or DEF_DIAG_MS
     local entries = edit_batch(files)
+    reg_request(req.id)
+    reg_bufs(req.id, entries)
     wait_attach(entries, attach_ms)
     for _, e in ipairs(entries) do
       e.snap = snapshot_clients(e.buf)
@@ -427,6 +490,10 @@ function PiNvim.diagnose(req_path, res_path)
       end
     end
     wait_diag_settled(settle, diag_ms)
+    if PiNvim._aborted then
+      abort_cleanup(req.id)
+      return
+    end
     local per_file = {}
     local wipe = {}
     for _, e in ipairs(entries) do
@@ -471,6 +538,7 @@ function PiNvim.diagnose(req_path, res_path)
     -- 批末只 wipe 本批 buffer，不停任何 client（server 留温整 session）
     wipe_buffers(wipe)
     write_json_file(op, { per_file = per_file, total_ms = vim.uv.now() - t0 })
+    unreg_request(req.id)
   end)
 end
 
@@ -492,11 +560,20 @@ function PiNvim.format(req_path, res_path)
     end
     -- 先逐文件写盘（不管诊断），再整批只做一次 settle，最后逐文件直接 collect
     -- （diagnose/format 同走批级落定路径；per-file settle 已删）
+    reg_request(req.id)
+    reg_bufs(req.id, entries)
     local pending = {}
     local snap_by_file = {}
     for _, e in ipairs(entries) do
+      if PiNvim._aborted then
+        break
+      end
       snap_by_file[e.file] = e.snap
       table.insert(pending, format_write(e))
+    end
+    if PiNvim._aborted then
+      abort_cleanup(req.id)
+      return
     end
     local settle = {}
     for _, r in ipairs(pending) do
@@ -549,11 +626,21 @@ function PiNvim.format(req_path, res_path)
     end
     wipe_buffers(wipe)
     write_json_file(op, { per_file = per_file, total_ms = vim.uv.now() - t0 })
+    unreg_request(req.id)
   end)
 end
 
 -- session 末／pi 侧 fire-and-forget：先立 flag（后续 process 直接回错），
 -- 再有界停 clients＋wipe，最后 :qa!（stop 无效同样走 :qa! 兜底）
+--- abort(id)：带证上门。仅当 id == 在跑请求才立 _aborted；对不上直接丢弃。
+--- TS 侧 signal 触发后 fire-and-forget 发送，不等回执。
+function PiNvim.abort(id)
+  if id ~= nil and id == PiNvim._current and PiNvim._reqs[id] ~= nil then
+    PiNvim._reqs[id].aborted = true
+    PiNvim._aborted = true
+  end
+end
+
 function PiNvim.begin_shutdown()
   PiNvim._shutdown = true
   stop_all_clients(5000)

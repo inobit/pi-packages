@@ -147,10 +147,11 @@ export function degradedHeader(lines: string[]): string {
 }
 
 /**
- * nvim_lsp 模型侧文本：头行计数＋逐文件一行状态＋全量诊断行。
+ * nvim_lsp 模型侧文本：头行计数＋正常文件行内＋全量诊断行＋末尾 failed 节。
  * 例：`3 files, 2 errors, 1 warning`／`a.ts: 2 errors`／`a.ts: clean`。
- * 调用守卫短路行：`path: error (…)`／`path: skipped (…)`（行内表达，不 throw）；
- * error 行走错误截断，诊断数组全量（结构化、可再生，不截断）。
+ * 二分法：无需动作的行内（clean／诊断／skipped／no_client），需动作的打包
+ * 进末尾 `failed (N)` 节（一文件一行＋原因）；error/raw 文走错误截断，
+ * 诊断数组全量（结构化、可再生，不截断）。
  */
 export function renderLspContent(
 	files: Array<{ file: string; diags: NvimDiag[]; no_client?: boolean; error?: string; skipped?: string; raw?: string; note?: string }>,
@@ -163,21 +164,21 @@ export function renderLspContent(
 		errors += c.errors;
 		warns += c.warns;
 	}
+	const failed: Array<{ file: string; reason: string }> = [];
+	for (const f of files) {
+		if (f.error !== undefined) failed.push({ file: f.file, reason: truncateError(f.error, errorCap) });
+		else if (f.raw !== undefined)
+			failed.push({ file: f.file, reason: `unrecognized (${f.note ?? "unknown"}): ${truncateError(f.raw, errorCap)}` });
+	}
 	const lines: string[] = [];
 	const headParts = [`${files.length} file${files.length === 1 ? "" : "s"}`];
 	if (errors > 0) headParts.push(`${errors} error${errors === 1 ? "" : "s"}`);
 	if (warns > 0) headParts.push(`${warns} warning${warns === 1 ? "" : "s"}`);
-	if (errors === 0 && warns === 0) headParts.push("clean");
+	if (failed.length > 0) headParts.push(`${failed.length} failed`);
+	if (errors === 0 && warns === 0 && failed.length === 0) headParts.push("clean");
 	lines.push(headParts.join(", "));
 	for (const f of files) {
-		if (f.error) {
-			lines.push(`${f.file}: error (${truncateError(f.error, errorCap)})`);
-			continue;
-		}
-		if (f.raw !== undefined) {
-			lines.push(`? ${f.file} — unrecognized (${f.note ?? "unknown"}): ${truncateError(f.raw, errorCap)}`);
-			continue;
-		}
+		if (f.error !== undefined || f.raw !== undefined) continue;
 		if (f.skipped) {
 			lines.push(`${f.file}: skipped (${f.skipped})`);
 			continue;
@@ -195,6 +196,10 @@ export function renderLspContent(
 		lines.push(`${f.file}: ${status.join(", ")}`);
 		for (const d of f.diags) lines.push(formatDiagLine(f.file, d));
 	}
+	if (failed.length > 0) {
+		lines.push(`failed (${failed.length}):`);
+		for (const item of failed) lines.push(`- ${item.file}: ${item.reason}`);
+	}
 	return lines.join("\n");
 }
 
@@ -206,13 +211,20 @@ export function renderLspContent(
  * 兼容旧 daemon 的 `ok`＋未变化：同样渲染为 `unchanged`。
  */
 export function renderFormatContent(files: FormatFileResult[], errorCap: number = ERROR_TEXT_LIMIT): string {
+	const failed: Array<{ file: string; reason: string }> = [];
+	for (const f of files) {
+		if (f.error !== undefined) failed.push({ file: f.file, reason: truncateError(f.error, errorCap) });
+		else if (f.raw !== undefined)
+			failed.push({ file: f.file, reason: `unrecognized (${f.note ?? "unknown"}): ${truncateError(f.raw, errorCap)}` });
+		else if (f.reason === "format-error" || f.reason === "write-error")
+			failed.push({ file: f.file, reason: f.error !== undefined ? truncateError(f.error, errorCap) : f.reason });
+	}
 	const done = files.filter((f) => f.formatted).length;
 	const lines: string[] = [`formatted ${done}/${files.length}`];
+	if (failed.length > 0) lines[0] += `, ${failed.length} failed`;
 	for (const f of files) {
-		if (f.error) {
-			lines.push(`${f.file}: error (${truncateError(f.error, errorCap)})`);
-		} else if (f.raw !== undefined) {
-			lines.push(`? ${f.file} — unrecognized (${f.note ?? "unknown"}): ${truncateError(f.raw, errorCap)}`);
+		if (f.error !== undefined || f.raw !== undefined || f.reason === "format-error" || f.reason === "write-error") {
+			continue;
 		} else if (f.skipped) {
 			lines.push(`${f.file}: skipped (${f.skipped})`);
 		} else if (f.formatted) {
@@ -225,6 +237,10 @@ export function renderFormatContent(files: FormatFileResult[], errorCap: number 
 	}
 	for (const f of files) {
 		for (const d of f.diags) lines.push(formatDiagLine(f.file, d));
+	}
+	if (failed.length > 0) {
+		lines.push(`failed (${failed.length}):`);
+		for (const item of failed) lines.push(`- ${item.file}: ${item.reason}`);
 	}
 	return lines.join("\n");
 }

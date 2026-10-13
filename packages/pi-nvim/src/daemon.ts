@@ -82,6 +82,8 @@ export type BridgeFn = "diagnose" | "format";
 
 /** daemon 请求体（随 req-<n>.json 落盘） */
 export interface DaemonRequest {
+	/** 请求身份证（req-<n>，会话 sockdir 内唯一）：abort 凭此认领 */
+	id: string;
 	files: string[];
 	attachMs: number;
 	diagMs: number;
@@ -196,6 +198,8 @@ export interface DaemonHandles {
 	pidPath: string;
 	/** daemon stderr 日志（启动健康检查读尾 20 行） */
 	logPath: string;
+	/** 在途请求 id（abort 发送用；无在途为 undefined） */
+	currentReqId?: string;
 	/** 启动健康 degraded 行（healthy 为空；content 头行＋details 同源，走错误截断） */
 	degradedLines?: string[];
 	childPid?: number;
@@ -398,18 +402,21 @@ export class DaemonManager {
 	): Promise<unknown> {
 		reqCounter += 1;
 		const n = reqCounter;
-		const reqPath = path.join(h.sockDir, `req-${n}.json`);
+		const reqId = `req-${n}`;
+		const reqPath = path.join(h.sockDir, `${reqId}.json`);
 		const resPath = path.join(h.sockDir, `res-${n}.json`);
 		const body: DaemonRequest = {
+			id: reqId,
 			files,
 			attachMs: this.cfg.timeouts.attachMs,
 			diagMs: this.cfg.timeouts.diagMs,
 		};
 		fs.writeFileSync(reqPath, JSON.stringify(body), "utf8");
 		unlinkIfExists(resPath);
+		h.currentReqId = reqId;
 		try {
 			await this.kickDaemon(h, fn, reqPath, resPath);
-			const raw = await this.waitResult(resPath, signal);
+			const raw = await this.waitResult(resPath, signal, () => this.sendAbort(h, reqId));
 			const parsed: unknown = JSON.parse(raw);
 			// Lua 侧异常／关闭中：{ error } 结果转抛错（绝不误报 clean；信封文走错误截断）
 			if (parsed && typeof parsed === "object" && "error" in parsed) {
@@ -420,9 +427,24 @@ export class DaemonManager {
 			}
 			return parsed;
 		} finally {
-			// P2-6 已知残留：中断后 Lua 侧无中断通道，会续写完 res 文件（孤儿重建，有界；同 session GC 与退出删目录时回收）
+			h.currentReqId = undefined;
+			// abort 生效后 Lua 侧跳过 res 写；未生效（迟到 abort 被丢）的孤儿 res 有界，同 session GC 与退出删目录时回收
 			unlinkIfExists(reqPath);
 			unlinkIfExists(resPath);
+		}
+	}
+
+/** abort 传导：fire-and-forget 发 abort(id)，不等回执、不抛错（对不上就地丢弃） */
+	private sendAbort(h: DaemonHandles, reqId: string | undefined): void {
+		if (!reqId) return;
+		try {
+			const child = spawn(this.cfg.nvimPath, ["--server", h.sockPath, "--remote-send", abortKeys(reqId)], {
+				stdio: ["ignore", "ignore", "ignore"],
+			});
+			child.on("error", () => {});
+			child.unref();
+		} catch {
+			// spawn 同步抛错也吞掉：abort 本就是尽力而为，模型侧 partial 照返
 		}
 	}
 
@@ -459,12 +481,18 @@ export class DaemonManager {
 		});
 	}
 
-	private async waitResult(resPath: string, signal: AbortSignal | undefined): Promise<string> {
+	private async waitResult(resPath: string, signal: AbortSignal | undefined, onAbort?: () => void): Promise<string> {
 		const deadline = Date.now() + this.cfg.timeouts.requestMs;
-		for (;;) {
-			if (signal?.aborted) {
-				throw new DaemonAbortedError(truncateError("请求被中断（signal aborted），返回 partial。"));
-			}
+		let aborted = signal?.aborted ?? false;
+		const off = listenAbort(signal, () => {
+			aborted = true;
+			onAbort?.();
+		});
+		try {
+			for (;;) {
+				if (aborted) {
+					throw new DaemonAbortedError(truncateError("请求被中断（signal aborted），返回 partial。", this.cfg.errorCap));
+				}
 			try {
 				// P2-8 已知残留：writefile 与 readFileSync 理论有部分读窗口；小文件风险极低，JSON.parse 失败抛错可重试
 				return fs.readFileSync(resPath, "utf8");
@@ -477,6 +505,9 @@ export class DaemonManager {
 				);
 			}
 			await sleep(this.cfg.timeouts.pollMs);
+			}
+		} finally {
+			off();
 		}
 	}
 
@@ -572,6 +603,23 @@ export class DaemonManager {
 		child.on("error", () => {});
 		child.unref();
 	}
+}
+
+/** abort 监听（导出可测）：已置位同步触发一次；返回清理函数，调用方必须在 finally 摘除 */
+export function listenAbort(signal: AbortSignal | undefined, cb: () => void): () => void {
+	if (!signal) return () => {};
+	if (signal.aborted) {
+		cb();
+		return () => {};
+	}
+	const handler = (): void => cb();
+	signal.addEventListener("abort", handler, { once: true });
+	return () => signal.removeEventListener("abort", handler);
+}
+
+/** abort 按键串（纯函数，可测）：fire-and-forget，不等回执 */
+export function abortKeys(reqId: string): string {
+	return `:lua PiNvim.abort('${reqId}')<CR>`;
 }
 
 /** 中断即 partial（调用方据此返回已得结果，不抛给模型看作失败） */
