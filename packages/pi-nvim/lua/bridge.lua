@@ -16,10 +16,11 @@ local PiNvim = {}
 -- 状态（先立 flag：begin_shutdown 后 process 直接回错，见 Correctness-3）
 PiNvim._shutdown = false
 PiNvim._busy = false
--- 在途请求登记：_current 为请求 id（req-<n>，TS 生成），_reqs 记其 buffers 供 abort 释放。
--- 全局量安全的唯一前提：TS 侧 DaemonMutex 保证同一 daemon 同时最多一个在途请求。
-PiNvim._current = nil
-PiNvim._aborted = false
+-- 在途请求登记：_reqs[id] 记该请求的 buffers＋abort 标记（id＝req-<n>，TS 生成）。
+-- 全部 abort 状态按请求分桶，**不用全局标记**（P2-4）：TS 收到 signal 即抛错，
+-- 可能在 Lua 仍在处理上一个请求时就发起下一个（vim.wait 会泵事件循环、remote-send
+-- 可重入），全局标记会让孤儿请求提前退出等待，随后它的 abort_cleanup 把新请求
+-- 正在用的同名 buffer 删掉（句柄相同），新请求 collect 失败记成 bridge error。
 PiNvim._reqs = {}
 PiNvim._last_req_ms = vim.uv.now()
 
@@ -189,16 +190,14 @@ local function recognize(bufnr, snap)
   return "noclient", cur
 end
 
--- 请求登记：记 id＋其 buffers（abort 时精确释放本单资源）。
+-- 请求登记：记 id＋其 buffers＋abort 标记（abort 时精确释放本单资源）。
 -- abort 收尾：wipe 登记 buffers（半成品未交付一律清；写失败残留同理——
 -- 本次调用整体作废，重调重建），删登记，不写 res（TS 侧已回 partial，写了也是孤儿）。
 local function reg_request(id)
   if id == nil then
     return
   end
-  PiNvim._current = id
-  PiNvim._aborted = false
-  PiNvim._reqs[id] = { bufs = {} }
+  PiNvim._reqs[id] = { bufs = {}, aborted = false }
 end
 
 local function unreg_request(id)
@@ -206,10 +205,12 @@ local function unreg_request(id)
     return
   end
   PiNvim._reqs[id] = nil
-  if PiNvim._current == id then
-    PiNvim._current = nil
-    PiNvim._aborted = false
-  end
+end
+
+-- 该请求是否已被 abort（nil-id／未登记一律 false：等不到就是没被中断）
+local function aborted(id)
+  local rec = id ~= nil and PiNvim._reqs[id] or nil
+  return rec ~= nil and rec.aborted == true
 end
 
 local function reg_bufs(id, entries)
@@ -257,10 +258,10 @@ end
 -- method 过滤：diagnose 等任意 client；format 等 formatting 能力 client——
 -- formatter（none-ls/ruff 等）常比诊断 client 慢，若只等“任一 client”（如 ty）
 -- 就放行，门控会把“还没 attach”误判成 no-formatter（冒烟复现），故按入口能力等。
-local function wait_attach(entries, budget_ms, method)
+local function wait_attach(entries, budget_ms, method, req_id)
   -- 阶段一：等任一 client 到达（保冷启动正确性；diagnose 到此即返）
   vim.wait(budget_ms, function()
-    if PiNvim._shutdown or PiNvim._aborted then
+    if PiNvim._shutdown or aborted(req_id) then
       return true
     end
     for _, e in ipairs(entries) do
@@ -278,7 +279,7 @@ local function wait_attach(entries, budget_ms, method)
   -- 阶段二：有 client 但无目标能力 client 的条目二次有界等待（慢 formatter 防误判
   -- no-formatter；上界 min(budget,5s），无 formatter 文件不再付满整档预算）
   vim.wait(math.min(budget_ms, 5000), function()
-    if PiNvim._shutdown or PiNvim._aborted then
+    if PiNvim._shutdown or aborted(req_id) then
       return true
     end
     for _, e in ipairs(entries) do
@@ -321,7 +322,7 @@ end
 -- ts 冷启动 attach 后 ~2s 才出首诊断，首调必 miss。全零真干净文件多付
 -- MIN_SETTLE_MS＋QUIET_MS（~3.5s），不付满 budget；慢诊断按到达即续，最坏延迟有界。
 -- 注意：diagMs 若小于 MIN_SETTLE_MS，最小线永不到，按 budget 到期返回（budget 恒为上界）。
-local function wait_diag_settled(bufnrs, budget_ms)
+local function wait_diag_settled(bufnrs, budget_ms, req_id)
   if #bufnrs == 0 then
     return
   end
@@ -330,7 +331,7 @@ local function wait_diag_settled(bufnrs, budget_ms)
   local last = diag_counts(bufnrs)
   local last_change = start
   while true do
-    if PiNvim._shutdown or PiNvim._aborted then
+    if PiNvim._shutdown or aborted(req_id) then
       return
     end
     local now = vim.uv.now()
@@ -497,7 +498,7 @@ function PiNvim.diagnose(req_path, res_path)
     local entries = edit_batch(files)
     reg_request(req.id)
     reg_bufs(req.id, entries)
-    wait_attach(entries, attach_ms)
+    wait_attach(entries, attach_ms, nil, req.id)
     for _, e in ipairs(entries) do
       e.snap = snapshot_clients(e.buf)
     end
@@ -510,8 +511,8 @@ function PiNvim.diagnose(req_path, res_path)
         table.insert(settle, e.buf)
       end
     end
-    wait_diag_settled(settle, diag_ms)
-    if PiNvim._aborted then
+    wait_diag_settled(settle, diag_ms, req.id)
+    if aborted(req.id) then
       abort_cleanup(req.id)
       return
     end
@@ -574,14 +575,14 @@ function PiNvim.format(req_path, res_path)
     local attach_ms = req.attachMs or DEF_ATTACH_MS
     local diag_ms = req.diagMs or DEF_DIAG_MS
     local entries = edit_batch(files)
-    -- 登记必须早于 wait_attach（与 diagnose 对齐）：attach 窗口内到达的 abort 要靠已在册的
-    -- _current/_reqs[id] 才能被 PiNvim.abort 认领。晚登记会两重失效——窗口内 abort 因
-    -- 对不上被丢弃，随后 reg_request 的 _aborted=false 又把已送达的抹掉，format 会在
-    -- 用户已中断后照常写盘（TS 侧却已回 partial，磁盘与模型认知相悖）。
+    -- 登记必须早于 wait_attach（与 diagnose 对齐）：abort 认领靠 `_reqs[id]` 已在册。
+    -- 晚登记则 attach 窗口（默认 attachMs=20s，正是冷启动＋用户最可能按 esc 的时候）
+    -- 内到达的 abort 对不上被丢弃，format 会在用户已中断后照常写盘（TS 侧却已回
+    -- partial，磁盘与模型认知相悖）。
     reg_request(req.id)
     reg_bufs(req.id, entries)
     -- 先全 edit 再统一等 attach（并发冷启动）；按 formatting 能力等，防误判 no-formatter
-    wait_attach(entries, attach_ms, "textDocument/formatting")
+    wait_attach(entries, attach_ms, "textDocument/formatting", req.id)
     for _, e in ipairs(entries) do
       e.snap = snapshot_clients(e.buf)
     end
@@ -590,13 +591,13 @@ function PiNvim.format(req_path, res_path)
     local pending = {}
     local snap_by_file = {}
     for _, e in ipairs(entries) do
-      if PiNvim._aborted then
+      if aborted(req.id) then
         break
       end
       snap_by_file[e.file] = e.snap
       table.insert(pending, format_write(e))
     end
-    if PiNvim._aborted then
+    if aborted(req.id) then
       abort_cleanup(req.id)
       return
     end
@@ -606,7 +607,7 @@ function PiNvim.format(req_path, res_path)
         table.insert(settle, r._buf)
       end
     end
-    wait_diag_settled(settle, diag_ms)
+    wait_diag_settled(settle, diag_ms, req.id)
     local per_file = {}
     local wipe = {}
     for _, r in ipairs(pending) do
@@ -657,12 +658,13 @@ end
 
 -- session 末／pi 侧 fire-and-forget：先立 flag（后续 process 直接回错），
 -- 再有界停 clients＋wipe，最后 :qa!（stop 无效同样走 :qa! 兜底）
---- abort(id)：带证上门。仅当 id == 在跑请求才立 _aborted；对不上直接丢弃。
+--- abort(id)：带证上门。只有仍在册（未 unreg）的请求才认领，过期/对不上直接丢弃。
+--- 每请求标记，绝不置全局（见文件头 P2-4 注释：全局会让孤儿请求误伤新请求的 buffer）。
 --- TS 侧 signal 触发后 fire-and-forget 发送，不等回执。
 function PiNvim.abort(id)
-  if id ~= nil and id == PiNvim._current and PiNvim._reqs[id] ~= nil then
-    PiNvim._reqs[id].aborted = true
-    PiNvim._aborted = true
+  local rec = id ~= nil and PiNvim._reqs[id] or nil
+  if rec ~= nil then
+    rec.aborted = true
   end
 end
 

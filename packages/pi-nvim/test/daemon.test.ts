@@ -186,6 +186,19 @@ describe("bridge.lua 请求登记时序（abort 认领前提）", () => {
 			expect(reg).toBeLessThan(wait);
 		});
 	}
+
+	// abort 状态必须按请求分桶（P2-4）：TS 收到 signal 即抛错，可能在 Lua 仍在处理
+	// 上一个请求时就发起下一个，全局标记会让孤儿请求提前退出等待、随后它的
+	// abort_cleanup 删掉新请求正在用的同名 buffer，新请求 collect 失败记 bridge error。
+	it("abort 状态按请求分桶，无全局 _aborted/_current", () => {
+		expect(bridgeSrc, "不得再用全局 abort 标记").not.toMatch(/PiNvim\._aborted/);
+		expect(bridgeSrc, "不得再用全局在途 id").not.toMatch(/PiNvim\._current/);
+		// 等待循环读每请求标记，且 id 由调用方传入
+		expect(bridgeSrc).toMatch(/local function aborted\(id\)/);
+		expect(bridgeSrc).toMatch(/wait_attach\(entries, budget_ms, method, req_id\)/);
+		expect(bridgeSrc).toMatch(/wait_diag_settled\(bufnrs, budget_ms, req_id\)/);
+		expect(bridgeSrc).toMatch(/aborted\(req_id\)/);
+	});
 });
 
 describe("bridge.lua 加载校验（语法＋加载期错误）", () => {
