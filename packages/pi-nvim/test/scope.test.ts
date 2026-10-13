@@ -145,6 +145,11 @@ describe("normalizeConfig whitelist", () => {
 	it("enabled:false 生效", () => {
 		expect(normalizeConfig({ whitelist: { enabled: false } }).whitelist.enabled).toBe(false);
 	});
+	it("errorCap 默认 2000、可覆盖（错误唯一截断用户可调）", () => {
+		expect(normalizeConfig(undefined).errorCap).toBe(2000);
+		expect(normalizeConfig({ errorCap: 500 }).errorCap).toBe(500);
+		expect(normalizeConfig({ errorCap: -3 }).errorCap).toBe(2000);
+	});
 	it("diagMs 被 overlay 抬过 requestMs 时钳住（防健康 daemon 被误判卡死）", () => {
 		const merged = applyOverlay(DEFAULT_CONFIG, { timeouts: { diagMs: 999999 } } as never);
 		expect(merged.timeouts.diagMs).toBe(merged.timeouts.requestMs);

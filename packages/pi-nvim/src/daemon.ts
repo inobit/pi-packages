@@ -23,7 +23,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { NvimConfig } from "./config.ts";
-import { truncateError } from "./result.ts";
+import { ERROR_TEXT_LIMIT, truncateError } from "./result.ts";
 
 /** daemon 启动日志文件名（stderr 重定向，启动健康检查用） */
 export const DAEMON_LOG_NAME = "daemon.log";
@@ -38,11 +38,11 @@ export const DAEMON_LOG_ERROR_RE = /Error detected while processing|^E\d+:/;
  * 日志尾部 degraded 行提取（纯函数，可单测）：取末 tailN 行，命中错误正则的逐行走错误截断。
  * 调用方读文件后调此函数；文件缺失/为空即 []（healthy）。
  */
-export function degradedLinesFromLog(logText: string, tailN: number = DAEMON_LOG_TAIL_LINES): string[] {
+export function degradedLinesFromLog(logText: string, tailN: number = DAEMON_LOG_TAIL_LINES, cap: number = ERROR_TEXT_LIMIT): string[] {
 	if (!logText) return [];
 	const lines = logText.split("\n");
 	const tail = lines.slice(Math.max(0, lines.length - tailN));
-	return tail.filter((l) => DAEMON_LOG_ERROR_RE.test(l)).map((l) => truncateError(l));
+	return tail.filter((l) => DAEMON_LOG_ERROR_RE.test(l)).map((l) => truncateError(l, cap));
 }
 
 /**
@@ -54,7 +54,7 @@ export function shouldForceFresh(prevDegraded: boolean): boolean {
 }
 
 /** 同步读日志尾 degraded 行（文件缺失即 healthy，不抛错） */
-export function readDegradedLines(logPath: string, tailN: number = DAEMON_LOG_TAIL_LINES): string[] {
+export function readDegradedLines(logPath: string, tailN: number = DAEMON_LOG_TAIL_LINES, cap: number = ERROR_TEXT_LIMIT): string[] {
 	try {
 		// 有界尾读：只读最后 64KB（病态刷屏日志不进内存），再取尾 tailN 行
 		const fd = fs.openSync(logPath, "r");
@@ -63,7 +63,7 @@ export function readDegradedLines(logPath: string, tailN: number = DAEMON_LOG_TA
 			const start = Math.max(0, size - 65536);
 			const buf = Buffer.alloc(size - start);
 			fs.readSync(fd, buf, 0, buf.length, start);
-			return degradedLinesFromLog(buf.toString("utf8"), tailN);
+			return degradedLinesFromLog(buf.toString("utf8"), tailN, cap);
 		} finally {
 			fs.closeSync(fd);
 		}
@@ -294,7 +294,7 @@ export class DaemonManager {
 
 	/** 就绪后读日志尾 20 行定档（healthy/degraded；failed 走 throw 不经此） */
 	private refreshHealth(h: DaemonHandles): void {
-		const lines = readDegradedLines(h.logPath);
+		const lines = readDegradedLines(h.logPath, DAEMON_LOG_TAIL_LINES, this.cfg.errorCap);
 		h.degradedLines = lines.length > 0 ? lines : undefined;
 		this.prevDegraded = lines.length > 0;
 	}
@@ -354,7 +354,7 @@ export class DaemonManager {
 			child.on("error", (err) => {
 				closeLogFd();
 				// spawn 失败 throw 不变（failed 档）；异常文走错误截断（非结构化、前重后轻）
-				reject(new Error(truncateError(`@inobit/pi-nvim: daemon spawn 失败：${err.message}`)));
+				reject(new Error(truncateError(`@inobit/pi-nvim: daemon spawn 失败：${err.message}`, this.cfg.errorCap)));
 			});
 			// 先等 spawn 成功再 resolve：否则 ENOENT 类错误在 resolve 后触发即被吞。
 			child.on("spawn", () => {
@@ -378,6 +378,7 @@ export class DaemonManager {
 					truncateError(
 						`@inobit/pi-nvim: daemon 启动超时（${this.cfg.timeouts.spawnMs}ms，sock=${h.sockPath}）；` +
 							"请确认 nvim 可用且用户配置可 headless 加载。",
+						this.cfg.errorCap,
 					),
 				);
 			}
@@ -414,7 +415,7 @@ export class DaemonManager {
 			if (parsed && typeof parsed === "object" && "error" in parsed) {
 				const msg = (parsed as { error?: unknown }).error;
 				throw new Error(
-					truncateError(`@inobit/pi-nvim: daemon 回错：${typeof msg === "string" ? msg : "unknown"}`),
+					truncateError(`@inobit/pi-nvim: daemon 回错：${typeof msg === "string" ? msg : "unknown"}`, this.cfg.errorCap),
 				);
 			}
 			return parsed;
@@ -451,7 +452,7 @@ export class DaemonManager {
 				else
 					reject(
 						new Error(
-							truncateError(`@inobit/pi-nvim: sender 退出码 ${String(code)}（判 daemon 死）；下次调用将重起 daemon。`),
+							truncateError(`@inobit/pi-nvim: sender 退出码 ${String(code)}（判 daemon 死）；下次调用将重起 daemon。`, this.cfg.errorCap),
 						),
 					);
 			});
@@ -472,7 +473,7 @@ export class DaemonManager {
 			}
 			if (Date.now() >= deadline) {
 				throw new DaemonTimeoutError(
-					truncateError(`daemon 请求超时（${this.cfg.timeouts.requestMs}ms）；已判卡死，下次调用将杀重建。`),
+					truncateError(`daemon 请求超时（${this.cfg.timeouts.requestMs}ms）；已判卡死，下次调用将杀重建。`, this.cfg.errorCap),
 				);
 			}
 			await sleep(this.cfg.timeouts.pollMs);

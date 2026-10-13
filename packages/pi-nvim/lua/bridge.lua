@@ -116,6 +116,44 @@ local function quit_all()
   vim.cmd("qa!")
 end
 
+-- 识别器：正常态只认“现至少一个已初始化 client”；快照有过人、现无人或未初始化
+-- 即不可识别，走 raw 透传（原文＋note），永不记 clean、永不编造 reason。
+local function snapshot_clients(bufnr)
+  if bufnr == nil or not vim.api.nvim_buf_is_valid(bufnr) then
+    return nil
+  end
+  local out = {}
+  for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
+    table.insert(out, { id = c.id, name = c.name, initialized = c.initialized == true })
+  end
+  return out
+end
+
+local function json_or_str(val)
+  local ok, js = pcall(vim.fn.json_encode, val)
+  if ok and type(js) == "string" then
+    return js
+  end
+  return tostring(val)
+end
+
+local function recognize(bufnr, snap)
+  local cur = snapshot_clients(bufnr) or {}
+  local live = 0
+  for _, c in ipairs(cur) do
+    if c.initialized then
+      live = live + 1
+    end
+  end
+  if live > 0 then
+    return "normal", cur
+  end
+  if snap ~= nil and #snap > 0 then
+    return "raw", cur
+  end
+  return "noclient", cur
+end
+
 -- 打开一批文件，返回 { buf = bufnr }（edit 失败记 error）
 local function edit_batch(files)
   local out = {}
@@ -376,6 +414,9 @@ function PiNvim.diagnose(req_path, res_path)
     local diag_ms = req.diagMs or DEF_DIAG_MS
     local entries = edit_batch(files)
     wait_attach(entries, attach_ms)
+    for _, e in ipairs(entries) do
+      e.snap = snapshot_clients(e.buf)
+    end
     -- 批级落定（push/pull 兼容）：冷启动 attach 后诊断异步到达，不等即大概率空结果；
     -- 整批 buffer 只做一次 settle 等待（有新诊断到达即续，无新诊断持续 QUIET_MS 且过
     -- 最小时间线 MIN_SETTLE_MS 才收），然后逐文件直接 collect（diagnose/format 同路径）。
@@ -389,20 +430,42 @@ function PiNvim.diagnose(req_path, res_path)
     local per_file = {}
     local wipe = {}
     for _, e in ipairs(entries) do
-      if e.edit_error ~= nil then
-        table.insert(per_file, { file = e.file, diags = {}, ms = 0, error = e.edit_error })
-      else
-        local clients = vim.lsp.get_clients({ bufnr = e.buf })
-        if #clients == 0 then
-          -- 无 client 文件记 diags:[]＋no_client:true，绝不写盘
-          table.insert(per_file, { file = e.file, diags = {}, ms = vim.uv.now() - t0, no_client = true })
-        else
-          table.insert(
-            per_file,
-            { file = e.file, diags = collect_diags(e.buf), ms = vim.uv.now() - t0 }
-          )
+      local ok, out = pcall(function()
+        if e.edit_error ~= nil then
+          return { entry = { file = e.file, diags = {}, ms = 0, error = e.edit_error }, wipe = false }
         end
-        table.insert(wipe, e.buf)
+        local verdict = recognize(e.buf, e.snap)
+        if verdict == "raw" then
+          return {
+            entry = {
+              file = e.file,
+              raw = json_or_str({ at_attach = e.snap, note = "lsp client(s) changed mid-request" }),
+              note = "lsp client(s) changed mid-request",
+              diags = {},
+              ms = vim.uv.now() - t0,
+            },
+            wipe = false,
+          }
+        end
+        if verdict == "noclient" then
+          -- 无 client 文件记 diags:[]＋no_client:true，绝不写盘
+          return { entry = { file = e.file, diags = {}, ms = vim.uv.now() - t0, no_client = true }, wipe = true }
+        end
+        return { entry = { file = e.file, diags = collect_diags(e.buf), ms = vim.uv.now() - t0 }, wipe = true }
+      end)
+      if not ok then
+        table.insert(per_file, {
+          file = e.file,
+          raw = json_or_str({ lua_error = tostring(out) }),
+          note = "bridge error",
+          diags = {},
+          ms = 0,
+        })
+      else
+        table.insert(per_file, out.entry)
+        if out.wipe and e.buf ~= nil then
+          table.insert(wipe, e.buf)
+        end
       end
     end
     -- 批末只 wipe 本批 buffer，不停任何 client（server 留温整 session）
@@ -424,10 +487,15 @@ function PiNvim.format(req_path, res_path)
     local entries = edit_batch(files)
     -- 先全 edit 再统一等 attach（并发冷启动）；按 formatting 能力等，防误判 no-formatter
     wait_attach(entries, attach_ms, "textDocument/formatting")
+    for _, e in ipairs(entries) do
+      e.snap = snapshot_clients(e.buf)
+    end
     -- 先逐文件写盘（不管诊断），再整批只做一次 settle，最后逐文件直接 collect
     -- （diagnose/format 同走批级落定路径；per-file settle 已删）
     local pending = {}
+    local snap_by_file = {}
     for _, e in ipairs(entries) do
+      snap_by_file[e.file] = e.snap
       table.insert(pending, format_write(e))
     end
     local settle = {}
@@ -440,21 +508,42 @@ function PiNvim.format(req_path, res_path)
     local per_file = {}
     local wipe = {}
     for _, r in ipairs(pending) do
-      if r._buf ~= nil and vim.api.nvim_buf_is_valid(r._buf) then
-        r.diags = collect_diags(r._buf)
-        if #vim.lsp.get_clients({ bufnr = r._buf }) == 0 then
-          r.no_client = true
+      local ok, err = pcall(function()
+        if r.error ~= nil then
+          return
         end
-      else
+        if r._buf ~= nil and vim.api.nvim_buf_is_valid(r._buf) then
+          local verdict = recognize(r._buf, snap_by_file[r.file])
+          if verdict == "raw" then
+            r.raw = json_or_str({ at_attach = snap_by_file[r.file], note = "lsp client(s) changed mid-request" })
+            r.note = "lsp client(s) changed mid-request"
+            r.diags = r.diags or {}
+            r._raw = true
+            return
+          end
+          r.diags = collect_diags(r._buf)
+          if verdict == "noclient" then
+            r.no_client = true
+          end
+        else
+          r.diags = r.diags or {}
+        end
+      end)
+      if not ok then
+        r.raw = json_or_str({ lua_error = tostring(err) })
+        r.note = "bridge error"
         r.diags = r.diags or {}
+        r._raw = true
       end
       local keep = r._keep
       local buf = r._buf
+      local skip_wipe = r._raw == true
       r._keep = nil
       r._buf = nil
+      r._raw = nil
       table.insert(per_file, r)
-      -- 写失败留现场不 wipe，下次碰到报残留；其余批末 wipe
-      if not keep and buf ~= nil then
+      -- 写失败／不可识别留现场不 wipe，下次碰到报残留；其余批末 wipe
+      if not keep and not skip_wipe and buf ~= nil then
         table.insert(wipe, buf)
       end
     end

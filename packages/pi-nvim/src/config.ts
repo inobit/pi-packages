@@ -53,6 +53,8 @@ export interface NvimConfig {
 	idleMs: number;
 	/** daemon 父进程存活探测间隔（毫秒），默认 15000（15s） */
 	parentPollMs: number;
+	/** 错误文本上限（字符数；唯一截断，content/details 同 cap，用户可调） */
+	errorCap: number;
 	/** 调用守卫白名单（仅调用时短路，无自动触发） */
 	whitelist: NvimWhitelist;
 }
@@ -81,6 +83,7 @@ export const DEFAULT_CONFIG: NvimConfig = {
 	},
 	idleMs: 300000,
 	parentPollMs: 15000,
+	errorCap: 2000,
 	whitelist: {
 		enabled: DEFAULT_WHITELIST.enabled,
 		diagnostics: { ...DEFAULT_WHITELIST.diagnostics, extensions: [...DEFAULT_WHITELIST.diagnostics.extensions], filenames: [...DEFAULT_WHITELIST.diagnostics.filenames] },
@@ -191,6 +194,7 @@ export function normalizeConfig(raw: Record<string, unknown> | undefined): NvimC
 		timeouts: { ...DEFAULT_CONFIG.timeouts },
 		idleMs: DEFAULT_CONFIG.idleMs,
 		parentPollMs: DEFAULT_CONFIG.parentPollMs,
+		errorCap: DEFAULT_CONFIG.errorCap,
 		whitelist: asWhitelist(undefined),
 	};
 	if (!raw) return out;
@@ -211,6 +215,8 @@ export function normalizeConfig(raw: Record<string, unknown> | undefined): NvimC
 	if (idleMs !== undefined) out.idleMs = idleMs;
 	const parentPollMs = asPositiveInt(raw["parentPollMs"]);
 	if (parentPollMs !== undefined) out.parentPollMs = parentPollMs;
+	const errorCap = asPositiveInt(raw["errorCap"]);
+	if (errorCap !== undefined) out.errorCap = errorCap;
 	return out;
 }
 
@@ -309,6 +315,8 @@ export function normalizeConfigOverlay(raw: Record<string, unknown>): Partial<Nv
 	if (idleMs !== undefined) out.idleMs = idleMs;
 	const parentPollMs = asPositiveInt(raw["parentPollMs"]);
 	if (parentPollMs !== undefined) out.parentPollMs = parentPollMs;
+	const errorCap = asPositiveInt(raw["errorCap"]);
+	if (errorCap !== undefined) out.errorCap = errorCap;
 	if (raw["whitelist"] && typeof raw["whitelist"] === "object") {
 		const w = raw["whitelist"] as Record<string, unknown>;
 		const patch: { enabled?: boolean; diagnostics?: { extensions?: string[]; filenames?: string[] }; format?: { extensions?: string[]; filenames?: string[] } } = {};

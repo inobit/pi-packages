@@ -34,6 +34,9 @@ export interface DiagnoseFileResult {
 	error?: string;
 	/** 调用守卫白名单未命中：渲染为 skipped 行（非错误，不执行） */
 	skipped?: string;
+	/** 不可识别输出：原文透传（错误 cap 截断）＋note，永不记 clean、永不编造 reason */
+	raw?: string;
+	note?: string;
 }
 
 /** format 五态 reason（unchanged＝写后比较无变化，覆盖“已格式化”与“静默无操作”两义） */
@@ -52,6 +55,9 @@ export interface FormatFileResult {
 	error?: string;
 	/** 调用守卫白名单未命中：渲染为 skipped 行（非错误，不执行） */
 	skipped?: string;
+	/** 不可识别输出：原文透传（错误 cap 截断）＋note，永不记 clean、永不编造 reason */
+	raw?: string;
+	note?: string;
 }
 
 /** 错误文本上限（字符数；唯一截断，content/details 同 cap） */
@@ -147,7 +153,8 @@ export function degradedHeader(lines: string[]): string {
  * error 行走错误截断，诊断数组全量（结构化、可再生，不截断）。
  */
 export function renderLspContent(
-	files: Array<{ file: string; diags: NvimDiag[]; no_client?: boolean; error?: string; skipped?: string }>,
+	files: Array<{ file: string; diags: NvimDiag[]; no_client?: boolean; error?: string; skipped?: string; raw?: string; note?: string }>,
+	errorCap: number = ERROR_TEXT_LIMIT,
 ): string {
 	let errors = 0;
 	let warns = 0;
@@ -164,7 +171,11 @@ export function renderLspContent(
 	lines.push(headParts.join(", "));
 	for (const f of files) {
 		if (f.error) {
-			lines.push(`${f.file}: error (${truncateError(f.error)})`);
+			lines.push(`${f.file}: error (${truncateError(f.error, errorCap)})`);
+			continue;
+		}
+		if (f.raw !== undefined) {
+			lines.push(`? ${f.file} — unrecognized (${f.note ?? "unknown"}): ${truncateError(f.raw, errorCap)}`);
 			continue;
 		}
 		if (f.skipped) {
@@ -194,12 +205,14 @@ export function renderLspContent(
  * `path: error (…)` 行内表达（error 行走错误截断）；reason 原样展示供模型判断。
  * 兼容旧 daemon 的 `ok`＋未变化：同样渲染为 `unchanged`。
  */
-export function renderFormatContent(files: FormatFileResult[]): string {
+export function renderFormatContent(files: FormatFileResult[], errorCap: number = ERROR_TEXT_LIMIT): string {
 	const done = files.filter((f) => f.formatted).length;
 	const lines: string[] = [`formatted ${done}/${files.length}`];
 	for (const f of files) {
 		if (f.error) {
-			lines.push(`${f.file}: error (${truncateError(f.error)})`);
+			lines.push(`${f.file}: error (${truncateError(f.error, errorCap)})`);
+		} else if (f.raw !== undefined) {
+			lines.push(`? ${f.file} — unrecognized (${f.note ?? "unknown"}): ${truncateError(f.raw, errorCap)}`);
 		} else if (f.skipped) {
 			lines.push(`${f.file}: skipped (${f.skipped})`);
 		} else if (f.formatted) {
@@ -217,7 +230,7 @@ export function renderFormatContent(files: FormatFileResult[]): string {
 }
 
 /** daemon 原始 JSON（宽容解析：字段缺失回退空值，不抛错；error 文进 details 前走错误截断） */
-export function parseDiagnosePayload(payload: unknown): DiagnoseFileResult[] {
+export function parseDiagnosePayload(payload: unknown, cap: number = ERROR_TEXT_LIMIT): DiagnoseFileResult[] {
 	if (!payload || typeof payload !== "object") return [];
 	const perFile = (payload as { per_file?: unknown }).per_file;
 	if (!Array.isArray(perFile)) return [];
@@ -244,19 +257,23 @@ export function parseDiagnosePayload(payload: unknown): DiagnoseFileResult[] {
 			diags,
 			ms: typeof e["ms"] === "number" ? e["ms"] : 0,
 			no_client: e["no_client"] === true ? true : undefined,
-			error: typeof e["error"] === "string" ? truncateError(e["error"] as string) : undefined,
+			error: typeof e["error"] === "string" ? truncateError(e["error"] as string, cap) : undefined,
+			raw: typeof e["raw"] === "string" ? truncateError(e["raw"] as string, cap) : undefined,
+			note: typeof e["note"] === "string" ? e["note"] : undefined,
 		});
 	}
 	return out;
 }
 
+// 截断单步点：parse 收 cap（默认 2000），调用方传配置值；render 同 cap 二次调用由幂等守卫吸收。
+
 /** format 原始 JSON 宽容解析（reason 非法回退 format-error，不静默记 ok；error 文走错误截断） */
-export function parseFormatPayload(payload: unknown): FormatFileResult[] {
+export function parseFormatPayload(payload: unknown, cap: number = ERROR_TEXT_LIMIT): FormatFileResult[] {
 	if (!payload || typeof payload !== "object") return [];
 	const perFile = (payload as { per_file?: unknown }).per_file;
 	if (!Array.isArray(perFile)) return [];
 	const out: FormatFileResult[] = [];
-	const diagnosed = parseDiagnosePayload(payload);
+	const diagnosed = parseDiagnosePayload(payload, cap);
 	const diagByFile = new Map(diagnosed.map((d) => [d.file, d]));
 	for (const entry of perFile) {
 		if (!entry || typeof entry !== "object") continue;
@@ -272,10 +289,13 @@ export function parseFormatPayload(payload: unknown): FormatFileResult[] {
 					? reason
 					: "format-error",
 			changed_lines: typeof e["changed_lines"] === "number" ? e["changed_lines"] : 0,
+			skipped: typeof e["skipped"] === "string" ? e["skipped"] : undefined,
 			diags: diagByFile.get(file)?.diags ?? [],
 			ms: typeof e["ms"] === "number" ? e["ms"] : 0,
 			no_client: e["no_client"] === true ? true : undefined,
-			error: typeof e["error"] === "string" ? truncateError(e["error"] as string) : undefined,
+			error: typeof e["error"] === "string" ? truncateError(e["error"] as string, cap) : undefined,
+			raw: typeof e["raw"] === "string" ? truncateError(e["raw"] as string, cap) : undefined,
+			note: typeof e["note"] === "string" ? e["note"] : undefined,
 		});
 	}
 	return out;

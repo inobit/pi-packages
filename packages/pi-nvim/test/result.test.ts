@@ -36,6 +36,12 @@ describe("truncateError（唯一截断）", () => {
 	it("刚好 2000 不截", () => {
 		expect(truncateError("y".repeat(2000))).toHaveLength(2000);
 	});
+	it("raw 透传行：不可识别不归一化、原文截断＋note", () => {
+		const parsed = parseDiagnosePayload({ per_file: [{ file: "a.ts", raw: "x".repeat(2500), note: "mid-request change" }] }, 100);
+		expect(parsed[0]?.raw).toHaveLength(100 + "…(truncated 2400 chars)".length);
+		const text = renderLspContent([{ file: "a.ts", diags: [], raw: parsed[0]?.raw, note: "mid-request change" }], 100);
+		expect(text).toContain("? a.ts — unrecognized (mid-request change)");
+	});
 	it("已带注记不再二次截断（parse＋render 双层调用注记一致）", () => {
 		const once = truncateError("z".repeat(2500));
 		expect(truncateError(once)).toBe(once);
