@@ -1,0 +1,18 @@
+{
+  "nvimPath": "nvim",
+  "sockDir": "",
+  "timeouts": {
+    "spawnMs": 30000,
+    "attachMs": 20000,
+    "diagMs": 10000,
+    "requestMs": 60000,
+    "pollMs": 50
+  },
+  "truncation": {
+    "perFile": 50,
+    "batch": 200,
+    "message": 500
+  },
+  "idleMs": 300000,
+  "parentPollMs": 15000
+}

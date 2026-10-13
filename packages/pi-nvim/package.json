@@ -1,0 +1,69 @@
+{
+  "name": "@inobit/pi-nvim",
+  "version": "0.1.0",
+  "description": "Reuse your Neovim LSP setup inside Pi sessions: `nvim_lsp` (read-only diagnostics) and `nvim_format` (write-back formatting) backed by a per-session headless nvim daemon.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "files": [
+    "src",
+    "lua",
+    "config",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "pack:check": "pnpm pack --pack-destination /tmp"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "pi-coding-agent",
+    "coding-agent",
+    "neovim",
+    "lsp",
+    "formatter"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inobit/pi-packages.git",
+    "directory": "packages/pi-nvim"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.87.1",
+    "@earendil-works/pi-coding-agent": ">=0.87.1",
+    "@earendil-works/pi-tui": ">=0.87.1",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "catalog:",
+    "@earendil-works/pi-coding-agent": "catalog:",
+    "@earendil-works/pi-tui": "catalog:",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "typebox": "catalog:",
+    "vitest": "^4.1.8"
+  }
+}
