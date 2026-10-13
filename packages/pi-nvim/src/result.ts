@@ -8,8 +8,9 @@
  *   `truncateError(text, 2000)`＋`…(truncated N chars)` 注记，details 同 cap
  *   （日志保护；错误非结构化、前重后轻）。
  * - 返回不含文件内容。
- * - format 五态：`formatted`＋`reason(ok/unchanged/no-formatter/format-error/write-error)`＋
- *   `changed_lines`，`formatted` 必须由写前写后内容比较得出（见 deriveFormatState）。
+ * - format 五态：`formatted`＋`reason(ok/unchanged/no-formatter/format-error/write-error)`，
+ *   `formatted` 必须由写前写后内容比较得出（布尔，见 lua/bridge.lua content_changed）；
+ *   不报改动行数——位置比较会把前部插入虚报成后续每一行都改，数字对模型无意义。
  */
 
  /** 诊断严重度（沿用 vim.diagnostic 1=Error 2=Warn 3=Info 4=Hint） */
@@ -47,7 +48,6 @@ export interface FormatFileResult {
 	file: string;
 	formatted: boolean;
 	reason: FormatReason;
-	changed_lines: number;
 	diags: NvimDiag[];
 	ms: number;
 	no_client?: boolean;
@@ -83,19 +83,6 @@ export function severityLabel(s: number): string {
 	return "hint";
 }
 
-/** 行级 diff 行数：逐行比对＋长度差（纯函数，写前写后比较用） */
-export function countChangedLines(before: string, after: string): number {
-	if (before === after) return 0;
-	const a = before.split("\n");
-	const b = after.split("\n");
-	const common = Math.min(a.length, b.length);
-	let n = Math.abs(a.length - b.length);
-	for (let i = 0; i < common; i++) {
-		if (a[i] !== b[i]) n++;
-	}
-	return n;
-}
-
 export interface FormatGate {
 	/** 是否有支持 textDocument/formatting 的 client（无→no-formatter） */
 	hasFormatter: boolean;
@@ -113,18 +100,19 @@ export interface FormatGate {
  * - 其余比较写前写后：有变化 formatted:true＋ok，无变化 formatted:false＋unchanged
  *   （unchanged 覆盖“已格式化，无事可做”与“formatter 静默无操作”两义，不以
  *   “未抛错”推导 formatted；ok 只表示“本次写盘产生了变化”）。
+ *
+ * 注：真实推导在 Lua（format_write），TS 侧只合成调用守卫短路结果（恒 unchanged/format-error），
+ * 故此函数仅作契约留档＋单测，不参与渲染。
  */
 export function deriveFormatState(
 	before: string,
 	after: string,
 	gate: FormatGate,
-): { formatted: boolean; reason: FormatReason; changed_lines: number } {
-	const changed_lines = countChangedLines(before, after);
-	if (gate.writeError) return { formatted: false, reason: "write-error", changed_lines };
-	if (!gate.hasFormatter) return { formatted: false, reason: "no-formatter", changed_lines };
-	if (gate.formatError) return { formatted: false, reason: "format-error", changed_lines };
-	if (changed_lines === 0) return { formatted: false, reason: "unchanged", changed_lines };
-	return { formatted: true, reason: "ok", changed_lines };
+): { formatted: boolean; reason: FormatReason } {
+	if (gate.writeError) return { formatted: false, reason: "write-error" };
+	if (!gate.hasFormatter) return { formatted: false, reason: "no-formatter" };
+	if (gate.formatError) return { formatted: false, reason: "format-error" };
+	return { formatted: before !== after, reason: before === after ? "unchanged" : "ok" };
 }
 
 function formatDiagLine(file: string, d: NvimDiag): string {
@@ -228,7 +216,7 @@ export function renderFormatContent(files: FormatFileResult[], errorCap: number 
 		} else if (f.skipped) {
 			lines.push(`${f.file}: skipped (${f.skipped})`);
 		} else if (f.formatted) {
-			lines.push(`${f.file}: formatted (${f.changed_lines} line${f.changed_lines === 1 ? "" : "s"})`);
+			lines.push(`${f.file}: formatted`);
 		} else if (f.reason === "unchanged" || f.reason === "ok") {
 			lines.push(`${f.file}: unchanged`);
 		} else {
@@ -304,7 +292,6 @@ export function parseFormatPayload(payload: unknown, cap: number = ERROR_TEXT_LI
 				reason === "ok" || reason === "unchanged" || reason === "no-formatter" || reason === "write-error"
 					? reason
 					: "format-error",
-			changed_lines: typeof e["changed_lines"] === "number" ? e["changed_lines"] : 0,
 			skipped: typeof e["skipped"] === "string" ? e["skipped"] : undefined,
 			diags: diagByFile.get(file)?.diags ?? [],
 			ms: typeof e["ms"] === "number" ? e["ms"] : 0,

@@ -23,12 +23,30 @@ PiNvim._aborted = false
 PiNvim._reqs = {}
 PiNvim._last_req_ms = vim.uv.now()
 
-local SOCK_DIR = vim.fn.getenv("PI_NVIM_SOCK_DIR") or ""
-local IDLE_MS = tonumber(vim.fn.getenv("PI_NVIM_IDLE_MS")) or 300000
-local PARENT_POLL_MS = tonumber(vim.fn.getenv("PI_NVIM_PARENT_POLL_MS")) or 15000
-local DEF_ATTACH_MS = tonumber(vim.fn.getenv("PI_NVIM_ATTACH_MS")) or 20000
-local DEF_DIAG_MS = tonumber(vim.fn.getenv("PI_NVIM_DIAG_MS")) or 10000
-local DEF_FORMAT_MS = tonumber(vim.fn.getenv("PI_NVIM_FORMAT_MS")) or 20000
+-- env 读取归一：`getenv` 未设置时返回 vim.NIL（userdata），`or fallback` 捕不到，
+-- 直接参与拼接会报"attempt to concatenate a userdata value"、传给 tonumber 亦不稳。
+local function env_str(name, fallback)
+  local v = vim.fn.getenv(name)
+  if type(v) == "string" and v ~= "" then
+    return v
+  end
+  return fallback
+end
+
+local function env_num(name, fallback)
+  local n = tonumber(env_str(name, ""))
+  if n == nil then
+    return fallback
+  end
+  return n
+end
+
+local SOCK_DIR = env_str("PI_NVIM_SOCK_DIR", "")
+local IDLE_MS = env_num("PI_NVIM_IDLE_MS", 300000)
+local PARENT_POLL_MS = env_num("PI_NVIM_PARENT_POLL_MS", 15000)
+local DEF_ATTACH_MS = env_num("PI_NVIM_ATTACH_MS", 20000)
+local DEF_DIAG_MS = env_num("PI_NVIM_DIAG_MS", 10000)
+local DEF_FORMAT_MS = env_num("PI_NVIM_FORMAT_MS", 20000)
 
 -- 批级诊断落定参数（P0 校准依据：本地 headless 实测冷启动 edit→首诊断
 -- ts ~2.5s（3 次：2475/2477/2505ms，attach 后 ~2.0s）、go ~0.6s、py ~0.3s；
@@ -110,7 +128,9 @@ local function wipe_all_file_buffers()
   wipe_buffers(out)
 end
 
--- 退出路径：删 socket＋ready＋daemon.pid 后再删目录（非空 rmdir 必失败，残留由 GC 收）
+-- 退出路径：删 socket＋ready＋daemon.pid＋daemon.log 后再删目录。
+-- daemon.log 必须一并删：它是本进程自己的 stderr 重定向，漏删则目录恒非空、rmdir 必失败，
+-- 每次会话泄漏一个 sockdir（兄弟 GC 只扫同 session，跨会话残留永不回收，实测已堆积）。
 local function cleanup_sock_dir()
   if SOCK_DIR == "" then
     return
@@ -118,6 +138,10 @@ local function cleanup_sock_dir()
   vim.fn.delete(sock_path("nvim.sock"))
   vim.fn.delete(sock_path("ready"))
   vim.fn.delete(sock_path("daemon.pid"))
+  local log_path = env_str("PI_NVIM_LOG", "")
+  if log_path ~= "" then
+    vim.fn.delete(log_path)
+  end
   -- 仅删空目录；在途 req/res 残留时失败即留给下次 GC
   vim.fn.delete(SOCK_DIR, "d")
 end
@@ -354,16 +378,19 @@ local function buf_lines(bufnr)
   return vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
 end
 
-local function count_changed(before, after)
-  local n = 0
-  local common = math.min(#before, #after)
-  n = n + math.abs(#before - #after)
-  for i = 1, common do
+-- 内容是否有变化（布尔，纯函数）：行数不同或任一行不同即变。
+-- formatted 只看成败，不做行级 diff——位置比较会把"前部插入"误报成后续每一行都改了
+-- （顶部插 1 行即虚报全文件），数字对模型无意义，故只留布尔。
+local function content_changed(before, after)
+  if #before ~= #after then
+    return true
+  end
+  for i = 1, #before do
     if before[i] ~= after[i] then
-      n = n + 1
+      return true
     end
   end
-  return n
+  return false
 end
 
 -- 确保当前 buffer＝目标（:w 恒写当前 buffer，错文件写入无报错，必须前置校验）
@@ -391,7 +418,6 @@ local function format_write(entry)
       file = entry.file,
       formatted = false,
       reason = "format-error",
-      changed_lines = 0,
       error = entry.edit_error,
     })
   end
@@ -400,7 +426,6 @@ local function format_write(entry)
       file = entry.file,
       formatted = false,
       reason = "format-error",
-      changed_lines = 0,
       _buf = entry.buf,
     })
   end
@@ -412,7 +437,6 @@ local function format_write(entry)
       file = entry.file,
       formatted = false,
       reason = "no-formatter",
-      changed_lines = 0,
       _buf = buf,
     })
   end
@@ -424,23 +448,20 @@ local function format_write(entry)
   local ok = pcall(vim.cmd, "write")
   if not ok then
     -- :w 失败留现场不 wipe（内存≠磁盘，转人工），下次碰到报残留
-    local after = buf_lines(buf)
     return finish({
       file = entry.file,
       formatted = false,
       reason = "write-error",
-      changed_lines = count_changed(before, after),
       _buf = buf,
       _keep = true,
     })
   end
   local after = buf_lines(buf)
-  local changed = count_changed(before, after)
+  local changed = content_changed(before, after)
   return finish({
     file = entry.file,
-    formatted = changed > 0,
-    reason = changed > 0 and "ok" or "unchanged",
-    changed_lines = changed,
+    formatted = changed,
+    reason = changed and "ok" or "unchanged",
     _buf = buf,
   })
 end
@@ -553,6 +574,12 @@ function PiNvim.format(req_path, res_path)
     local attach_ms = req.attachMs or DEF_ATTACH_MS
     local diag_ms = req.diagMs or DEF_DIAG_MS
     local entries = edit_batch(files)
+    -- 登记必须早于 wait_attach（与 diagnose 对齐）：attach 窗口内到达的 abort 要靠已在册的
+    -- _current/_reqs[id] 才能被 PiNvim.abort 认领。晚登记会两重失效——窗口内 abort 因
+    -- 对不上被丢弃，随后 reg_request 的 _aborted=false 又把已送达的抹掉，format 会在
+    -- 用户已中断后照常写盘（TS 侧却已回 partial，磁盘与模型认知相悖）。
+    reg_request(req.id)
+    reg_bufs(req.id, entries)
     -- 先全 edit 再统一等 attach（并发冷启动）；按 formatting 能力等，防误判 no-formatter
     wait_attach(entries, attach_ms, "textDocument/formatting")
     for _, e in ipairs(entries) do
@@ -560,8 +587,6 @@ function PiNvim.format(req_path, res_path)
     end
     -- 先逐文件写盘（不管诊断），再整批只做一次 settle，最后逐文件直接 collect
     -- （diagnose/format 同走批级落定路径；per-file settle 已删）
-    reg_request(req.id)
-    reg_bufs(req.id, entries)
     local pending = {}
     local snap_by_file = {}
     for _, e in ipairs(entries) do

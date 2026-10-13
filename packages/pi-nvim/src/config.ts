@@ -183,6 +183,33 @@ function asWhitelist(raw: unknown): NvimWhitelist {
 	};
 }
 
+/** 超时保底下界（毫秒）：落定等待不得压成 0，否则冷 server 首波诊断必漏检 */
+const MIN_TIMEOUT_MS = 1000;
+
+/**
+ * 钳制超时层级（纯函数，可单测）：闭合不变式 `attachMs + diagMs ≤ requestMs`。
+ *
+ * 单次 daemon 请求内 attach 与 diag 串行相加，其和若超过 requestMs，则 requestMs 必先到点
+ * → TS 侧判卡死抛 DaemonTimeoutError → killStuck 杀掉**健康** daemon 丢温。
+ *
+ * 必须先钳 attachMs 再钳 diagMs 才闭合：只钳 diagMs 时，attachMs > requestMs-MIN_TIMEOUT_MS
+ * 会让 `Math.max(MIN_TIMEOUT_MS, requestMs-attachMs)` 落到保底值，和仍超 requestMs
+ * （实测 requestMs=5000＋默认 attachMs=20000 → 21000 > 5000）。
+ *
+ * diagMs 恒保底 MIN_TIMEOUT_MS（含用户显式设更小值）：它是诊断落定的硬上界，压到接近 0
+ * 会让冷 server 首波诊断（attach 后 ~2.5s 才到）必漏检，等于静默关掉诊断。attachMs 不设
+ * 保底——它只是 attach 等待上界，设小仅退化为不等 attach（noclient 判定照常兜底）。
+ *
+ * 注：requestMs < 2*MIN_TIMEOUT_MS 的病态配置无法同时满足不变式与保底，此时保底优先
+ * （attach+diag 上界为 2*MIN_TIMEOUT_MS），故 requestMs 应设到 ≥2s。
+ */
+export function clampTimeoutHierarchy(timeouts: NvimTimeouts): NvimTimeouts {
+	const requestMs = timeouts.requestMs;
+	const attachMs = Math.min(timeouts.attachMs, Math.max(MIN_TIMEOUT_MS, requestMs - MIN_TIMEOUT_MS));
+	const diagMs = Math.max(MIN_TIMEOUT_MS, Math.min(timeouts.diagMs, requestMs, requestMs - attachMs));
+	return { ...timeouts, attachMs, diagMs };
+}
+
 /**
  * 纯校验：非法字段回退默认值；数值须为正整数（sockDir 允许空字符串表未覆盖）。
  * 约束：pollMs/idleMs/parentPollMs 与各项超时一律正整数，否则回退。
@@ -210,10 +237,8 @@ export function normalizeConfig(raw: Record<string, unknown> | undefined): NvimC
 			if (n !== undefined) out.timeouts[key] = n;
 		}
 	}
-	if (out.timeouts.diagMs > out.timeouts.requestMs) out.timeouts.diagMs = out.timeouts.requestMs;
-	if (out.timeouts.attachMs + out.timeouts.diagMs > out.timeouts.requestMs) {
-		out.timeouts.diagMs = Math.max(1000, out.timeouts.requestMs - out.timeouts.attachMs);
-	}
+	// 超时层级：attach+diag 之和不得超 requestMs（见 clampTimeoutHierarchy）
+	out.timeouts = clampTimeoutHierarchy(out.timeouts);
 	const idleMs = asPositiveInt(raw["idleMs"]);
 	if (idleMs !== undefined) out.idleMs = idleMs;
 	const parentPollMs = asPositiveInt(raw["parentPollMs"]);
@@ -292,17 +317,8 @@ export function applyOverlay(base: NvimConfig, overlay: Partial<NvimConfig>): Nv
 				}
 			: base.whitelist,
 	};
-	// P2-2：diagMs 若被 overlay 抬过 requestMs，健康 daemon 会被误判卡死丢温；钳住。
-	// 另保证 attach+diag 之和不超过 request（单请求内串行相加的上界）。
-	if (merged.timeouts.diagMs > merged.timeouts.requestMs) {
-		merged.timeouts = { ...merged.timeouts, diagMs: merged.timeouts.requestMs };
-	}
-	if (merged.timeouts.attachMs + merged.timeouts.diagMs > merged.timeouts.requestMs) {
-		merged.timeouts = {
-			...merged.timeouts,
-			diagMs: Math.max(1000, merged.timeouts.requestMs - merged.timeouts.attachMs),
-		};
-	}
+	// 超时层级钳制（同 normalizeConfig）：防健康 daemon 被 requestMs 误判卡死丢温
+	merged.timeouts = clampTimeoutHierarchy(merged.timeouts);
 	return merged;
 }
 

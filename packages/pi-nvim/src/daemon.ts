@@ -25,7 +25,7 @@ import path from "node:path";
 import type { NvimConfig } from "./config.ts";
 import { ERROR_TEXT_LIMIT, truncateError } from "./result.ts";
 
-/** daemon 启动日志文件名（stderr 重定向，启动健康检查用） */
+/** daemon 启动日志文件名（stderr 重定向，启动健康检查用；daemon 优雅退出时自删，防 sockdir 泄漏） */
 export const DAEMON_LOG_NAME = "daemon.log";
 
 /** 启动健康只看日志尾部行数（有界读取，防大日志） */
@@ -320,6 +320,8 @@ export class DaemonManager {
 			PI_NVIM_PARENT_POLL_MS: String(this.cfg.parentPollMs),
 			PI_NVIM_ATTACH_MS: String(this.cfg.timeouts.attachMs),
 			PI_NVIM_DIAG_MS: String(this.cfg.timeouts.diagMs),
+			// 退出路径据此自删日志：不删则 sockdir 恒非空、rmdir 必失败（每次会话泄漏一个目录）
+			PI_NVIM_LOG: h.logPath,
 		};
 		const args = [
 			"--headless",
@@ -548,6 +550,10 @@ export class DaemonManager {
 		unlinkIfExists(h.sockPath);
 		unlinkIfExists(h.readyPath);
 		unlinkIfExists(h.pidPath);
+		// 日志与目录不删：请求超时恰是最需要看日志定位的场景（可能是被误判卡死的健康
+		// daemon），且 sockdir 由 (session,pid) 决定——下次 spawn 复用同一目录并把日志以
+		// "w" 截断重写，故留日志不累积。真正会累积的是优雅退出路径（下个 session 是新的
+		// uuidv7→新目录），那条由 Lua cleanup_sock_dir 删日志＋rmdir 收口。
 		h.childPid = undefined;
 	}
 

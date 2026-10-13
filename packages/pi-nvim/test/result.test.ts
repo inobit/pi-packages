@@ -7,7 +7,6 @@
 
 import { describe, expect, it } from "vitest";
 import {
-	countChangedLines,
 	degradedHeader,
 	deriveFormatState,
 	ERROR_TEXT_LIMIT,
@@ -68,7 +67,7 @@ describe("诊断全量", () => {
 	it("format 写后诊断全量", () => {
 		const diags = Array.from({ length: 60 }, () => diag("m"));
 		const text = renderFormatContent([
-			{ file: "a.ts", formatted: true, reason: "ok", changed_lines: 1, diags, ms: 1 },
+			{ file: "a.ts", formatted: true, reason: "ok", diags, ms: 1 },
 		]);
 		expect(text).not.toContain("…truncated");
 		expect(text).toContain("a.ts:1:1 [error] (ts_ls) m");
@@ -79,17 +78,17 @@ describe("deriveFormatState（五态）", () => {
 	it("有变化→formatted:true＋ok", () => {
 		expect(
 			deriveFormatState("a\n", "a\nb\n", { hasFormatter: true, writeError: false, formatError: false }),
-		).toEqual({ formatted: true, reason: "ok", changed_lines: 2 });
+		).toEqual({ formatted: true, reason: "ok", });
 	});
 	it("无变化→formatted:false＋unchanged（覆盖已格式化＋静默无操作）", () => {
 		expect(
 			deriveFormatState("a\n", "a\n", { hasFormatter: true, writeError: false, formatError: false }),
-		).toEqual({ formatted: false, reason: "unchanged", changed_lines: 0 });
+		).toEqual({ formatted: false, reason: "unchanged", });
 	});
 	it("无 formatter→no-formatter", () => {
 		expect(
 			deriveFormatState("a\n", "a\nb\n", { hasFormatter: false, writeError: false, formatError: false }),
-		).toEqual({ formatted: false, reason: "no-formatter", changed_lines: 2 });
+		).toEqual({ formatted: false, reason: "no-formatter", });
 	});
 	it(":w 失败→write-error（优先于门控）", () => {
 		expect(
@@ -99,16 +98,7 @@ describe("deriveFormatState（五态）", () => {
 	it("formatter 显式错→format-error", () => {
 		expect(
 			deriveFormatState("a\n", "a\n", { hasFormatter: true, writeError: false, formatError: true }),
-		).toEqual({ formatted: false, reason: "format-error", changed_lines: 0 });
-	});
-});
-
-describe("countChangedLines", () => {
-	it("相同内容为 0", () => {
-		expect(countChangedLines("a\nb", "a\nb")).toBe(0);
-	});
-	it("改行＋增删行累加", () => {
-		expect(countChangedLines("a\nb\nc", "a\nB\nc\nd")).toBe(2);
+		).toEqual({ formatted: false, reason: "format-error", });
 	});
 });
 
@@ -138,13 +128,13 @@ describe("parseDiagnosePayload", () => {
 describe("parseFormatPayload", () => {
 	it("reason 非法回退 format-error（不静默记 ok）", () => {
 		const out = parseFormatPayload({
-			per_file: [{ file: "a", formatted: true, reason: "weird", changed_lines: 3, ms: 1 }],
+			per_file: [{ file: "a", formatted: true, reason: "weird", ms: 1 }],
 		});
 		expect(out[0]?.reason).toBe("format-error");
 	});
 	it("unchanged 合法通过", () => {
 		const out = parseFormatPayload({
-			per_file: [{ file: "a", formatted: false, reason: "unchanged", changed_lines: 0, ms: 1 }],
+			per_file: [{ file: "a", formatted: false, reason: "unchanged", ms: 1 }],
 		});
 		expect(out[0]?.reason).toBe("unchanged");
 	});
@@ -179,18 +169,18 @@ describe("renderLspContent", () => {
 describe("renderFormatContent", () => {
 	it("formatted X/Y＋逐文件一行（unchanged 与 ok 未变化并列）", () => {
 		const text = renderFormatContent([
-			{ file: "a.ts", formatted: true, reason: "ok", changed_lines: 12, diags: [], ms: 1 },
-			{ file: "b.ts", formatted: false, reason: "unchanged", changed_lines: 0, diags: [], ms: 1 },
-			{ file: "c.ts", formatted: false, reason: "no-formatter", changed_lines: 0, diags: [], ms: 1 },
+			{ file: "a.ts", formatted: true, reason: "ok", diags: [], ms: 1 },
+			{ file: "b.ts", formatted: false, reason: "unchanged", diags: [], ms: 1 },
+			{ file: "c.ts", formatted: false, reason: "no-formatter", diags: [], ms: 1 },
 		]);
 		expect(text).toContain("formatted 1/3");
-		expect(text).toContain("a.ts: formatted (12 lines)");
+		expect(text).toContain("a.ts: formatted");
 		expect(text).toContain("b.ts: unchanged");
 		expect(text).toContain("c.ts: skipped (no-formatter)");
 	});
 	it("旧 daemon 的 ok＋未变化兼容渲染为 unchanged", () => {
 		const text = renderFormatContent([
-			{ file: "b.ts", formatted: false, reason: "ok", changed_lines: 0, diags: [], ms: 1 },
+			{ file: "b.ts", formatted: false, reason: "ok", diags: [], ms: 1 },
 		]);
 		expect(text).toContain("b.ts: unchanged");
 	});

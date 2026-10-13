@@ -201,8 +201,8 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 				const local = scope.locals.get(file);
 				if (!local) return undefined;
 				// P2-8 注记：skipped 是“未执行”（白名单短路），借用 unchanged 槽位是因为 FormatReason 无空转值；渲染优先 skipped 分支，details 语义以 skipped 字段为准
-				if (local.skipped) return { file, formatted: false, reason: "unchanged", changed_lines: 0, diags: [], ms: 0, skipped: local.skipped };
-				return { file, formatted: false, reason: "format-error", changed_lines: 0, diags: [], ms: 0, error: local.error ?? "unreadable file" };
+				if (local.skipped) return { file, formatted: false, reason: "unchanged", diags: [], ms: 0, skipped: local.skipped };
+				return { file, formatted: false, reason: "format-error", diags: [], ms: 0, error: local.error ?? "unreadable file" };
 			};
 			const results: FormatFileResult[] = [];
 			let aborted = false;
@@ -213,7 +213,7 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 			try {
 			if (scope.daemonFiles.length === 0) {
 				// 全拦截：根本不 ensure()（daemon 零惊动），本地项按原序单次聚合返回
-				for (const file of params.files) results.push(localFormatOf(file) ?? { file, formatted: false, reason: "format-error", changed_lines: 0, diags: [], ms: 0, error: "unreadable file" });
+				for (const file of params.files) results.push(localFormatOf(file) ?? { file, formatted: false, reason: "format-error", diags: [], ms: 0, error: "unreadable file" });
 			} else {
 			// 整批占住 daemon 互斥（串行），daemon-bound 逐文件再走 per-file mutation queue
 				await deps.daemon.runExclusive(async () => {
@@ -239,7 +239,6 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 									file,
 									formatted: false,
 									reason: "format-error",
-									changed_lines: 0,
 									diags: [],
 									ms: 0,
 								},
@@ -261,7 +260,7 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 				const seen = new Set(results.map((r) => r.file));
 				for (const file of params.files) {
 					if (!seen.has(file)) {
-						results.push({ file, formatted: false, reason: "format-error", changed_lines: 0, diags: [], ms: 0, error: "aborted before processing" });
+						results.push({ file, formatted: false, reason: "format-error", diags: [], ms: 0, error: "aborted before processing" });
 					}
 				}
 			}

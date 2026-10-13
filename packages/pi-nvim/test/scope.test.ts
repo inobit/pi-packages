@@ -176,7 +176,7 @@ describe("result skipped 行渲染", () => {
 	});
 	it("format skipped 非错误行", () => {
 		const text = renderFormatContent([
-			{ file: "a.ts", formatted: false, reason: "unchanged", changed_lines: 0, diags: [], ms: 0, skipped: SCOPE_SKIP_REASON },
+			{ file: "a.ts", formatted: false, reason: "unchanged", diags: [], ms: 0, skipped: SCOPE_SKIP_REASON },
 		]);
 		expect(text).toContain("a.ts: skipped (not in whitelist)");
 	});
@@ -203,7 +203,7 @@ function makeHarness(tmp: string): {
 		async request(_h: unknown, fn: string, files: string[]): Promise<unknown> {
 			requested.push({ fn, files: [...files] });
 			if (fn === "diagnose") return { per_file: files.map((file) => ({ file, diags: [], ms: 1 })) };
-			return { per_file: files.map((file) => ({ file, formatted: false, reason: "unchanged", changed_lines: 0, ms: 1 })) };
+			return { per_file: files.map((file) => ({ file, formatted: false, reason: "unchanged", ms: 1 })) };
 		},
 		async killStuck(): Promise<void> {},
 	};

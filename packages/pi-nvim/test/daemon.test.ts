@@ -6,6 +6,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
 	DaemonMutex,
@@ -152,5 +154,72 @@ describe("启动健康 IO", () => {
 		fs.writeFileSync(log, filler + "\nError detected while processing BufReadPost\n");
 		expect(readDegradedLines(log)).toHaveLength(1);
 		fs.rmSync(dir, { recursive: true, force: true });
+	});
+});
+
+/** bridge.lua 绝对路径（结构断言＋加载校验共用） */
+const BRIDGE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "lua", "bridge.lua");
+
+describe("bridge.lua 请求登记时序（abort 认领前提）", () => {
+	// abort 靠已在册的 _current/_reqs[id] 认领，故 reg_request 必须早于 wait_attach：
+	// 晚登记则 attach 窗口内到达的 abort 被丢弃，随后被 reg_request 的 _aborted=false 抹掉，
+	// format 会在用户已中断后照常写盘（TS 侧却已回 partial，磁盘与模型认知相悖）。
+	// 该顺序 bug 无法靠冒烟稳定复现（需卡进默认 20s 的 attach 窗口按 esc），
+	// 且不违反"daemon 真机行为不进单测"（只读源码断言，不跑 nvim），故用结构断言防回归。
+	const bridgeSrc = fs.readFileSync(BRIDGE_PATH, "utf8");
+
+	/** 取 PiNvim.<name> 的函数体（到下一个顶层 function PiNvim. 为止） */
+	function fnBody(name: string): string {
+		const start = bridgeSrc.indexOf(`function PiNvim.${name}(`);
+		expect(start, `bridge.lua 缺少 PiNvim.${name}`).toBeGreaterThanOrEqual(0);
+		const next = bridgeSrc.indexOf("\nfunction PiNvim.", start + 1);
+		return bridgeSrc.slice(start, next === -1 ? bridgeSrc.length : next);
+	}
+
+	for (const fn of ["diagnose", "format"]) {
+		it(`${fn}：reg_request 早于 wait_attach`, () => {
+			const body = fnBody(fn);
+			const reg = body.indexOf("reg_request(req.id)");
+			const wait = body.indexOf("wait_attach(");
+			expect(reg, `${fn} 缺 reg_request`).toBeGreaterThanOrEqual(0);
+			expect(wait, `${fn} 缺 wait_attach`).toBeGreaterThanOrEqual(0);
+			expect(reg).toBeLessThan(wait);
+		});
+	}
+});
+
+describe("bridge.lua 加载校验（语法＋加载期错误）", () => {
+	// Lua 语法/加载期错误在 vitest 里完全不可见：真机只表现为"daemon 启动超时 30s"，
+	// 且该错误被 degraded 语义容忍、不抛给模型（改坏 bridge.lua 时实测踩过，只留下
+	// 一行 E5112 在 daemon.log 里）。故用 nvim 自己做一次 luafile 校验——只验语法＋顶层
+	// 执行，不起 LSP、不连 socket，不违反"daemon 真机行为不进单测"。
+	// 无 nvim 时跳过（保持无 nvim 环境可跑测试）。
+	const luafileProbe = (env: NodeJS.ProcessEnv): { out: string; status: number | null } | undefined => {
+		const r = spawnSync("nvim", ["--headless", "-n", "-i", "NONE", "-u", "NONE", "-c", `luafile ${BRIDGE_PATH}`, "-c", "qa!"], {
+			encoding: "utf8",
+			timeout: 30000,
+			env: { ...process.env, ...env },
+		});
+		// nvim 命令行 Lua 出错时退出码仍可能是 0，故以输出为判定主依据
+		if (r.error !== undefined) return undefined;
+		return { out: `${r.stdout ?? ""}${r.stderr ?? ""}`, status: r.status };
+	};
+
+	it("无 env 也能干净加载（SOCK_DIR 空 → auto_setup 早退）", () => {
+		const p = luafileProbe({});
+		if (!p) return;
+		expect(p.out, `bridge.lua 加载失败：\n${p.out}`).not.toMatch(/^E\d+:|Error in command line/m);
+	});
+	it("带 daemon env 能加载且写出 ready 标记（auto_setup 全路径）", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nvim-luachk-"));
+		try {
+			const p = luafileProbe({ PI_NVIM_SOCK_DIR: dir, PI_NVIM_LOG: path.join(dir, "daemon.log") });
+			if (!p) return;
+			expect(p.out, `bridge.lua 加载失败：\n${p.out}`).not.toMatch(/^E\d+:|Error in command line/m);
+			// ready 是 ensure 的就绪双条件之一，写出即证明 auto_setup 跑通
+			expect(fs.existsSync(path.join(dir, "ready"))).toBe(true);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
