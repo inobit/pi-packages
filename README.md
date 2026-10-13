@@ -15,6 +15,7 @@ A pnpm workspace monorepo of extensions for [Pi coding agent](https://pi.dev). T
 | [`@inobit/pi-retry`](packages/pi-retry) | Manual transparent retry: `/retry` + `alt+r`, re-issues the last failed turn as-is with zero prompt injection |
 | [`@inobit/pi-themes`](packages/pi-themes) | Curated themes: Rosé Pine, Tokyonight, Catppuccin and Solarized families with light & dark variants supporting `theme: "light/dark"` paired auto-switching |
 | [`@inobit/pi-subagent-presets`](packages/pi-subagent-presets) | Batch-configure pi-subagents agent `model` + `thinking` per project, field-level merge of the global config, and export a reusable global profile template |
+| [`@inobit/pi-nvim`](packages/pi-nvim) | Reuse your Neovim LSP setup inside Pi sessions: `nvim_lsp` (read-only diagnostics) and `nvim_format` (write-back formatting) over a per-session headless nvim daemon |
 
 See each package's README (links above) for installation, configuration, and usage.
 
