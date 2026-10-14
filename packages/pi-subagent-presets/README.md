@@ -240,6 +240,7 @@ top-level non-object (that shape cannot be stored in `agentOverrides` at all).
 - Verify an agent result with pi-subagents' own `/subagents-models <agent>`; verify a `main` change by starting pi again in this project.
 - The project config directory name is not hardcoded — it is resolved from pi's `CONFIG_DIR_NAME` (and pi-subagents resolves the same name from its own `package.json`).
 - The project root follows pi-subagents' `findConfiguredProjectRoot` when available (including its `.agents`-directory candidates, home cutoff, and `projectRootResolution` policy). Without the upstream, the root is `ctx.cwd`, and a banner tells you the file may not be picked up.
+- If no `.pi` exists anywhere above `cwd`, the root falls back to the git root: project settings go to `<git root>/.pi/settings.json`, and the save says so when it creates that file.
 
 ## License
 

@@ -760,7 +760,9 @@ describe("项目根解析：`.pi` → git 根 → cwd", () => {
 			const r = resolveProjectRoot(path.join(t.base, "container/repo"), undefined);
 			expect(r.root).toBe(path.join(t.base, "container/repo"));
 			expect(r.tier).toBe("git");
-			expect(r.warning).toContain("git root");
+			// 落到 git 根**不再**在打开时提示（每次执行命令都会重算 ⇒ 同一条会刷出好几遍）；
+			// 改由保存侧在首次创建项目 settings 时 warn 一次。
+			expect(r.warning).toBeUndefined();
 		} finally {
 			t.cleanup();
 		}
@@ -1007,6 +1009,25 @@ describe("writeProjectSettings（顶层三键 + 其余键语义保留，§16.2.5
 		writeProjectSettingsFile({ defaultModel: "m" });
 		writeProjectAgentOverrides(projectRoot, { reviewer: { model: "p/m" } });
 		expect(readProjectSettings().defaultModel).toBe("m");
+	});
+
+	it("created：目标文件此前不存在 ⇒ true（保存侧据此提示一次）", () => {
+		const result = writeProjectSettings(projectRoot, { overrides: { reviewer: { model: "p/m" } } });
+		expect(result.created).toBe(true);
+		expect(fs.existsSync(projectPath)).toBe(true);
+	});
+
+	it("created：文件已存在 ⇒ false（第二次保存不再提示）", () => {
+		writeProjectSettingsFile({ theme: "dark" });
+		const result = writeProjectSettings(projectRoot, { overrides: { reviewer: { model: "p/m" } } });
+		expect(result.created).toBe(false);
+	});
+
+	it("created：等值内容早退（什么都没写）⇒ false", () => {
+		writeProjectSettingsFile({ subagents: { agentOverrides: { reviewer: { model: "p/m" } } } });
+		const result = writeProjectSettings(projectRoot, { overrides: { reviewer: { model: "p/m" } } });
+		expect(result.changedKeys).toEqual([]);
+		expect(result.created).toBe(false);
 	});
 
 	it("settings.json 语法错误 ⇒ 抛 SettingsWriteError，不写盘", () => {

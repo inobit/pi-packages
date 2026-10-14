@@ -86,7 +86,7 @@ export type ProjectRootTier = "pi" | "git" | "cwd";
 export interface ProjectRootResolution {
 	root: string;
 	tier: ProjectRootTier;
-	/** 上游探测自身抛错时的说明（已回落 ctx.cwd，绝不硬失败）。 */
+	/** 需要立刻知道的解析说明（目前只有上游显式 opt-in 到 git 根那一条，进黄条）。 */
 	warning?: string;
 }
 
@@ -101,6 +101,10 @@ export interface ProjectRootResolution {
  *
  * 收敛性：写盘会在选中的根创建 `<CONFIG_DIR_NAME>/`，该目录随即成为上游的最近候选，
  * 所以**第一次保存之后两边一致**（差异只存在于“还没有配置文件”的那一刻）。
+ *
+ * 落到 git 根/cwd **不在这里产提示**（见下），改由保存侧在**真的创建了项目
+ * settings 文件**时 warn 一次：本函数每次装配会话都会被重算，而 pi 的 warning 是往
+ * 聊天区追加的常驻行，在打开时提示会把同一条刷出好几遍。
  */
 export function resolveProjectRoot(
 	cwd: string,
@@ -116,13 +120,9 @@ export function resolveProjectRoot(
 		return { root: gitRoot, tier: "git", warning: `${nearestPi}/.pi requests projectRootResolution: "git-root"` };
 	}
 	if (nearestPi) return { root: nearestPi, tier: "pi" };
-	if (gitRoot) {
-		return {
-			root: gitRoot,
-			tier: "git",
-			warning: `No ${configDir} found above cwd; using the git root ${gitRoot}. A ${configDir}/settings.json will be created there.`,
-		};
-	}
+	// git 根档：**不产 warning**。提示移到保存侧（`commitSave` + `writeProjectSettings.created`）：
+	// 文件已存在 ⇒ 无需提示；本次真的创建了它 ⇒ warn 一次。
+	if (gitRoot) return { root: gitRoot, tier: "git" };
 	return { root: cwd, tier: "cwd" };
 }
 

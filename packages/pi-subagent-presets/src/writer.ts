@@ -438,6 +438,13 @@ export interface WriteProjectResult {
 	file: string;
 	changedKeys: string[];
 	deletedKeys: string[];
+	/**
+	 * 目标 settings 文件**此前不存在**，本次写盘才创建它。
+	 *
+	 * 唯一用途：保存侧据此提示一次「往上没有 `.pi`，项目配置就落在 git 根」——
+	 * 文件已在 ⇒ 不再提示（`context.ts` 里那条“每次打开都刷一遍”的 warning 已移除）。
+	 */
+	created: boolean;
 }
 
 /** `writeProjectSettings` 的输入：agent 条目 + 可选的顶层 main 三键。 */
@@ -460,6 +467,7 @@ export interface WriteProjectSettingsInput {
  */
 export function writeProjectSettings(projectRoot: string, input: WriteProjectSettingsInput): WriteProjectResult {
 	const file = getProjectSettingsPath(projectRoot);
+	const existed = fs.existsSync(file);
 	const { value: settings, error } = readSettingsObject(file);
 	if (error) throw new SettingsWriteError(error);
 
@@ -492,13 +500,14 @@ export function writeProjectSettings(projectRoot: string, input: WriteProjectSet
 		}
 	}
 	if (JSON.stringify(settings) === before) {
-		return { file, changedKeys: [], deletedKeys: [] };
+		return { file, changedKeys: [], deletedKeys: [], created: false };
 	}
 	writeJsonAtomic(file, settings);
 	return {
 		file,
 		changedKeys: ["subagents.agentOverrides", ...changedKeys],
 		deletedKeys: [...(Object.keys(input.overrides).length === 0 ? ["subagents.agentOverrides"] : []), ...deletedKeys],
+		created: !existed,
 	};
 }
 
@@ -613,4 +622,11 @@ export interface CommitResult {
 	wroteProject?: boolean;
 	/** profile 文件已导出（导出总是落盘，profile = 整张矩阵快照）。 */
 	wroteProfile?: boolean;
+	/**
+	 * 保存时才成立的提示（黄条，不阻止写入，也不进 `message` 摘要）。
+	 *
+	 * 目前只有一条：往上找不到 `.pi`、本次保存**创建了** git 根下的项目 settings。
+	 * 文件已在 ⇒ 空数组，不再提示（打开矩阵时不再报这条，见 `context.ts`）。
+	 */
+	saveWarnings?: string[];
 }

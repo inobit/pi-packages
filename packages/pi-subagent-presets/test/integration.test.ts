@@ -794,6 +794,50 @@ describe("会话装配 + 端到端保存", () => {
 		expect(profile.subagents.agentOverrides.worker).toEqual({ model: "p/m" });
 	});
 
+	it("项目根落在 git 根：只有**首次创建**项目 settings 时才提示一次，之后不再提示", () => {
+		// cwd = <tmp>/repo/packages/foo，往上只有 .git ⇒ tier "git"（此前没有任何 .pi）
+		const gitRoot = path.join(tmp, "repo");
+		fs.mkdirSync(path.join(gitRoot, ".git"), { recursive: true });
+
+		const s = sessionOf(l1());
+		expect(s.projectRoot.tier).toBe("git");
+		expect(s.projectRoot.root).toBe(gitRoot);
+		// 打开矩阵时**不再**产这条提示：buildSession 每次执行命令都会重算，
+		// 而 pi 的 warning 是往聊天区追加的常驻行 ⇒ 会在打开时被刷出好几遍。
+		expect(s.notices.some((n) => n.includes("found above cwd"))).toBe(false);
+
+		const worker = s.rows.find((r) => r.name === "worker")!;
+		worker.draft.touched.add("model");
+		worker.draft.model = "p/m1";
+		const first = commitSave(
+			s,
+			{ writeProject: true, writeProfile: false, profileName: "default" },
+			buildPlan(s, sessionViews(s)).plan,
+			[],
+			agentDir,
+			fakeModule(),
+		);
+		expect(first.ok).toBe(true);
+		expect(first.saveWarnings?.length).toBe(1);
+		expect(first.saveWarnings?.[0]).toContain("found above cwd");
+		expect(first.saveWarnings?.[0]).toContain(getProjectSettingsPath(gitRoot));
+
+		// 第二次保存：文件已在 ⇒ 没有提示，也不需要任何“已提示过”的状态
+		const again = s.rows.find((r) => r.name === "worker")!;
+		again.draft.touched.add("thinking");
+		again.draft.thinking = "high";
+		const second = commitSave(
+			s,
+			{ writeProject: true, writeProfile: false, profileName: "default" },
+			buildPlan(s, sessionViews(s)).plan,
+			[],
+			agentDir,
+			fakeModule(),
+		);
+		expect(second.ok).toBe(true);
+		expect(second.saveWarnings).toBeUndefined();
+	});
+
 	it("settings.json 语法错误 ⇒ 报错并给出路径，不写入", () => {
 		fs.mkdirSync(path.dirname(getProjectSettingsPath(projectRoot)), { recursive: true });
 		fs.writeFileSync(getProjectSettingsPath(projectRoot), "{ broken", "utf-8");

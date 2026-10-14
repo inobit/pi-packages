@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.2] - 2026-10-14
+
+### Fixed
+
+- the "no `.pi` above cwd, using the git root" hint is now a save-time warning, emitted only when the save creates `<git root>/.pi/settings.json` (previously it was announced every time the matrix opened, and pi keeps warning lines in the chat log, so the same message piled up)
+
 ## [0.2.1] - 2026-10-10
 
 ### Fixed

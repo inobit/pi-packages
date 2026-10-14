@@ -230,6 +230,7 @@ profile 位于 `~/.pi/agent/profiles/pi-subagents/<name>.json`，与官方工具
 - 用上游的 `/subagents-models <agent>` 复核 agent 结果；`main` 的改动请在这个项目里重新启动一次 pi 来验证
 - 项目配置目录名不硬编码：由 pi 的 `CONFIG_DIR_NAME` 解析（pi-subagents 也从自己的 `package.json` 解析同名）
 - 项目根在上游可用时跟随 pi-subagents 的 `findConfiguredProjectRoot`（含 `.agents` 目录候选、home 截断、`projectRootResolution` 策略）；上游不可用时用 `ctx.cwd`，并提示该文件可能不被上游读取
+- `cwd` 往上找不到任何 `.pi` 时，项目根回落到 git 根：项目配置写在 `<git 根>/.pi/settings.json`，保存创建该文件时提示一次
 
 ## 许可
 

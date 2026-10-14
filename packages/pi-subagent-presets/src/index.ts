@@ -18,7 +18,7 @@ import { CONFIG_DIR_NAME, DefaultPackageManager, getAgentDir, KeybindingsManager
 import { type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { buildCompletions } from "./completions.ts";
 import { loadConfig } from "./config.ts";
-import { applyConfigDirNameOverride, getProfilePath, getProjectSettingsPath } from "./context.ts";
+import { applyConfigDirNameOverride, getConfigDirName, getProfilePath, getProjectSettingsPath } from "./context.ts";
 import { runExternalEditorRound } from "./external-editor.ts";
 import { listModels, locateModel, refreshModels, type ModelRegistryLike, type ScopedModelLike } from "./models.ts";
 import { MAIN_ROW_NAME, mainAuthWarning, mainEntryForEditor } from "./main-row.ts";
@@ -606,6 +606,9 @@ function shouldWriteProject(session: SessionState, plan: RebuildPlan): boolean {
  *
  * 失败时**不**写后续目标（project 写失败就不写 profile），把错误交回调用方弹红条；
  * 成功时清缓存 + 重建会话状态（`resetAfterSave`），这是连续保存幂等的前提。
+ *
+ * 项目 settings **被创建**（此前文件不存在）且项目根是猜来的 git 根 ⇒ 往
+ * `saveWarnings` 放一条提示，由调用方弹黄条；文件已在 ⇒ 无提示。
  */
 export function commitSave(
 	session: SessionState,
@@ -620,6 +623,7 @@ export function commitSave(
 	views: readonly MatrixRowView[] = [],
 ): CommitResult {
 	const messages: string[] = [];
+	const saveWarnings: string[] = [];
 	const mainChanged = plan.main.changed || plan.main.removal;
 	const agentChanged = plan.changed.length > 0 || plan.removals.length > 0;
 	// main 无改动 ⇒ 传 `undefined`（顶层三键不动）；无条件传 `after` 会把三键全删
@@ -635,10 +639,17 @@ export function commitSave(
 		// 等值内容 `writeProjectSettings` 本身也会早退，这里先判一次是为了不必读文件、
 		// 也不会让保存提示指向一个没写过的路径。
 		try {
-			writeProjectSettings(session.projectRoot.root, { overrides: plan.overrides, ...(mainAfter !== undefined ? { main: mainAfter } : {}) });
+			const written = writeProjectSettings(session.projectRoot.root, { overrides: plan.overrides, ...(mainAfter !== undefined ? { main: mainAfter } : {}) });
 			wroteProject = true;
 			messages.push(`project: ${getProjectSettingsPath(session.projectRoot.root)}`);
 			if (mainChanged) messages.push("main: defaultProvider/defaultModel/defaultThinkingLevel (next pi start)");
+			// 往上没有 `.pi`（落到 git 根）且本次**创建**了项目 settings ⇒ 提示一次。
+			// 文件已在（第二次起）⇒ 不提示，所以不需要任何“已提示过”的状态标记。
+			if (written.created && session.projectRoot.tier === "git") {
+				saveWarnings.push(
+					`No ${getConfigDirName()} found above cwd; created ${written.file} at the git root — that file is now the project settings pi-subagents reads.`,
+				);
+			}
 		} catch (e) {
 			return { ok: false, message: e instanceof Error ? e.message : String(e) };
 		}
@@ -669,7 +680,7 @@ export function commitSave(
 	if (warnings.length > 0) messages.push(`${warnings.length} notice(s) shown before saving`);
 	if (agentChanged) messages.push("verify with /subagents-models <agent>");
 	if (mainChanged) messages.push("verify by starting pi again in this project");
-	return { ok: true, message: messages.join("; "), wroteProject, wroteProfile: result.writeProfile };
+	return { ok: true, message: messages.join("; "), wroteProject, wroteProfile: result.writeProfile, ...(saveWarnings.length > 0 ? { saveWarnings } : {}) };
 }
 
 /** 脏行必须重算：用户改草稿后列要按草稿值刷新（否则连按 shift+tab 看不到变化）。 */
@@ -828,6 +839,8 @@ async function runCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, from: 
 						matrix.currentViews(),
 					);
 					if (!outcome.ok) emit(pi, ctx, outcome.message, "error");
+					// 保存时才成立的提示（首次创建项目 settings）：成功才发，红条时不发
+					for (const warning of outcome.saveWarnings ?? []) emit(pi, ctx, warning, "warning");
 					return outcome;
 				},
 			},
