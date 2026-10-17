@@ -85,8 +85,10 @@ export interface DaemonRequest {
 	/** 请求身份证（req-<n>，会话 sockdir 内唯一）：abort 凭此认领 */
 	id: string;
 	files: string[];
-	attachMs: number;
-	diagMs: number;
+	/** 启动阶段总预算（等首个 initialized client；成功提前走，到点按文件裁决） */
+	startupMs: number;
+	/** 整批 pull 共享预算（Lua 侧串行逐文件扣） */
+	diagnosticMs: number;
 }
 
 /** 请求计数器（req/res 文件名后缀，进程内单调） */
@@ -318,8 +320,9 @@ export class DaemonManager {
 			PI_NVIM_SOCK_DIR: h.sockDir,
 			PI_NVIM_IDLE_MS: String(this.cfg.idleMs),
 			PI_NVIM_PARENT_POLL_MS: String(this.cfg.parentPollMs),
-			PI_NVIM_ATTACH_MS: String(this.cfg.timeouts.attachMs),
-			PI_NVIM_DIAG_MS: String(this.cfg.timeouts.diagMs),
+			PI_NVIM_STARTUP_MS: String(this.cfg.timeouts.startupMs),
+			PI_NVIM_DIAGNOSTIC_MS: String(this.cfg.timeouts.diagnosticMs),
+			PI_NVIM_PUSH_MIN_OBSERVE_MS: String(this.cfg.timeouts.pushObserveMs),
 			// 退出路径据此自删日志：不删则 sockdir 恒非空、rmdir 必失败（每次会话泄漏一个目录）
 			PI_NVIM_LOG: h.logPath,
 		};
@@ -410,8 +413,8 @@ export class DaemonManager {
 		const body: DaemonRequest = {
 			id: reqId,
 			files,
-			attachMs: this.cfg.timeouts.attachMs,
-			diagMs: this.cfg.timeouts.diagMs,
+			startupMs: this.cfg.timeouts.startupMs,
+			diagnosticMs: this.cfg.timeouts.diagnosticMs,
 		};
 		fs.writeFileSync(reqPath, JSON.stringify(body), "utf8");
 		unlinkIfExists(resPath);

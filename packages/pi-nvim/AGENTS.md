@@ -20,7 +20,7 @@
 - **中断必须一致**：用户中断之后，不能出现"模型以为没处理、磁盘却已改"的分裂
 - **资源跟着 session 生死**：daemon 不无限驻留；退出即整树回收（含 LSP server 子进程、socket 与临时目录），不留内存与硬盘污染
 - **运行时零第三方依赖**（本仓约定）：通信只用 nvim CLI＋结果文件，不引 npm RPC client
-- **批量优先**：对外串行（`executionMode: "sequential"`），对内同一 daemon 串行，别把并发做进桥接层
+- **批量优先**：对外串行（`executionMode: "sequential"`），同一 daemon 的请求串行；但**一次诊断内的多个 buffer 并发等待**（pull 请求一次性全部发出、回调驱动，push 观测并行），且 buffer 间互不影响——启动一个 server 只该让同批 buffer 更快进入下一段，而不是逐个排队
 
 ## 验证
 

@@ -164,7 +164,7 @@ describe("bridge.lua 请求登记时序（abort 认领前提）", () => {
 	// abort 靠已在册的 _current/_reqs[id] 认领，故 reg_request 必须早于 wait_attach：
 	// 晚登记则 attach 窗口内到达的 abort 被丢弃，随后被 reg_request 的 _aborted=false 抹掉，
 	// format 会在用户已中断后照常写盘（TS 侧却已回 partial，磁盘与模型认知相悖）。
-	// 该顺序 bug 无法靠冒烟稳定复现（需卡进默认 20s 的 attach 窗口按 esc），
+	// 该顺序 bug 无法靠冒烟稳定复现（需卡进启动窗口按 esc），
 	// 且不违反"daemon 真机行为不进单测"（只读源码断言，不跑 nvim），故用结构断言防回归。
 	const bridgeSrc = fs.readFileSync(BRIDGE_PATH, "utf8");
 
@@ -196,8 +196,67 @@ describe("bridge.lua 请求登记时序（abort 认领前提）", () => {
 		// 等待循环读每请求标记，且 id 由调用方传入
 		expect(bridgeSrc).toMatch(/local function aborted\(id\)/);
 		expect(bridgeSrc).toMatch(/wait_attach\(entries, budget_ms, method, req_id\)/);
-		expect(bridgeSrc).toMatch(/wait_diag_settled\(bufnrs, budget_ms, req_id\)/);
 		expect(bridgeSrc).toMatch(/aborted\(req_id\)/);
+	});
+});
+
+describe("bridge.lua pull 语义（查询代替猜测）", () => {
+	// diagnose 改走 textDocument/diagnostic 请求-响应：响应（或请求超时）即终点，
+	// 不再靠“静默秒数”猜 push 是否到齐。慢 analyzer（gopls slicescontains 冷时 5~7s
+	// 才 publish）在 settle 语义下必漏（冻结版设计）。以下断言钉死该语义不回退。
+	const bridgeSrc = fs.readFileSync(BRIDGE_PATH, "utf8");
+
+	it("edit 前先查存在性（不存在的文件不得被建成空 buffer 出假诊断）", () => {
+		expect(bridgeSrc).toContain("filereadable");
+		expect(bridgeSrc).toContain("file not found or not readable");
+	});
+	it("pull 请求经能力门控异步发出（buffer 间并行等待）", () => {
+		expect(bridgeSrc).toContain("textDocument/diagnostic");
+		expect(bridgeSrc).toContain('supports_method("textDocument/diagnostic")');
+		expect(bridgeSrc).toContain("plan_entry");
+		expect(bridgeSrc).toContain("issue_pull");
+		expect(bridgeSrc, "旧串行汇总必须删除").not.toContain("pull_entry_diags");
+	});
+	it("settle 全套已删（不许回退到猜测）", () => {
+		for (const dead of [
+			"wait_diag_settled",
+			"diag_counts",
+			"counts_equal",
+			"MIN_SETTLE_MS",
+			"QUIET_MS",
+			"snapshot_clients",
+			"collect_diags",
+		]) {
+			expect(bridgeSrc, `${dead} 必须删除`).not.toContain(dead);
+		}
+		expect(bridgeSrc, "recognize 识别器必须删除").not.toMatch(/local function recognize\(/);
+	});
+	it("请求体用 startupMs/diagnosticMs（旧 attachMs/diagMs 字段不得再读）", () => {
+		expect(bridgeSrc).toContain("req.startupMs");
+		expect(bridgeSrc).toContain("req.diagnosticMs");
+		expect(bridgeSrc, "旧请求字段必须删除").not.toContain("req.attachMs");
+		expect(bridgeSrc, "旧请求字段必须删除").not.toContain("req.diagMs");
+	});
+	it("非正常状态与失败原因成形（status 三值＋客户端点名）", () => {
+		expect(bridgeSrc).toContain("status = \"failed\"");
+		expect(bridgeSrc).toContain("status = \"success\"");
+		expect(bridgeSrc).toContain('"skipped"');
+		expect(bridgeSrc).toContain("diagnostics timed out");
+		expect(bridgeSrc).toContain("initialization timed out");
+		for (const dead of ["unsupportedClients", "timeoutClients", "pullErrors", "push_collect", "batch_push_wait"]) {
+			expect(bridgeSrc, `${dead} 必须删除`).not.toContain(dead);
+		}
+	});
+	it("push 数据来自发布记录的诊断快照（wipe 后仍有效，无需反查 namespace）", () => {
+		expect(bridgeSrc).toContain("PiNvim._publishes");
+		expect(bridgeSrc).toContain("map_lsp_diags");
+		expect(bridgeSrc, "旧的三级 namespace 反查已删").not.toContain("diag_client_name");
+	});
+	it("push 观测与 pull 共用单一等待循环", () => {
+		expect(bridgeSrc).toContain("wait_diagnostics");
+		expect(bridgeSrc).toContain("PUSH_QUIET");
+		expect(bridgeSrc).toContain("PUSH_MIN_OBSERVE_MS");
+		expect(bridgeSrc).toContain("merge_dedupe");
 	});
 });
 

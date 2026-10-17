@@ -1,7 +1,8 @@
 -- @inobit/pi-nvim — 常驻 daemon 内桥接（lua/bridge.lua，方案 §五）。
 --
 -- 双入口（经 --remote-send 按键式 `:lua PiNvim.<fn>('<req>','<res>')` 调用）：
--- - `PiNvim.diagnose(req, res)`：只读诊断，绝不写盘。
+-- - `PiNvim.diagnose(req, res)`：只读诊断（pull 查询语义：逐 client 发
+--   `textDocument/diagnostic` 请求，响应即终点；无 pull 能力的 client 进 push 回退），绝不写盘。
 -- - `PiNvim.format(req, res)`：逐文件模拟用户按 `:w`（普通 `:w`，用户 autocmd 即
 --   formatter 管道；桥接不显式调 buf.format、不用 noautocmd、不选边）。
 -- 两定时器（异常兜底，常规管理靠 pi 侧事件）：
@@ -9,7 +10,7 @@
 --   （剩裸 nvim，~30MB；下次调用秒级重建）。
 -- - 父探测：parentPollMs 轮询 vim.uv.os_getppid() 存活，死则停＋wipe＋删 socket 目录＋`:qa!`。
 --
--- 请求文件：{files=[...], attachMs, diagMs, formatMs}；结果文件：{per_file=[...], total_ms}。
+-- 请求文件：{files=[...], startupMs, diagnosticMs}；结果文件：{per_file=[...], total_ms}。
 
 local PiNvim = {}
 
@@ -23,6 +24,171 @@ PiNvim._busy = false
 -- 正在用的同名 buffer 删掉（句柄相同），新请求 collect 失败记成 bridge error。
 PiNvim._reqs = {}
 PiNvim._last_req_ms = vim.uv.now()
+
+-- daemon 常驻 progress 记录（LspProgress 无轮询接口，只能事件常驻记录）。
+-- push“还在干活”证据的唯一来源：超时不再是“等了半天没等到”，而是“抓到未结束的
+-- progress”。PiNvim._progress[key] = {client_id=, began_at=, ended_at=}（ended 的懒 GC）。
+-- 古董 nvim 无 LspProgress 事件时此处 pcall 吞掉：busy 证据恒空，静默一律判干净（降级，注释钉死）。
+PiNvim._progress = {}
+
+local function progress_key(client_id, token)
+  return tostring(client_id) .. "\0" .. tostring(token)
+end
+
+local function setup_progress_watch()
+  local ok, grp = pcall(vim.api.nvim_create_augroup, "PiNvimProgress", { clear = true })
+  if not ok then
+    return
+  end
+  pcall(vim.api.nvim_create_autocmd, "LspProgress", {
+    group = grp,
+    callback = function(ev)
+      local data = ev.data or {}
+      local params = data.params or {}
+      local value = params.value or {}
+      local key = progress_key(data.client_id, params.token)
+      local now = vim.uv.now()
+      if value.kind == "begin" then
+        PiNvim._progress[key] = { client_id = data.client_id, began_at = now }
+      elseif value.kind == "end" then
+        local r = PiNvim._progress[key]
+        if r ~= nil then
+          r.ended_at = now
+        end
+      end
+      -- report：只关心开合，不管进度条
+      -- 懒 GC：条目超 500 删 ended 超 5min 的；还超则全清（progress 只是短暂证据）
+      local n = 0
+      for _ in pairs(PiNvim._progress) do
+        n = n + 1
+      end
+      if n > 500 then
+        for k, r in pairs(PiNvim._progress) do
+          if r.ended_at ~= nil and now - r.ended_at > 300000 then
+            PiNvim._progress[k] = nil
+          end
+        end
+      end
+    end,
+  })
+end
+
+-- pull 查询语义（替代已删的批级 settle）：push 是“等一个永远不说发完了的通知”，
+-- 只能靠静默秒数猜，慢 analyzer（如 gopls slicescontains，冷时 5~7s 才 publish）必漏；
+-- pull 是请求-响应，响应（或请求超时）即终点，不猜——等的不是猜测，是 server 的现场计算。
+local function sort_diags(out)
+  table.sort(out, function(a, b)
+    if a.severity ~= b.severity then
+      return a.severity < b.severity
+    end
+    if a.line ~= b.line then
+      return a.line < b.line
+    end
+    return a.col < b.col
+  end)
+  return out
+end
+
+-- buffer 内容哈希（发布时记，缓存命中判定用）：内容未变 ⇒ 该次发布的诊断仍对应当前内容
+local function buf_content_hash(bufnr)
+  local ok, lines = pcall(vim.api.nvim_buf_get_lines, bufnr, 0, -1, false)
+  if not ok then
+    return nil
+  end
+  return vim.fn.sha256(table.concat(lines, "\n"))
+end
+
+-- LSP 诊断 → 结果 shape（pull items 与 publish diagnostics 同形，client 由调用方给出）
+local function map_lsp_diags(items, client_name)
+  local out = {}
+  for _, d in ipairs(items or {}) do
+    local st = (d.range and d.range.start) or {}
+    table.insert(out, {
+      line = (st.line or 0) + 1,
+      col = (st.character or 0) + 1,
+      severity = (d.severity == 1 or d.severity == 2 or d.severity == 3) and d.severity or 4,
+      source = d.source or "lsp",
+      message = d.message or "",
+      client = client_name,
+    })
+  end
+  return sort_diags(out)
+end
+
+-- publishDiagnostics 观测表（PiNvim._publishes[key] = {at=, hash=, name=, diags=}）＋常驻包装。
+-- push 的唯一精确信号源：**空发布也可见**（干净文件 server 也会推空列表，
+-- 这是“真 clean”的证据，而计数法看不见）。包装后仍调原 handler（nvim 行为不变；
+-- 原 handler 可能来自用户配置）。handler 缺失（古董 nvim）时降级：push 信号全空。
+PiNvim._publishes = {}
+
+local function setup_publish_watch()
+  local handlers = vim.lsp.handlers
+  if type(handlers) ~= "table" then
+    return
+  end
+  local orig = handlers["textDocument/publishDiagnostics"]
+  handlers["textDocument/publishDiagnostics"] = function(err, result, ctx, config)
+    if result ~= nil and result.uri ~= nil and ctx ~= nil and ctx.client_id ~= nil then
+      local name = nil
+      local c = vim.lsp.get_client_by_id(ctx.client_id)
+      if c ~= nil then
+        name = c.name
+      end
+      local hash = nil
+      local okb, b = pcall(vim.uri_to_bufnr, result.uri)
+      if okb and b ~= nil and vim.api.nvim_buf_is_valid(b) then
+        hash = buf_content_hash(b)
+      end
+      PiNvim._publishes[tostring(ctx.client_id) .. "\0" .. result.uri] = {
+        at = vim.uv.now(),
+        hash = hash,
+        name = name,
+        diags = map_lsp_diags(result.diagnostics, name),
+      }
+      -- 懒 GC：条目超 2000 删 10min 前的（只是最近真相的登记表）
+      local n = 0
+      for _ in pairs(PiNvim._publishes) do
+        n = n + 1
+      end
+      if n > 2000 then
+        local now = vim.uv.now()
+        for k, r in pairs(PiNvim._publishes) do
+          if now - r.at > 600000 then
+            PiNvim._publishes[k] = nil
+          end
+        end
+      end
+    end
+    if orig ~= nil then
+      return orig(err, result, ctx, config)
+    end
+    if vim.lsp.diagnostic ~= nil and vim.lsp.diagnostic.on_publish_diagnostics ~= nil then
+      return vim.lsp.diagnostic.on_publish_diagnostics(err, result, ctx, config)
+    end
+  end
+end
+
+-- 未结束且开始于 t0 之后（含 t0）的 progress 所属 client 名
+-- （限定在给定 buffers 的 clients 内；t0 取请求开始≈didOpen，server 在此之后开工才算数）。
+local function busy_push_clients(bufnrs, t0)
+  local ids = {}
+  for _, b in ipairs(bufnrs) do
+    if b ~= nil and vim.api.nvim_buf_is_valid(b) then
+      for _, c in ipairs(vim.lsp.get_clients({ bufnr = b })) do
+        ids[c.id] = c.name
+      end
+    end
+  end
+  local out = {}
+  local seen = {}
+  for _, r in pairs(PiNvim._progress) do
+    if r.ended_at == nil and r.began_at ~= nil and r.began_at >= t0 and ids[r.client_id] ~= nil and not seen[r.client_id] then
+      seen[r.client_id] = true
+      table.insert(out, ids[r.client_id])
+    end
+  end
+  return out
+end
 
 -- env 读取归一：`getenv` 未设置时返回 vim.NIL（userdata），`or fallback` 捕不到，
 -- 直接参与拼接会报"attempt to concatenate a userdata value"、传给 tonumber 亦不稳。
@@ -45,15 +211,13 @@ end
 local SOCK_DIR = env_str("PI_NVIM_SOCK_DIR", "")
 local IDLE_MS = env_num("PI_NVIM_IDLE_MS", 300000)
 local PARENT_POLL_MS = env_num("PI_NVIM_PARENT_POLL_MS", 15000)
-local DEF_ATTACH_MS = env_num("PI_NVIM_ATTACH_MS", 20000)
-local DEF_DIAG_MS = env_num("PI_NVIM_DIAG_MS", 10000)
-local DEF_FORMAT_MS = env_num("PI_NVIM_FORMAT_MS", 20000)
-
--- 批级诊断落定参数（P0 校准依据：本地 headless 实测冷启动 edit→首诊断
--- ts ~2.5s（3 次：2475/2477/2505ms，attach 后 ~2.0s）、go ~0.6s、py ~0.3s；
--- ts 最慢，故最小时间线取 3s（覆盖 ts 冷启动＋余量），静默期 0.5s 防诊断分波到达）。
-local MIN_SETTLE_MS = tonumber(vim.fn.getenv("PI_NVIM_MIN_SETTLE_MS")) or 3000
-local QUIET_MS = 500
+-- 启动／pull 预算回退（请求体恒带 TS 配置值，此处仅防旧请求缺字段；旧 env 名认作别名）。
+local DEF_STARTUP_MS = env_num("PI_NVIM_STARTUP_MS", env_num("PI_NVIM_ATTACH_MS", 10000))
+local DEF_DIAGNOSTIC_MS = env_num("PI_NVIM_DIAGNOSTIC_MS", env_num("PI_NVIM_DIAG_MS", 20000))
+-- 冻结名单前迟到 client 宽限（startup 预算内扣；宽限后才到的下轮调用见）
+local LATE_ATTACH_GRACE_MS = 1000
+-- -32002 就绪竞态重试等待上界（单次，pull 预算内扣）
+local REINIT_WAIT_MS = 2000
 
 local function sock_path(name)
   return SOCK_DIR .. "/" .. name
@@ -152,18 +316,9 @@ local function quit_all()
   vim.cmd("qa!")
 end
 
--- 识别器：正常态只认“现至少一个已初始化 client”；快照有过人、现无人或未初始化
--- 即不可识别，走 raw 透传（原文＋note），永不记 clean、永不编造 reason。
-local function snapshot_clients(bufnr)
-  if bufnr == nil or not vim.api.nvim_buf_is_valid(bufnr) then
-    return nil
-  end
-  local out = {}
-  for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
-    table.insert(out, { id = c.id, name = c.name, initialized = c.initialized == true })
-  end
-  return out
-end
+-- 快照／识别器已删（pull 语义不再需要）：push 时代靠“attach 快照 vs 现状”识别 client
+-- 中途变化；pull 直接对 client 对象发请求，client 中途死亡表现为请求错误，按失败记账即可。
+-- `no_client` 只看冻结时有无 initialized client（零 client＝信息态，绝不判失败）。
 
 local function json_or_str(val)
   local ok, js = pcall(vim.fn.json_encode, val)
@@ -173,21 +328,23 @@ local function json_or_str(val)
   return tostring(val)
 end
 
-local function recognize(bufnr, snap)
-  local cur = snapshot_clients(bufnr) or {}
-  local live = 0
-  for _, c in ipairs(cur) do
+-- 本 buffer 已初始化 clients（LspAttach 在 initialize 握手完成后触发，故
+-- initialized 即“可发 pull”，无需再等别的；50ms 轮询只是把事件量化，无盲区）。
+local function initialized_clients(bufnr, method)
+  if bufnr == nil or not vim.api.nvim_buf_is_valid(bufnr) then
+    return {}
+  end
+  local opts = { bufnr = bufnr }
+  if method ~= nil then
+    opts.method = method
+  end
+  local out = {}
+  for _, c in ipairs(vim.lsp.get_clients(opts)) do
     if c.initialized then
-      live = live + 1
+      table.insert(out, c)
     end
   end
-  if live > 0 then
-    return "normal", cur
-  end
-  if snap ~= nil and #snap > 0 then
-    return "raw", cur
-  end
-  return "noclient", cur
+  return out
 end
 
 -- 请求登记：记 id＋其 buffers＋abort 标记（abort 时精确释放本单资源）。
@@ -240,139 +397,360 @@ local function abort_cleanup(id)
   unreg_request(id)
 end
 
--- 打开一批文件，返回 { buf = bufnr }（edit 失败记 error）
+-- 打开一批文件，返回 { buf = bufnr }（edit 失败记 error）。
+-- 存在性必须前置：`:edit` 对不存在的路径会新建空 buffer，LSP 会照常挂上并给空文件
+-- 出诊断（下游守卫虽已查，但守卫与 daemon 之间文件可能被删，此处兜底）。
 local function edit_batch(files)
   local out = {}
   for _, f in ipairs(files) do
-    local ok, err = pcall(vim.cmd.edit, vim.fn.fnameescape(f))
-    if not ok then
-      table.insert(out, { file = f, buf = nil, edit_error = tostring(err) })
+    if vim.fn.filereadable(f) ~= 1 then
+      table.insert(out, { file = f, buf = nil, edit_error = "file not found or not readable" })
     else
-      table.insert(out, { file = f, buf = vim.api.nvim_get_current_buf(), edit_error = nil })
+      local ok, err = pcall(vim.cmd.edit, vim.fn.fnameescape(f))
+      if not ok then
+        table.insert(out, { file = f, buf = nil, edit_error = tostring(err) })
+      else
+        table.insert(out, { file = f, buf = vim.api.nvim_get_current_buf(), edit_error = nil })
+      end
     end
   end
   return out
 end
 
--- 统一等各 root client attach（并发冷启动，批延迟＝最慢 root；有界超时即走）。
--- method 过滤：diagnose 等任意 client；format 等 formatting 能力 client——
--- formatter（none-ls/ruff 等）常比诊断 client 慢，若只等“任一 client”（如 ty）
--- 就放行，门控会把“还没 attach”误判成 no-formatter（冒烟复现），故按入口能力等。
+-- 统一等各 root client 就绪（并发冷启动，批延迟＝最慢 root；有界超时即走）。
+-- method 过滤：diagnose 传 nil（等任意 initialized client）；format 传
+-- "textDocument/formatting”（formatter 常比诊断 client 慢，若只等“任一 client”
+-- 就放行，门控会把“还没 attach”误判成 no-formatter，故按入口能力等）。
+-- 注意：只保证“名单内”完整——冻结后才就绪的 client 本轮不在快照里，下轮调用自然包含
+-- （名单外连“该有谁”都不可知，这是查询语义诚实的边界）。
 local function wait_attach(entries, budget_ms, method, req_id)
-  -- 阶段一：等任一 client 到达（保冷启动正确性；diagnose 到此即返）
   vim.wait(budget_ms, function()
     if PiNvim._shutdown or aborted(req_id) then
       return true
     end
     for _, e in ipairs(entries) do
       if e.buf ~= nil and vim.api.nvim_buf_is_valid(e.buf) then
-        if #vim.lsp.get_clients({ bufnr = e.buf }) == 0 then
+        if #initialized_clients(e.buf, method) == 0 then
           return false
         end
       end
     end
     return true
-  end)
-  if method == nil then
-    return
-  end
-  -- 阶段二：有 client 但无目标能力 client 的条目二次有界等待（慢 formatter 防误判
-  -- no-formatter；上界 min(budget,5s），无 formatter 文件不再付满整档预算）
-  vim.wait(math.min(budget_ms, 5000), function()
-    if PiNvim._shutdown or aborted(req_id) then
-      return true
-    end
-    for _, e in ipairs(entries) do
-      if e.buf ~= nil and vim.api.nvim_buf_is_valid(e.buf) then
-        if #vim.lsp.get_clients({ bufnr = e.buf }) > 0
-          and #vim.lsp.get_clients({ bufnr = e.buf, method = method }) == 0 then
-          return false
-        end
-      end
-    end
-    return true
-  end)
+  end, 50)
 end
 
-local function diag_counts(bufnrs)
-  local out = {}
-  for _, b in ipairs(bufnrs) do
-    if vim.api.nvim_buf_is_valid(b) then
-      out[b] = #vim.diagnostic.get(b)
-    else
-      out[b] = -1
-    end
+-- 纯格式化 client 识别（不当作诊断源）：只声明格式化类＋标准同步类能力者，
+-- 不会发诊断。实测 oxfmt caps={documentFormattingProvider, textDocumentSync, workspace}
+-- → 识别为纯格式化；lua_ls/gopls 等有 hover/completion 等一大票能力 → 不是。
+-- 意义：避免每批为纯格式化 client 白等满 push 预算（实测 TS 批 +20s）。
+-- 代价：若某纯格式化 server 真的 publish 诊断，会被忽略（极罕见，注释钉死此取舍）。
+local FORMAT_ONLY_OK_CAPS = {
+  documentFormattingProvider = true,
+  documentRangeFormattingProvider = true,
+  documentOnTypeFormattingProvider = true,
+  textDocumentSync = true,
+  workspace = true,
+  experimental = true,
+  positionEncoding = true,
+}
+local function is_formatter_only(c)
+  local caps = c.server_capabilities or {}
+  if caps.documentFormattingProvider == nil and caps.documentRangeFormattingProvider == nil then
+    return false
   end
-  return out
-end
-
-local function counts_equal(a, b)
-  for k, v in pairs(a) do
-    if b[k] ~= v then
+  for k, v in pairs(caps) do
+    if v ~= nil and v ~= false and not FORMAT_ONLY_OK_CAPS[k] then
       return false
     end
   end
   return true
 end
 
--- 批级诊断落定（push/pull 兼容）：attach 全齐后，对整批 buffer 只做一次等待。
--- 语义：有新诊断到达即续（last_change 重置）；无新诊断持续 QUIET_MS 且已过
--- 最小时间线 MIN_SETTLE_MS 才收；硬上界 budget（diagMs，per-request 覆盖保留）。
--- 背景（P0）：旧逻辑“计数连续两次采样不变即返”把“还没开始（暂 0）”当成“真干净”——
--- ts 冷启动 attach 后 ~2s 才出首诊断，首调必 miss。全零真干净文件多付
--- MIN_SETTLE_MS＋QUIET_MS（~3.5s），不付满 budget；慢诊断按到达即续，最坏延迟有界。
--- 注意：diagMs 若小于 MIN_SETTLE_MS，最小线永不到，按 budget 到期返回（budget 恒为上界）。
-local function wait_diag_settled(bufnrs, budget_ms, req_id)
-  if #bufnrs == 0 then
+-- pull 快照与 push 存量合并（精确去重；两边是同一份 server 数据的两种看法）
+local function merge_dedupe(dst, src)
+  for _, d in ipairs(src) do
+    local dup = false
+    for _, e in ipairs(dst) do
+      if e.line == d.line and e.col == d.col and e.severity == d.severity and e.source == d.source and e.message == d.message and e.client == d.client then
+        dup = true
+        break
+      end
+    end
+    if not dup then
+      table.insert(dst, d)
+    end
+  end
+  sort_diags(dst)
+end
+
+-- push 回退静默收敛期（尽力而为的启发值，非确定性保证，见 wait_diagnostics）
+local PUSH_QUIET = 1500
+-- 最小观测窗（毫秒）：实测 gopls 先推空（~1.5s）后出 analyzer 波（~7.3s），
+-- 首推即收会把真波漏掉（与 push 无终点标记同一根因）。故即使已满足，也至少观测
+-- 这么久；有未结束 progress（busy）则继续延长到预算上限。env 可调（调小＝变快但可能漏）。
+local PUSH_MIN_OBSERVE_MS = env_num("PI_NVIM_PUSH_MIN_OBSERVE_MS", 15000)
+
+-- 目标单位是 buffer（不管后台 server 怎么起、怎么 attach）：两段节奏——
+-- 启动段（等每个 buffer 有可用 client，批级一次等待）与诊断段（每 buffer 的 pull 请求
+-- 与 push 观测并行，共用一份 diagnosticMs 总预算）。pull 一次性全部发出（回调写状态），
+-- buffer 间彼此独立：总延迟＝最慢那个，而不是逐个相加。
+local function plan_entry(entry)
+  entry.pull = {}
+  entry.push = { clients = {}, state = "pending" }
+  local clients = initialized_clients(entry.buf, nil)
+  if #clients == 0 then
+    local attached = vim.lsp.get_clients({ bufnr = entry.buf })
+    if #attached > 0 then
+      local names = {}
+      for _, c in ipairs(attached) do
+        table.insert(names, c.name)
+      end
+      entry.skip_fail = "(" .. table.concat(names, ", ") .. ") initialization timed out"
+    else
+      entry.skip_reason = "no LSP client"
+    end
     return
   end
-  local budget = budget_ms or DEF_DIAG_MS
-  local start = vim.uv.now()
-  local last = diag_counts(bufnrs)
-  local last_change = start
-  while true do
-    if PiNvim._shutdown or aborted(req_id) then
-      return
-    end
-    local now = vim.uv.now()
-    if now - start >= budget then
-      return
-    end
-    if now - start >= MIN_SETTLE_MS and now - last_change >= QUIET_MS then
-      return
-    end
-    vim.wait(100)
-    local cur = diag_counts(bufnrs)
-    if not counts_equal(cur, last) then
-      last = cur
-      last_change = vim.uv.now()
+  for _, c in ipairs(clients) do
+    if c:supports_method("textDocument/diagnostic") then
+      table.insert(entry.pull, { client = c, name = c.name, done = false })
+    elseif not is_formatter_only(c) then
+      table.insert(entry.push.clients, { id = c.id, name = c.name })
     end
   end
 end
 
--- vim.diagnostic → 结果 shape（诊断全量搬运，不含文件内容；severity 优先排序：
--- error→warning→info→hint 再按行列，阅读优先级，非截断服务——诊断本就不截断）
-local function collect_diags(bufnr)
-  local out = {}
-  for _, d in ipairs(vim.diagnostic.get(bufnr)) do
-    table.insert(out, {
-      line = (d.lnum or 0) + 1,
-      col = (d.col or 0) + 1,
-      severity = d.severity or 4,
-      source = d.source or "lsp",
-      message = d.message or "",
-    })
-  end
-  table.sort(out, function(a, b)
-    if a.severity ~= b.severity then
-      return a.severity < b.severity
+-- 异步发一个 pull（不阻塞）；回调写状态。client 中途死亡＝请求错误（按失败记账）。
+local function issue_pull(p, buf, uri)
+  p.done, p.ok, p.items, p.code, p.message = false, nil, nil, nil, nil
+  local ok_send, send_err = pcall(function()
+    local accepted = p.client:request("textDocument/diagnostic", { textDocument = { uri = uri } }, function(err, result)
+      if err ~= nil then
+        p.ok = false
+        p.code = type(err) == "table" and err.code or nil
+        p.message = type(err) == "table" and (err.message or vim.inspect(err)) or tostring(err)
+      else
+        p.ok = true
+        p.items = (result and result.kind ~= "unchanged" and result.items) or {}
+      end
+      p.done = true
+    end, buf)
+    if not accepted then
+      error("request not accepted (client stopped?)")
     end
-    if a.line ~= b.line then
-      return a.line < b.line
-    end
-    return a.col < b.col
   end)
-  return out
+  if not ok_send then
+    p.ok, p.done, p.message = false, true, tostring(send_err)
+  end
+end
+
+local function issue_all_pulls(entries)
+  for _, e in ipairs(entries) do
+    for _, p in ipairs(e.pull or {}) do
+      issue_pull(p, e.buf, e.uri)
+    end
+  end
+end
+
+-- -32002（ServerNotInitialized）是 attach 与 initialized 之间的就绪竞态：等 500ms 重试一次。
+local function sweep_pull_retries(entries, now)
+  for _, e in ipairs(entries) do
+    for _, p in ipairs(e.pull or {}) do
+      if p.done and not p.ok and p.code == -32002 and not p.retried then
+        p.retried = true
+        p.retry_at = now + 500
+      end
+      if p.retry_at ~= nil and now >= p.retry_at then
+        p.retry_at = nil
+        issue_pull(p, e.buf, e.uri)
+      end
+    end
+  end
+end
+
+local function pulls_settled(entries)
+  for _, e in ipairs(entries) do
+    for _, p in ipairs(e.pull or {}) do
+      if not p.done then
+        return false
+      end
+    end
+  end
+  return true
+end
+
+-- 诊断段单一等待循环：pull 回调与 push 观测并行，共用一份 diagnosticMs 总预算。
+-- 时间基点是**诊断段起点 t_diag**（startup 段结束时刻）——两段节奏各自计时，互不吃预算；
+-- t_req 只用于 busy 证据过滤（本请求以来仍未结束的 progress 才算“还在干活”）。
+-- 退出：pull 全部 settle 且 push 结论落定；或到总预算上限（未完成者按超时/弱干净裁决）。
+-- push 结论＝（全部满足＋静默＋过地板） 或 （从未发布＋过地板＋无 busy＝弱干净早收） 或 到上限。
+local function wait_diagnostics(entries, t_diag, t_req, budget_ms, req_id)
+  local deadline = t_diag + math.max(budget_ms, 1)
+  local bufnrs = {}
+  for _, e in ipairs(entries) do
+    if e.buf ~= nil then
+      table.insert(bufnrs, e.buf)
+    end
+  end
+  local last_activity = nil
+  local function scan_push(now_ts)
+    local activity = false
+    for _, e in ipairs(entries) do
+      local push = e.push
+      if push ~= nil and push.state == "pending" then
+        local cur_hash = nil
+        local all_settled = true
+        local any_fresh = false
+        for _, c in ipairs(push.clients) do
+          local rec = PiNvim._publishes[tostring(c.id) .. "\0" .. e.uri]
+          if rec == nil then
+            all_settled = false
+          elseif rec.at >= t_diag then
+            any_fresh = true
+          else
+            -- 旧发布：内容未变且已静默够久（≥地板）⇒ 该次发布即当前内容的最终结论
+            if cur_hash == nil then
+              cur_hash = buf_content_hash(e.buf)
+            end
+            if rec.hash == nil or cur_hash == nil or rec.hash ~= cur_hash or (now_ts - rec.at) < PUSH_MIN_OBSERVE_MS then
+              all_settled = false
+            end
+          end
+        end
+        if all_settled then
+          push.state = any_fresh and "fresh" or "cached"
+          if any_fresh then
+            activity = true
+          end
+        end
+      end
+    end
+    return activity
+  end
+  if scan_push(vim.uv.now()) then
+    last_activity = t_diag
+  end
+  while true do
+    local now = vim.uv.now()
+    if PiNvim._shutdown or aborted(req_id) then
+      return "aborted"
+    end
+    sweep_pull_retries(entries, now)
+    local need_push = false
+    local push_all = true
+    local any_fresh = false
+    for _, e in ipairs(entries) do
+      local push = e.push
+      if push ~= nil and #push.clients > 0 then
+        need_push = true
+        if push.state == "pending" then
+          push_all = false
+        elseif push.state == "fresh" then
+          any_fresh = true
+        end
+      end
+    end
+    local push_done = true
+    if need_push then
+      local elapsed = now - t_diag
+      local quiet = last_activity == nil or (now - last_activity) >= PUSH_QUIET
+      local floor_ok = (not any_fresh) or elapsed >= PUSH_MIN_OBSERVE_MS
+      if push_all and quiet and floor_ok then
+        -- 全部落定（新鲜发布需过地板防迟到波；缓存命中不吃地板——内容哈希已证同源）
+        push_done = true
+      elseif quiet and elapsed >= PUSH_MIN_OBSERVE_MS and #busy_push_clients(bufnrs, t_req) == 0 then
+        -- 无发布（或发布后长期静默）且无“还在干活”证据 → 早收（未落定者按弱干净裁决）
+        push_done = true
+      else
+        push_done = false
+      end
+    end
+    if pulls_settled(entries) and push_done then
+      return "ok"
+    end
+    if now >= deadline then
+      return "ok"
+    end
+    vim.wait(50)
+    if scan_push(vim.uv.now()) then
+      last_activity = vim.uv.now()
+    end
+  end
+end
+
+-- 组装一个文件的 entry：pull 结果＋push 裁决合并。
+-- status 三值：success（检查完成；diags 空＝干净）／failed（未完成，原因在 message）／
+-- skipped（未执行）。弱干净只写 note（details），不进 content。
+local function assemble_entry(e, t_req, t_diag)
+  local entry = { file = e.file, diags = {}, ms = vim.uv.now() - t_req }
+  if e.edit_error ~= nil then
+    entry.status, entry.message = "failed", e.edit_error
+    return entry
+  end
+  if e.buf == nil or not vim.api.nvim_buf_is_valid(e.buf) then
+    entry.status, entry.message = "failed", "buffer lost mid-request"
+    return entry
+  end
+  if e.skip_reason ~= nil then
+    entry.status, entry.message = "skipped", e.skip_reason
+    return entry
+  end
+  if e.skip_fail ~= nil then
+    entry.status, entry.message = "failed", e.skip_fail
+    return entry
+  end
+  local failures = {}
+  for _, p in ipairs(e.pull or {}) do
+    if p.ok then
+      for _, d in ipairs(map_lsp_diags(p.items, p.name)) do
+        table.insert(entry.diags, d)
+      end
+    elseif not p.done then
+      table.insert(failures, "(" .. p.name .. ") diagnostics timed out")
+    elseif p.code == -32002 then
+      table.insert(failures, "(" .. p.name .. ") server not initialized")
+    else
+      table.insert(failures, "(" .. p.name .. ") " .. (p.message ~= nil and p.message ~= "" and p.message or "unknown error"))
+    end
+  end
+  local weak_clean = false
+  local push = e.push
+  if push ~= nil and #push.clients > 0 then
+    local pending_names = {}
+    for _, c in ipairs(push.clients) do
+      local rec = PiNvim._publishes[tostring(c.id) .. "\0" .. e.uri]
+      if rec ~= nil and (push.state == "fresh" or push.state == "cached") and rec.name == c.name then
+        -- 数据直接来自发布记录（wipe 后仍有效；client 归属由记录自带）
+        merge_dedupe(entry.diags, rec.diags)
+      elseif rec ~= nil and rec.at >= t_req then
+        merge_dedupe(entry.diags, rec.diags)
+      else
+        table.insert(pending_names, c.name)
+      end
+    end
+    if #pending_names > 0 then
+      local busy = busy_push_clients({ e.buf }, t_req)
+      if #busy > 0 then
+        table.insert(failures, "(" .. table.concat(busy, ", ") .. ") diagnostics timed out")
+      elseif t_diag ~= nil and (vim.uv.now() - t_diag) >= PUSH_MIN_OBSERVE_MS then
+        -- 观测满地板且服务器闲着 → 弱干净（有经验的“无事”）；
+        -- 没观测满（预算配得比地板还短）→ 不能判干净，按超时失败（诚实性优先）
+        weak_clean = true
+      else
+        table.insert(failures, "(" .. table.concat(pending_names, ", ") .. ") diagnostics timed out")
+      end
+    end
+  end
+  sort_diags(entry.diags)
+  if #failures > 0 then
+    entry.status, entry.message = "failed", table.concat(failures, "; ")
+  else
+    entry.status = "success"
+    if weak_clean and #entry.diags == 0 then
+      entry.note = "best-effort clean: no push published, server idle"
+    end
+  end
+  return entry
 end
 
 local function buf_lines(bufnr)
@@ -493,68 +871,53 @@ function PiNvim.diagnose(req_path, res_path)
       return
     end
     local files = req.files or {}
-    local attach_ms = req.attachMs or DEF_ATTACH_MS
-    local diag_ms = req.diagMs or DEF_DIAG_MS
+    local startup_ms = req.startupMs or DEF_STARTUP_MS
+    local diagnostic_ms = req.diagnosticMs or DEF_DIAGNOSTIC_MS
     local entries = edit_batch(files)
     reg_request(req.id)
     reg_bufs(req.id, entries)
-    wait_attach(entries, attach_ms, nil, req.id)
-    for _, e in ipairs(entries) do
-      e.snap = snapshot_clients(e.buf)
+    -- 启动等待（成功提前走，到点按文件裁决；LspAttach 在握手完成后触发，
+    -- 故“有 initialized client”即“可发 pull”，无需再等别的）
+    wait_attach(entries, startup_ms, nil, req.id)
+    if aborted(req.id) then
+      abort_cleanup(req.id)
+      return
     end
-    -- 批级落定（push/pull 兼容）：冷启动 attach 后诊断异步到达，不等即大概率空结果；
-    -- 整批 buffer 只做一次 settle 等待（有新诊断到达即续，无新诊断持续 QUIET_MS 且过
-    -- 最小时间线 MIN_SETTLE_MS 才收），然后逐文件直接 collect（diagnose/format 同路径）。
-    local settle = {}
+    -- 冻结前宽限（startup 预算内扣）：捡启动慢一拍的 client；宽限后才到的下轮调用见
+    local grace = math.max(math.min(LATE_ATTACH_GRACE_MS, startup_ms - (vim.uv.now() - t0)), 0)
+    if grace > 0 then
+      vim.wait(grace, function()
+        return PiNvim._shutdown or aborted(req_id)
+      end, 50)
+    end
+    if aborted(req.id) then
+      abort_cleanup(req.id)
+      return
+    end
+    -- 计划（per-client 二选一：pull／push／纯格式化排除）＋一次性发出全部 pull（异步）
     for _, e in ipairs(entries) do
-      if e.buf ~= nil and vim.api.nvim_buf_is_valid(e.buf) then
-        table.insert(settle, e.buf)
+      if e.edit_error == nil and e.buf ~= nil and vim.api.nvim_buf_is_valid(e.buf) then
+        e.uri = vim.uri_from_bufnr(e.buf)
+        plan_entry(e)
       end
     end
-    wait_diag_settled(settle, diag_ms, req.id)
-    if aborted(req.id) then
+    issue_all_pulls(entries)
+    -- 诊断段单一等待（pull 并行＋push 观测，共用一份 diagnosticMs 总预算；自诊断段起点计时）
+    local t_diag = vim.uv.now()
+    if wait_diagnostics(entries, t_diag, t0, diagnostic_ms, req.id) == "aborted" then
       abort_cleanup(req.id)
       return
     end
     local per_file = {}
     local wipe = {}
     for _, e in ipairs(entries) do
-      local ok, out = pcall(function()
-        if e.edit_error ~= nil then
-          return { entry = { file = e.file, diags = {}, ms = 0, error = e.edit_error }, wipe = false }
-        end
-        local verdict = recognize(e.buf, e.snap)
-        if verdict == "raw" then
-          return {
-            entry = {
-              file = e.file,
-              raw = json_or_str({ at_attach = e.snap, note = "lsp client(s) changed mid-request" }),
-              note = "lsp client(s) changed mid-request",
-              diags = {},
-              ms = vim.uv.now() - t0,
-            },
-            wipe = false,
-          }
-        end
-        if verdict == "noclient" then
-          -- 无 client 文件记 diags:[]＋no_client:true，绝不写盘
-          return { entry = { file = e.file, diags = {}, ms = vim.uv.now() - t0, no_client = true }, wipe = true }
-        end
-        return { entry = { file = e.file, diags = collect_diags(e.buf), ms = vim.uv.now() - t0 }, wipe = true }
-      end)
+      local ok, entry = pcall(assemble_entry, e, t0, t_diag)
       if not ok then
-        table.insert(per_file, {
-          file = e.file,
-          raw = json_or_str({ lua_error = tostring(out) }),
-          note = "bridge error",
-          diags = {},
-          ms = 0,
-        })
-      else
-        table.insert(per_file, out.entry)
-        if out.wipe and e.buf ~= nil then
-          table.insert(wipe, e.buf)
-        end
+        entry = { file = e.file, status = "failed", message = "bridge error: " .. tostring(entry), diags = {}, ms = 0 }
+      end
+      table.insert(per_file, entry)
+      if e.buf ~= nil then
+        table.insert(wipe, e.buf)
       end
     end
     -- 批末只 wipe 本批 buffer，不停任何 client（server 留温整 session）
@@ -572,65 +935,92 @@ function PiNvim.format(req_path, res_path)
       return
     end
     local files = req.files or {}
-    local attach_ms = req.attachMs or DEF_ATTACH_MS
-    local diag_ms = req.diagMs or DEF_DIAG_MS
+    local startup_ms = req.startupMs or DEF_STARTUP_MS
+    local diagnostic_ms = req.diagnosticMs or DEF_DIAGNOSTIC_MS
     local entries = edit_batch(files)
     -- 登记必须早于 wait_attach（与 diagnose 对齐）：abort 认领靠 `_reqs[id]` 已在册。
-    -- 晚登记则 attach 窗口（默认 attachMs=20s，正是冷启动＋用户最可能按 esc 的时候）
-    -- 内到达的 abort 对不上被丢弃，format 会在用户已中断后照常写盘（TS 侧却已回
-    -- partial，磁盘与模型认知相悖）。
+    -- 晚登记则启动窗口内到达的 abort 被丢弃，format 会在用户已中断后照常写盘
+    -- （TS 侧却已回 partial，磁盘与模型认知相悖）。
     reg_request(req.id)
     reg_bufs(req.id, entries)
     -- 先全 edit 再统一等 attach（并发冷启动）；按 formatting 能力等，防误判 no-formatter
-    wait_attach(entries, attach_ms, "textDocument/formatting", req.id)
-    for _, e in ipairs(entries) do
-      e.snap = snapshot_clients(e.buf)
-    end
-    -- 先逐文件写盘（不管诊断），再整批只做一次 settle，最后逐文件直接 collect
-    -- （diagnose/format 同走批级落定路径；per-file settle 已删）
+    wait_attach(entries, startup_ms, "textDocument/formatting", req.id)
+    -- 先逐文件写盘（不管诊断），再逐文件 pull 写后诊断（查询语义，无需 settle）
     local pending = {}
-    local snap_by_file = {}
     for _, e in ipairs(entries) do
       if aborted(req.id) then
         break
       end
-      snap_by_file[e.file] = e.snap
       table.insert(pending, format_write(e))
     end
     if aborted(req.id) then
       abort_cleanup(req.id)
       return
     end
-    local settle = {}
+    -- 诊断段（format 只 pull，不赌 push）：逐文件计划＋一次性发出全部 pull，单循环等待
+    local plans = {}
+    local plan_of = {}
     for _, r in ipairs(pending) do
-      if r._buf ~= nil and vim.api.nvim_buf_is_valid(r._buf) then
-        table.insert(settle, r._buf)
+      if r.error == nil and r._buf ~= nil and vim.api.nvim_buf_is_valid(r._buf) then
+        local plan = { buf = r._buf, uri = vim.uri_from_bufnr(r._buf) }
+        plan_entry(plan)
+        plan_of[r] = plan
+        table.insert(plans, plan)
+        for _, pp in ipairs(plan.pull) do
+          issue_pull(pp, plan.buf, plan.uri)
+        end
       end
     end
-    wait_diag_settled(settle, diag_ms, req.id)
+    local deadline = t0 + math.max(diagnostic_ms, 1)
+    while true do
+      local now = vim.uv.now()
+      if PiNvim._shutdown or aborted(req.id) then
+        abort_cleanup(req.id)
+        return
+      end
+      sweep_pull_retries(plans, now)
+      if pulls_settled(plans) or now >= deadline then
+        break
+      end
+      vim.wait(50)
+    end
     local per_file = {}
     local wipe = {}
     for _, r in ipairs(pending) do
       local ok, err = pcall(function()
-        if r.error ~= nil then
-          return
-        end
-        if r._buf ~= nil and vim.api.nvim_buf_is_valid(r._buf) then
-          local verdict = recognize(r._buf, snap_by_file[r.file])
-          if verdict == "raw" then
-            r.raw = json_or_str({ at_attach = snap_by_file[r.file], note = "lsp client(s) changed mid-request" })
-            r.note = "lsp client(s) changed mid-request"
-            r.diags = r.diags or {}
-            r._raw = true
-            return
+        local plan = plan_of[r]
+        if plan ~= nil then
+          local fails = {}
+          for _, pp in ipairs(plan.pull) do
+            if pp.ok then
+              for _, d in ipairs(map_lsp_diags(pp.items, pp.name)) do
+                table.insert(r.diags, d)
+              end
+            elseif not pp.done then
+              table.insert(fails, "(" .. pp.name .. ") diagnostics timed out")
+            elseif pp.code == -32002 then
+              table.insert(fails, "(" .. pp.name .. ") server not initialized")
+            else
+              table.insert(fails, "(" .. pp.name .. ") " .. (pp.message ~= nil and pp.message ~= "" and pp.message or "unknown error"))
+            end
           end
-          r.diags = collect_diags(r._buf)
-          if verdict == "noclient" then
-            r.no_client = true
+          if #plan.push.clients > 0 then
+            local names = {}
+            for _, c in ipairs(plan.push.clients) do
+              table.insert(names, c.name)
+            end
+            table.insert(fails, "no pull support: " .. table.concat(names, ", "))
           end
-        else
-          r.diags = r.diags or {}
+          if plan.skip_reason ~= nil then
+            table.insert(fails, plan.skip_reason)
+          elseif plan.skip_fail ~= nil then
+            table.insert(fails, plan.skip_fail)
+          end
+          if #fails > 0 then
+            r.note = "post-write diagnostics incomplete (" .. table.concat(fails, "; ") .. ")"
+          end
         end
+        r.diags = r.diags or {}
       end)
       if not ok then
         r.raw = json_or_str({ lua_error = tostring(err) })
@@ -722,5 +1112,9 @@ end
 
 _G.PiNvim = PiNvim
 auto_setup()
+-- progress 常驻记录与 auto_setup 解耦：无 SOCK_DIR 的加载校验路径也装得上
+-- （pcall 内部兜底，古董 nvim 无声降级）；真正的 daemon 启动时 auto_setup 照常跑。
+setup_progress_watch()
+setup_publish_watch()
 
 return PiNvim

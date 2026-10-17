@@ -19,10 +19,16 @@ import path from "node:path";
 export interface NvimTimeouts {
 	/** spawn 后等 ready＋connect 就绪的上界 */
 	spawnMs: number;
-	/** 批内等各 root client attach 的上界 */
-	attachMs: number;
-	/** 诊断到达等待的上界 */
-	diagMs: number;
+	/** 启动阶段总预算：`:edit` → 首个 initialized client（LspAttach 在握手完成后触发，
+	 * 成功提前走；到点按文件裁决：零 client 记 no_client，有 attach 无 initialized 记启动超时） */
+	startupMs: number;
+	/** 诊断段总预算（pull 与 push 观测并行共用；到点未完成者按超时/弱干净裁决） */
+	diagnosticMs: number;
+	/** push-only 观测地板（毫秒）：即使已收到发布，也至少观测这么久才下结论——
+	 * 防“首推空波 → 迟到真波”（实测 gopls：空 1.5s／真波 7~20s，负载越重越晚；
+	 * push 没有任何完成信号，只能靠时间）。0＝显式关闭（更快但可能漏迟到波）；
+	 * pull 路径不吃它；钳制不得超过 diagnosticMs。 */
+	pushObserveMs: number;
 	/** 单文件 format（含写盘＋收诊断）的上界 */
 	/** 单次 daemon 请求（含 spawn sender＋轮询结果）的上界 */
 	requestMs: number;
@@ -76,8 +82,9 @@ export const DEFAULT_CONFIG: NvimConfig = {
 	sockDir: "",
 	timeouts: {
 		spawnMs: 30000,
-		attachMs: 20000,
-		diagMs: 10000,
+		startupMs: 10000,
+		diagnosticMs: 20000,
+		pushObserveMs: 15000,
 		requestMs: 60000,
 		pollMs: 50,
 	},
@@ -183,31 +190,32 @@ function asWhitelist(raw: unknown): NvimWhitelist {
 	};
 }
 
-/** 超时保底下界（毫秒）：落定等待不得压成 0，否则冷 server 首波诊断必漏检 */
+/** 超时保底下界（毫秒）：pull 请求预算不得压成 0，否则 server 的现场计算直接被掐断 */
 const MIN_TIMEOUT_MS = 1000;
 
 /**
- * 钳制超时层级（纯函数，可单测）：闭合不变式 `attachMs + diagMs ≤ requestMs`。
+ * 钳制超时层级（纯函数，可单测）：闭合不变式 `startupMs + diagnosticMs ≤ requestMs`。
  *
- * 单次 daemon 请求内 attach 与 diag 串行相加，其和若超过 requestMs，则 requestMs 必先到点
- * → TS 侧判卡死抛 DaemonTimeoutError → killStuck 杀掉**健康** daemon 丢温。
+ * 两段节奏：启动段（等每个 buffer 有可用 client）＋诊断段（各 buffer 的 pull 请求与 push
+ * 观测**并行**，共用同一份 diagnosticMs 总预算）。两段串行相加，其和若超过 requestMs，
+ * 则 requestMs 必先到点 → TS 侧判卡死抛 DaemonTimeoutError → killStuck 杀掉**健康**
+ * daemon 丢温。
  *
- * 必须先钳 attachMs 再钳 diagMs 才闭合：只钳 diagMs 时，attachMs > requestMs-MIN_TIMEOUT_MS
- * 会让 `Math.max(MIN_TIMEOUT_MS, requestMs-attachMs)` 落到保底值，和仍超 requestMs
- * （实测 requestMs=5000＋默认 attachMs=20000 → 21000 > 5000）。
+ * 必须先钳 startupMs 再钳 diagnosticMs 才闭合。diagnosticMs 恒保底 MIN_TIMEOUT_MS
+ * （含用户显式设更小值）：它是单次等待的硬上界，压到接近 0 会让 server 的现场
+ * 计算／首波 publish 必超时，等于静默关掉诊断。startupMs 不设保底——它只是
+ * attach 事件等待上界，设小仅退化为更快判 no_client。
  *
- * diagMs 恒保底 MIN_TIMEOUT_MS（含用户显式设更小值）：它是诊断落定的硬上界，压到接近 0
- * 会让冷 server 首波诊断（attach 后 ~2.5s 才到）必漏检，等于静默关掉诊断。attachMs 不设
- * 保底——它只是 attach 等待上界，设小仅退化为不等 attach（noclient 判定照常兜底）。
- *
- * 注：requestMs < 2*MIN_TIMEOUT_MS 的病态配置无法同时满足不变式与保底，此时保底优先
- * （attach+diag 上界为 2*MIN_TIMEOUT_MS），故 requestMs 应设到 ≥2s。
+ * 注：requestMs < 2*MIN_TIMEOUT_MS 的病态配置无法同时满足不变式与保底，此时保底优先，
+ * 故 requestMs 应设到 ≥2s。
  */
 export function clampTimeoutHierarchy(timeouts: NvimTimeouts): NvimTimeouts {
 	const requestMs = timeouts.requestMs;
-	const attachMs = Math.min(timeouts.attachMs, Math.max(MIN_TIMEOUT_MS, requestMs - MIN_TIMEOUT_MS));
-	const diagMs = Math.max(MIN_TIMEOUT_MS, Math.min(timeouts.diagMs, requestMs, requestMs - attachMs));
-	return { ...timeouts, attachMs, diagMs };
+	const startupMs = Math.min(timeouts.startupMs, Math.max(MIN_TIMEOUT_MS, requestMs - MIN_TIMEOUT_MS));
+	const diagnosticMs = Math.max(MIN_TIMEOUT_MS, Math.min(timeouts.diagnosticMs, requestMs, requestMs - startupMs));
+	// 地板不得超诊断总预算（否则永远等满 budget 也到不了地板）
+	const pushObserveMs = Math.max(0, Math.min(timeouts.pushObserveMs, diagnosticMs));
+	return { ...timeouts, startupMs, diagnosticMs, pushObserveMs };
 }
 
 /**
@@ -232,10 +240,18 @@ export function normalizeConfig(raw: Record<string, unknown> | undefined): NvimC
 	const timeouts = raw["timeouts"];
 	if (timeouts && typeof timeouts === "object") {
 		const t = timeouts as Record<string, unknown>;
-		for (const key of ["spawnMs", "attachMs", "diagMs", "requestMs", "pollMs"] as const) {
+		for (const key of ["spawnMs", "requestMs", "pollMs"] as const) {
 			const n = asPositiveInt(t[key]);
 			if (n !== undefined) out.timeouts[key] = n;
 		}
+		// pushObserveMs 允许 0（显式关闭地板：更快但可能漏迟到波）
+		if (typeof t["pushObserveMs"] === "number" && Number.isInteger(t["pushObserveMs"]) && t["pushObserveMs"] >= 0) {
+			out.timeouts.pushObserveMs = t["pushObserveMs"];
+		}
+		const startupMs = pickTimeout(t, "startupMs", "attachMs");
+		if (startupMs !== undefined) out.timeouts.startupMs = startupMs;
+		const diagnosticMs = pickTimeout(t, "diagnosticMs", "diagMs");
+		if (diagnosticMs !== undefined) out.timeouts.diagnosticMs = diagnosticMs;
 	}
 	// 超时层级：attach+diag 之和不得超 requestMs（见 clampTimeoutHierarchy）
 	out.timeouts = clampTimeoutHierarchy(out.timeouts);
@@ -246,6 +262,11 @@ export function normalizeConfig(raw: Record<string, unknown> | undefined): NvimC
 	const errorCap = asPositiveInt(raw["errorCap"]);
 	if (errorCap !== undefined) out.errorCap = errorCap;
 	return out;
+}
+
+/** 超时主 key 缺席时认旧 key（0.1.x 的 attachMs/diagMs 别名，不断档；新 key 优先） */
+function pickTimeout(t: Record<string, unknown>, primary: string, legacy: string): number | undefined {
+	return asPositiveInt(t[primary]) ?? asPositiveInt(t[legacy]);
 }
 
 /** 包根目录：jiti 直载下 import.meta.url 不可用，用 CJS __dirname 手法（照 pi-reader 实测） */
@@ -331,10 +352,17 @@ export function normalizeConfigOverlay(raw: Record<string, unknown>): Partial<Nv
 	if (raw["timeouts"] && typeof raw["timeouts"] === "object") {
 		const t = raw["timeouts"] as Record<string, unknown>;
 		const timeouts: Partial<NvimTimeouts> = {};
-		for (const key of ["spawnMs", "attachMs", "diagMs", "requestMs", "pollMs"] as const) {
+		for (const key of ["spawnMs", "requestMs", "pollMs"] as const) {
 			const n = asPositiveInt(t[key]);
 			if (n !== undefined) timeouts[key] = n;
 		}
+		if (typeof t["pushObserveMs"] === "number" && Number.isInteger(t["pushObserveMs"]) && t["pushObserveMs"] >= 0) {
+			timeouts.pushObserveMs = t["pushObserveMs"];
+		}
+		const startupMs = pickTimeout(t, "startupMs", "attachMs");
+		if (startupMs !== undefined) timeouts.startupMs = startupMs;
+		const diagnosticMs = pickTimeout(t, "diagnosticMs", "diagMs");
+		if (diagnosticMs !== undefined) timeouts.diagnosticMs = diagnosticMs;
 		if (Object.keys(timeouts).length > 0) out.timeouts = timeouts as NvimTimeouts;
 	}
 	const idleMs = asPositiveInt(raw["idleMs"]);

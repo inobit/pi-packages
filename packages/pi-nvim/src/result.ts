@@ -16,27 +16,31 @@
  /** 诊断严重度（沿用 vim.diagnostic 1=Error 2=Warn 3=Info 4=Hint） */
 export type DiagSeverity = 1 | 2 | 3 | 4;
 
-/** 单条诊断（不含文件内容，只有位置＋消息） */
+/** 单条诊断（不含文件内容，只有位置＋消息）；client 为发出它的 lsp 名（pull 已知，
+ * push 按 namespace 回查；认不出时缺席，渲染回退为只有 source） */
 export interface NvimDiag {
 	line: number;
 	col: number;
 	severity: DiagSeverity;
 	source: string;
 	message: string;
+	client?: string;
 }
 
-/** diagnose 单文件结果；无 client 的文件记 diags:[]＋no_client:true；调用守卫短路记 error/skipped 行内表达 */
+/** diagnose 单文件结果（HTTP 信封：status 二值＋message 一句话；`diags` 只放真诊断，
+ * 失败时也可带已拿到的 partial——status 表动作 complete 与否，diags 表拿到了什么）。
+ * - success：检查完成；message 恒缺席；diags 为空即真干净（pull 空返回或 push 空发布）；
+ * - failed：检查没完成；message 必填（一句话，多 client 用 "; " 连接）；
+ * - skipped：未执行（白名单门卫／零 client）；message 为原因，diags 恒空。
+ * pi 框架的 execute 返回无 status 位（`AgentToolResult` 只有 content/details；
+ * 失败靠 throw），故 per-file 状态必须落在我们自己的 payload 里。 */
 export interface DiagnoseFileResult {
 	file: string;
+	status: "success" | "failed" | "skipped";
+	message?: string;
 	diags: NvimDiag[];
 	ms: number;
-	no_client?: boolean;
-	/** daemon 侧处理失败（edit 失败等）：渲染为 error 行，绝不静默记 clean */
-	error?: string;
-	/** 调用守卫白名单未命中：渲染为 skipped 行（非错误，不执行） */
-	skipped?: string;
-	/** 不可识别输出：原文透传（错误 cap 截断）＋note，永不记 clean、永不编造 reason */
-	raw?: string;
+	/** details-only 标记（weak-clean 等）；content 渲染忽略，不进模型行 */
 	note?: string;
 }
 
@@ -115,8 +119,14 @@ export function deriveFormatState(
 	return { formatted: before !== after, reason: before === after ? "unchanged" : "ok" };
 }
 
+/** 单行折叠：诊断 message 可能多行（如 oxlint 的 message＋help），一行一条不能用 \n */
+function oneLine(text: string): string {
+	return text.replaceAll(/\s*\n+\s*/g, " ").trim();
+}
+
 function formatDiagLine(file: string, d: NvimDiag): string {
-	return `${file}:${d.line}:${d.col} [${severityLabel(d.severity)}] (${d.source}) ${d.message}`;
+	const origin = d.client !== undefined && d.client !== "" ? `${d.client}: ${d.source}` : d.source;
+	return `${file}:${d.line}:${d.col} [${severityLabel(d.severity)}] (${origin}) ${oneLine(d.message)}`;
 }
 
 function countErrors(diags: NvimDiag[]): { errors: number; warns: number } {
@@ -135,58 +145,70 @@ export function degradedHeader(lines: string[]): string {
 }
 
 /**
- * nvim_lsp 模型侧文本：头行计数＋正常文件行内＋全量诊断行＋末尾 failed 节。
- * 例：`3 files, 2 errors, 1 warning`／`a.ts: 2 errors`／`a.ts: clean`。
- * 二分法：无需动作的行内（clean／诊断／skipped／no_client），需动作的打包
- * 进末尾 `failed (N)` 节（一文件一行＋原因）；error/raw 文走错误截断，
- * 诊断数组全量（结构化、可再生，不截断）。
+ * nvim_lsp 模型侧文本：只用 2 种格式（槽位镜像）＋门卫行。
+ * - 正常：`path: clean` ／ 明细 `path:L:C [sev] (client: source) msg`；
+ * - 非正常：`path: [failed] (client) reason`（client 槽可选；桥接层失败无括号；
+ *   message 空/缺兜底 `unknown error`）；`path: skipped (reason)`（白名单／零 client，未执行）。
+ * header 只写计数（不写目录）；行内恒用全路径。
+ * `clean`（行与头）只在全 success 且零诊断时出现；header 另计 failed/skipped 文件数。
  */
 export function renderLspContent(
-	files: Array<{ file: string; diags: NvimDiag[]; no_client?: boolean; error?: string; skipped?: string; raw?: string; note?: string }>,
+	files: Array<{
+		file: string;
+		status: "success" | "failed" | "skipped";
+		message?: string;
+		diags: NvimDiag[];
+		ms?: number;
+		note?: string;
+	}>,
 	errorCap: number = ERROR_TEXT_LIMIT,
 ): string {
 	let errors = 0;
 	let warns = 0;
+	let hints = 0;
+	let failed = 0;
+	let skipped = 0;
 	for (const f of files) {
+		if (f.status === "skipped") {
+			skipped++;
+			continue;
+		}
+		if (f.status === "failed") {
+			failed++;
+		}
 		const c = countErrors(f.diags);
 		errors += c.errors;
 		warns += c.warns;
-	}
-	const failed: Array<{ file: string; reason: string }> = [];
-	for (const f of files) {
-		if (f.error !== undefined) failed.push({ file: f.file, reason: truncateError(f.error, errorCap) });
-		else if (f.raw !== undefined)
-			failed.push({ file: f.file, reason: `unrecognized (${f.note ?? "unknown"}): ${truncateError(f.raw, errorCap)}` });
+		hints += f.diags.length - c.errors - c.warns;
 	}
 	const lines: string[] = [];
 	const headParts = [`${files.length} file${files.length === 1 ? "" : "s"}`];
 	if (errors > 0) headParts.push(`${errors} error${errors === 1 ? "" : "s"}`);
 	if (warns > 0) headParts.push(`${warns} warning${warns === 1 ? "" : "s"}`);
-	if (failed.length > 0) headParts.push(`${failed.length} failed`);
-	if (errors === 0 && warns === 0 && failed.length === 0) headParts.push("clean");
+	if (hints > 0) headParts.push(`${hints} hint${hints === 1 ? "" : "s"}/info`);
+	if (failed > 0) headParts.push(`${failed} failed`);
+	if (skipped > 0) headParts.push(`${skipped} skipped`);
+	if (errors === 0 && warns === 0 && hints === 0 && failed === 0 && skipped === 0) headParts.push("clean");
 	lines.push(headParts.join(", "));
 	for (const f of files) {
-		if (f.error !== undefined || f.raw !== undefined) continue;
-		if (f.skipped) {
-			lines.push(`${f.file}: skipped (${f.skipped})`);
+		const name = f.file;
+		if (f.status === "skipped") {
+			lines.push(`${name}: skipped (${f.message ?? "skipped"})`);
 			continue;
 		}
-		if (f.diags.length === 0) {
-			lines.push(f.no_client === true ? `${f.file}: clean (no LSP client)` : `${f.file}: clean`);
-			continue;
+		if (f.status === "failed") {
+			// 兜底：empty/缺 message 也必须有一行错误（绝不出现 `[failed] ` 裸尾巴）
+			const msg = f.message !== undefined && f.message.trim() !== "" ? f.message : "unknown error";
+			lines.push(`${name}: [failed] ${truncateError(msg, errorCap)}`);
 		}
-		const c = countErrors(f.diags);
-		const status: string[] = [];
-		if (c.errors > 0) status.push(`${c.errors} error${c.errors === 1 ? "" : "s"}`);
-		if (c.warns > 0) status.push(`${c.warns} warning${c.warns === 1 ? "" : "s"}`);
-		const rest = f.diags.length - c.errors - c.warns;
-		if (rest > 0) status.push(`${rest} hint${rest === 1 ? "" : "s"}/info`);
-		lines.push(`${f.file}: ${status.join(", ")}`);
-		for (const d of f.diags) lines.push(formatDiagLine(f.file, d));
-	}
-	if (failed.length > 0) {
-		lines.push(`failed (${failed.length}):`);
-		for (const item of failed) lines.push(`- ${item.file}: ${item.reason}`);
+		// success：clean 或明细行；failed 的 partial 诊断同样照跟（拿到的数据不丢）。
+		// success 的 message 恒缺席（HTTP 200 的 data 只有数据）；note（best-effort 标记）
+		// 只进 details，不进 content 行——content 保持 2 种格式的纯粹。
+		if (f.diags.length > 0) {
+			for (const d of f.diags) lines.push(formatDiagLine(name, d));
+		} else if (f.status === "success") {
+			lines.push(`${name}: clean`);
+		}
 	}
 	return lines.join("\n");
 }
@@ -226,6 +248,12 @@ export function renderFormatContent(files: FormatFileResult[], errorCap: number 
 	for (const f of files) {
 		for (const d of f.diags) lines.push(formatDiagLine(f.file, d));
 	}
+	// 写后诊断缺口注记（pull 不可用/超时时 Lua 记 note；details 同源，content 行内一行）
+	for (const f of files) {
+		if (f.note === undefined) continue;
+		if (f.error !== undefined || f.raw !== undefined || f.reason === "format-error" || f.reason === "write-error") continue;
+		lines.push(`${f.file}: ${truncateError(f.note, errorCap)}`);
+	}
 	if (failed.length > 0) {
 		lines.push(`failed (${failed.length}):`);
 		for (const item of failed) lines.push(`- ${item.file}: ${item.reason}`);
@@ -233,7 +261,8 @@ export function renderFormatContent(files: FormatFileResult[], errorCap: number 
 	return lines.join("\n");
 }
 
-/** daemon 原始 JSON（宽容解析：字段缺失回退空值，不抛错；error 文进 details 前走错误截断） */
+/** daemon 原始 JSON（宽容解析：status 非法回退 failed；message 走错误截断；
+ * 诊断数组全量，不截断） */
 export function parseDiagnosePayload(payload: unknown, cap: number = ERROR_TEXT_LIMIT): DiagnoseFileResult[] {
 	if (!payload || typeof payload !== "object") return [];
 	const perFile = (payload as { per_file?: unknown }).per_file;
@@ -254,15 +283,22 @@ export function parseDiagnosePayload(payload: unknown, cap: number = ERROR_TEXT_
 				severity: r["severity"] === 1 || r["severity"] === 2 || r["severity"] === 3 ? r["severity"] : 4,
 				source: typeof r["source"] === "string" ? r["source"] : "lsp",
 				message: typeof r["message"] === "string" ? r["message"] : "",
+				client: typeof r["client"] === "string" && r["client"] !== "" ? r["client"] : undefined,
 			});
 		}
+		const status = e["status"];
+		const goodStatus = status === "success" || status === "failed" || status === "skipped";
 		out.push({
 			file: e["file"],
+			status: goodStatus ? status : "failed",
+			message:
+			typeof e["message"] === "string"
+				? truncateError(e["message"], cap)
+				: goodStatus
+					? undefined
+					: "unrecognized file status",
 			diags,
 			ms: typeof e["ms"] === "number" ? e["ms"] : 0,
-			no_client: e["no_client"] === true ? true : undefined,
-			error: typeof e["error"] === "string" ? truncateError(e["error"] as string, cap) : undefined,
-			raw: typeof e["raw"] === "string" ? truncateError(e["raw"] as string, cap) : undefined,
 			note: typeof e["note"] === "string" ? e["note"] : undefined,
 		});
 	}

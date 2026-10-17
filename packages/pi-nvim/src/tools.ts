@@ -141,12 +141,12 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 			const localOf = (file: string): DiagnoseFileResult | undefined => {
 				const local = scope.locals.get(file);
 				if (!local) return undefined;
-				if (local.skipped) return { file, diags: [], ms: 0, skipped: local.skipped };
-				return { file, diags: [], ms: 0, error: local.error ?? "unreadable file" };
+				if (local.skipped) return { file, status: "skipped", message: local.skipped, diags: [], ms: 0 };
+				return { file, status: "failed", message: local.error ?? "unreadable file", diags: [], ms: 0 };
 			};
 			if (scope.daemonFiles.length === 0) {
 				// 全拦截：根本不 ensure()（daemon 零惊动，冷启动不变量）
-				const full = params.files.map((f) => localOf(f) ?? { file: f, diags: [], ms: 0 });
+				const full = params.files.map((f) => localOf(f) ?? { file: f, status: "failed" as const, message: "guard error", diags: [], ms: 0 });
 				return textResult(renderLspContent(full, deps.cfg.errorCap), {
 					kind: "nvim_lsp",
 					files: full,
@@ -163,8 +163,8 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 					await deps.daemon.killStuck(handles).catch(() => undefined);
 				}
 				if (err instanceof DaemonAbortedError) {
-					const failedNow = scope.daemonFiles.map((file) => ({ file, diags: [], ms: 0, error: "aborted before processing" }));
-					const full = params.files.map((f) => localOf(f) ?? failedNow.find((x) => x.file === f) ?? { file: f, diags: [], ms: 0 });
+					const failedNow = scope.daemonFiles.map((file) => ({ file, status: "failed" as const, message: "aborted before processing", diags: [], ms: 0 }));
+					const full = params.files.map((f) => localOf(f) ?? failedNow.find((x) => x.file === f) ?? { file: f, status: "failed" as const, message: "aborted before processing", diags: [], ms: 0 });
 					return textResult(withDegraded(renderLspContent(full, deps.cfg.errorCap), handles.degradedLines), {
 						kind: "nvim_lsp",
 						files: full,
@@ -175,9 +175,9 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 				throw err;
 			}
 			const parsed = parseDiagnosePayload(payload, deps.cfg.errorCap);
-			// 按请求原序合并：本地项（error/skipped）行内表达，daemon 未回的文件记空诊断（不虚构 no_client）
+			// 按请求原序合并：本地项行内表达，daemon 未回的文件记失败（不虚构干净）
 			const byFile = new Map(parsed.map((p) => [p.file, p]));
-			const full = params.files.map((f) => localOf(f) ?? byFile.get(f) ?? { file: f, diags: [], ms: 0 });
+			const full = params.files.map((f) => localOf(f) ?? byFile.get(f) ?? { file: f, status: "failed" as const, message: "no result from daemon", diags: [], ms: 0 });
 			return textResult(withDegraded(renderLspContent(full, deps.cfg.errorCap), handles.degradedLines), {
 				kind: "nvim_lsp",
 				files: full,
