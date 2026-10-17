@@ -7,6 +7,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+	appendRetryHint,
 	degradedHeader,
 	deriveFormatState,
 	ERROR_TEXT_LIMIT,
@@ -292,6 +293,35 @@ describe("renderFormatContent", () => {
 			{ file: "b.ts", formatted: false, reason: "ok", diags: [], ms: 1 },
 		]);
 		expect(text).toContain("b.ts: unchanged");
+	});
+});
+
+describe("appendRetryHint（超时失败给出可调大的旋钮）", () => {
+	const caps = { maxStartupMs: 120000, maxDiagnosticMs: 120000 };
+	it("诊断超时 → 建议 diagnosticMs（生效值×2）", () => {
+		expect(appendRetryHint("(gopls) diagnostics timed out", { startupMs: 10000, diagnosticMs: 20000 }, caps)).toBe(
+			"(gopls) diagnostics timed out (retry with diagnosticMs=40000)",
+		);
+	});
+	it("启动超时 → 建议 startupMs", () => {
+		expect(appendRetryHint("(gopls) initialization timed out", { startupMs: 10000, diagnosticMs: 20000 }, caps)).toBe(
+			"(gopls) initialization timed out (retry with startupMs=20000)",
+		);
+	});
+	it("建议值不低于地板（push 地板+5s），避免每次翻倍反复失败", () => {
+		expect(
+			appendRetryHint("(gopls) diagnostics timed out", { startupMs: 10000, diagnosticMs: 2000 }, { maxStartupMs: 120000, maxDiagnosticMs: 120000, diagnosticFloorMs: 20000 }),
+		).toContain("diagnosticMs=20000");
+	});
+	it("建议值不超硬顶", () => {
+		expect(appendRetryHint("(x) diagnostics timed out", { startupMs: 10000, diagnosticMs: 120000 }, caps)).toContain(
+			"diagnosticMs=120000",
+		);
+	});
+	it("非超时失败原样返回", () => {
+		expect(appendRetryHint("(tsc) server not initialized", { startupMs: 1, diagnosticMs: 1 }, caps)).toBe(
+			"(tsc) server not initialized",
+		);
 	});
 });
 

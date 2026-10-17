@@ -28,7 +28,11 @@ The model calls two tools (both `executionMode: "sequential"`):
 - `nvim_lsp({ files })` — read-only diagnostics over the given absolute paths. Never modifies files.
 - `nvim_format({ files })` — formats with your Neovim formatters, writes back, and returns remaining diagnostics. MODIFIES files on disk.
 
-Rules for the model (4 guidelines): nvim_lsp is read-only diagnostics; nvim_format writes back to disk; batch ALL files in ONE call; scope is allowlisted — out-of-scope files come back as per-file skipped.
+Per-call timeout overrides:
+
+Per-call timeouts: `nvim_lsp` accepts optional `startupMs` and `diagnosticMs`, `nvim_format` accepts `startupMs`; omitted → the config defaults above. Timeout failures name the knob and a suggested value (e.g. `retry with diagnosticMs=40000`), so a retry can simply pass the larger value — no config edit needed. Overrides are clamped to `maxRequestMs` (default 300s); the daemon request window grows to fit (`startup + diagnostic + 5s`), so a large ask never gets killed by the default 60s window. The bridge clamps the same fields again (120s each) as a defence against malformed requests.
+
+Rules for the model (5 guidelines): nvim_lsp is read-only diagnostics; nvim_format writes back to disk; batch ALL files in ONE call; scope is allowlisted — out-of-scope files come back as per-file skipped.
 
 Call guard: each `execute` pre-checks files (exists → is a file → readable text → per-tool whitelist) before touching the daemon. Missing/directory/unreadable/binary return per-file `error`; off-scope types (unknown included, fail-closed) return per-file `skipped` and are not executed. Fully intercepted batches never start the daemon. Set `whitelist.enabled: false` to disable only the whitelist gate (existence/readability pre-checks still apply).
 
@@ -39,7 +43,7 @@ Optional `config.json` (global `~/.pi/agent/extensions/pi-nvim/config.json`, or 
 ```json
 {
   "nvimPath": "nvim",
-  "timeouts": { "spawnMs": 30000, "startupMs": 10000, "diagnosticMs": 20000, "pushObserveMs": 15000, "requestMs": 60000, "pollMs": 50 },
+  "timeouts": { "spawnMs": 30000, "startupMs": 10000, "diagnosticMs": 20000, "pushObserveMs": 15000, "requestMs": 60000, "maxRequestMs": 300000, "pollMs": 50 },
   "idleMs": 300000,
   "parentPollMs": 15000,
   "errorCap": 2000,

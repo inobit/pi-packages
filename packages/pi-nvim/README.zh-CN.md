@@ -37,7 +37,7 @@ pi install npm:@inobit/pi-nvim
 ```json
 {
   "nvimPath": "nvim",
-  "timeouts": { "spawnMs": 30000, "startupMs": 10000, "diagnosticMs": 20000, "pushObserveMs": 15000, "requestMs": 60000, "pollMs": 50 },
+  "timeouts": { "spawnMs": 30000, "startupMs": 10000, "diagnosticMs": 20000, "pushObserveMs": 15000, "requestMs": 60000, "maxRequestMs": 300000, "pollMs": 50 },
   "idleMs": 300000,
   "parentPollMs": 15000,
   "errorCap": 2000,

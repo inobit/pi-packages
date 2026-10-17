@@ -214,6 +214,11 @@ local PARENT_POLL_MS = env_num("PI_NVIM_PARENT_POLL_MS", 15000)
 -- 启动／pull 预算回退（请求体恒带 TS 配置值，此处仅防旧请求缺字段；旧 env 名认作别名）。
 local DEF_STARTUP_MS = env_num("PI_NVIM_STARTUP_MS", env_num("PI_NVIM_ATTACH_MS", 10000))
 local DEF_DIAGNOSTIC_MS = env_num("PI_NVIM_DIAGNOSTIC_MS", env_num("PI_NVIM_DIAG_MS", 20000))
+-- 调用级时间硬顶（防畸形请求把 daemon 挂住）：TS 侧已按窗口联合钳制并放大过窗口，
+-- 此处只做兜底——各字段各自封顶，二者之和（240s）仍在硬顶窗口（默认 300s）内。
+local STARTUP_CAP_MS = 120000
+local DIAGNOSTIC_CAP_MS = 120000
+
 -- 冻结名单前迟到 client 宽限（startup 预算内扣；宽限后才到的下轮调用见）
 local LATE_ATTACH_GRACE_MS = 1000
 -- -32002 就绪竞态重试等待上界（单次，pull 预算内扣）
@@ -715,15 +720,19 @@ local function assemble_entry(e, t_req, t_diag)
   end
   local weak_clean = false
   local push = e.push
+  -- 观测是否够久（诊断段起点 t_diag 起算）：deadline 早于地板时，"新鲜发布"也不足为据
+  local observed_enough = t_diag == nil or (vim.uv.now() - t_diag) >= PUSH_MIN_OBSERVE_MS
   if push ~= nil and #push.clients > 0 then
     local pending_names = {}
     for _, c in ipairs(push.clients) do
       local rec = PiNvim._publishes[tostring(c.id) .. "\0" .. e.uri]
-      if rec ~= nil and (push.state == "fresh" or push.state == "cached") and rec.name == c.name then
+      if rec ~= nil and rec.name == c.name and ((push.state == "cached") or (push.state == "fresh" and observed_enough)) then
         -- 数据直接来自发布记录（wipe 后仍有效；client 归属由记录自带）
         merge_dedupe(entry.diags, rec.diags)
       elseif rec ~= nil and rec.at >= t_req then
+        -- 记录存在但观测不足（新鲜发布 + 预算比地板短）：数据照收（partial），但按未完成记账
         merge_dedupe(entry.diags, rec.diags)
+        table.insert(pending_names, c.name)
       else
         table.insert(pending_names, c.name)
       end
@@ -871,8 +880,8 @@ function PiNvim.diagnose(req_path, res_path)
       return
     end
     local files = req.files or {}
-    local startup_ms = req.startupMs or DEF_STARTUP_MS
-    local diagnostic_ms = req.diagnosticMs or DEF_DIAGNOSTIC_MS
+    local startup_ms = math.min(math.max(tonumber(req.startupMs) or DEF_STARTUP_MS, 0), STARTUP_CAP_MS)
+    local diagnostic_ms = math.min(math.max(tonumber(req.diagnosticMs) or DEF_DIAGNOSTIC_MS, 1000), DIAGNOSTIC_CAP_MS)
     local entries = edit_batch(files)
     reg_request(req.id)
     reg_bufs(req.id, entries)
@@ -935,8 +944,8 @@ function PiNvim.format(req_path, res_path)
       return
     end
     local files = req.files or {}
-    local startup_ms = req.startupMs or DEF_STARTUP_MS
-    local diagnostic_ms = req.diagnosticMs or DEF_DIAGNOSTIC_MS
+    local startup_ms = math.min(math.max(tonumber(req.startupMs) or DEF_STARTUP_MS, 0), STARTUP_CAP_MS)
+    local diagnostic_ms = math.min(math.max(tonumber(req.diagnosticMs) or DEF_DIAGNOSTIC_MS, 1000), DIAGNOSTIC_CAP_MS)
     local entries = edit_batch(files)
     -- 登记必须早于 wait_attach（与 diagnose 对齐）：abort 认领靠 `_reqs[id]` 已在册。
     -- 晚登记则启动窗口内到达的 abort 被丢弃，format 会在用户已中断后照常写盘

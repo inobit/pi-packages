@@ -30,8 +30,10 @@ export interface NvimTimeouts {
 	 * pull 路径不吃它；钳制不得超过 diagnosticMs。 */
 	pushObserveMs: number;
 	/** 单文件 format（含写盘＋收诊断）的上界 */
-	/** 单次 daemon 请求（含 spawn sender＋轮询结果）的上界 */
+	/** 单次 daemon 请求的**默认窗口**（不传调用级时间时的窗口；含 spawn sender＋轮询结果） */
 	requestMs: number;
+	/** 单次 daemon 请求的**硬顶窗口**：调用级时间可把窗口放大到此为止（防失控挂死） */
+	maxRequestMs: number;
 	/** 结果文件轮询间隔 */
 	pollMs: number;
 }
@@ -86,6 +88,7 @@ export const DEFAULT_CONFIG: NvimConfig = {
 		diagnosticMs: 20000,
 		pushObserveMs: 15000,
 		requestMs: 60000,
+		maxRequestMs: 300000,
 		pollMs: 50,
 	},
 	idleMs: 300000,
@@ -193,6 +196,63 @@ function asWhitelist(raw: unknown): NvimWhitelist {
 /** 超时保底下界（毫秒）：pull 请求预算不得压成 0，否则 server 的现场计算直接被掐断 */
 const MIN_TIMEOUT_MS = 1000;
 
+/** 调用级时间覆盖上限（硬顶，防失控）：启动／诊断各自最大 120s，
+ * 加 RESERVE 后仍装得进 maxRequestMs=300s 的硬顶窗口。 */
+export const MAX_STARTUP_MS = 120000;
+export const MAX_DIAGNOSTIC_MS = 120000;
+/** 请求窗口余量（spawn sender、写盘、轮询等开销） */
+export const REQUEST_RESERVE_MS = 5000;
+
+/** 调用级时间覆盖（工具参数，全部可选；不传即用配置默认） */
+export interface CallTimeouts {
+	startupMs?: number;
+	diagnosticMs?: number;
+}
+
+/** 一次调用实际生效的时间（含窗口与是否被钳） */
+export interface EffectiveTimeouts {
+	startupMs: number;
+	diagnosticMs: number;
+	/** 该次 daemon 请求的等待窗口 = clamp(startup+diagnostic+RESERVE, requestMs, maxRequestMs) */
+	windowMs: number;
+	/** 是否发生了钳制（请求值与生效值不同） */
+	clamped: boolean;
+	/** 调用方请求的原值（未钳制前；未传时为配置值） */
+	requestedStartupMs: number;
+	requestedDiagnosticMs: number;
+}
+
+function clampInt(v: number, lo: number, hi: number): number {
+	if (!Number.isFinite(v)) return lo;
+	return Math.min(hi, Math.max(lo, Math.floor(v)));
+}
+
+/**
+ * 解析一次调用的生效时间（纯函数，可单测）。不变式：
+ * `startupMs + diagnosticMs + RESERVE ≤ windowMs ≤ maxRequestMs`，
+ * 且 `startupMs ≤ MAX_STARTUP_MS`、`MIN ≤ diagnosticMs ≤ MAX_DIAGNOSTIC_MS`。
+ *
+ * 先各自钳到硬顶，再算窗口；若两段之和仍装不进窗口，**联合缩小**（先缩诊断到保底，
+ * 仍不够再缩启动）——绝不出现"照收下超大值、随后被 requestMs 杀掉"的情况。
+ * 窗口下限是配置的 requestMs（不传参时行为与旧版完全一致），上限是 maxRequestMs。
+ */
+export function resolveCallTimeouts(timeouts: NvimTimeouts, call: CallTimeouts = {}): EffectiveTimeouts {
+	const requestedStartupMs = call.startupMs ?? timeouts.startupMs;
+	const requestedDiagnosticMs = call.diagnosticMs ?? timeouts.diagnosticMs;
+	let startupMs = clampInt(requestedStartupMs, 0, MAX_STARTUP_MS);
+	let diagnosticMs = clampInt(requestedDiagnosticMs, MIN_TIMEOUT_MS, MAX_DIAGNOSTIC_MS);
+	const windowMs = clampInt(startupMs + diagnosticMs + REQUEST_RESERVE_MS, timeouts.requestMs, timeouts.maxRequestMs);
+	const room = Math.max(0, windowMs - REQUEST_RESERVE_MS);
+	if (startupMs + diagnosticMs > room) {
+		const over = startupMs + diagnosticMs - room;
+		const diagCut = Math.min(over, Math.max(0, diagnosticMs - MIN_TIMEOUT_MS));
+		diagnosticMs -= diagCut;
+		startupMs = Math.max(0, startupMs - (over - diagCut));
+	}
+	const clamped = startupMs !== requestedStartupMs || diagnosticMs !== requestedDiagnosticMs || windowMs !== timeouts.requestMs;
+	return { startupMs, diagnosticMs, windowMs, clamped, requestedStartupMs, requestedDiagnosticMs };
+}
+
 /**
  * 钳制超时层级（纯函数，可单测）：闭合不变式 `startupMs + diagnosticMs ≤ requestMs`。
  *
@@ -215,7 +275,9 @@ export function clampTimeoutHierarchy(timeouts: NvimTimeouts): NvimTimeouts {
 	const diagnosticMs = Math.max(MIN_TIMEOUT_MS, Math.min(timeouts.diagnosticMs, requestMs, requestMs - startupMs));
 	// 地板不得超诊断总预算（否则永远等满 budget 也到不了地板）
 	const pushObserveMs = Math.max(0, Math.min(timeouts.pushObserveMs, diagnosticMs));
-	return { ...timeouts, startupMs, diagnosticMs, pushObserveMs };
+	// 硬顶窗口不得小于默认窗口（否则调用级放大无空间，且配置自相矛盾）
+	const maxRequestMs = Math.max(requestMs, timeouts.maxRequestMs);
+	return { ...timeouts, startupMs, diagnosticMs, pushObserveMs, maxRequestMs };
 }
 
 /**
@@ -248,6 +310,8 @@ export function normalizeConfig(raw: Record<string, unknown> | undefined): NvimC
 		if (typeof t["pushObserveMs"] === "number" && Number.isInteger(t["pushObserveMs"]) && t["pushObserveMs"] >= 0) {
 			out.timeouts.pushObserveMs = t["pushObserveMs"];
 		}
+		const maxRequestMs = asPositiveInt(t["maxRequestMs"]);
+		if (maxRequestMs !== undefined) out.timeouts.maxRequestMs = maxRequestMs;
 		const startupMs = pickTimeout(t, "startupMs", "attachMs");
 		if (startupMs !== undefined) out.timeouts.startupMs = startupMs;
 		const diagnosticMs = pickTimeout(t, "diagnosticMs", "diagMs");
@@ -359,6 +423,8 @@ export function normalizeConfigOverlay(raw: Record<string, unknown>): Partial<Nv
 		if (typeof t["pushObserveMs"] === "number" && Number.isInteger(t["pushObserveMs"]) && t["pushObserveMs"] >= 0) {
 			timeouts.pushObserveMs = t["pushObserveMs"];
 		}
+		const maxRequestMs = asPositiveInt(t["maxRequestMs"]);
+		if (maxRequestMs !== undefined) timeouts.maxRequestMs = maxRequestMs;
 		const startupMs = pickTimeout(t, "startupMs", "attachMs");
 		if (startupMs !== undefined) timeouts.startupMs = startupMs;
 		const diagnosticMs = pickTimeout(t, "diagnosticMs", "diagMs");
@@ -400,8 +466,8 @@ export function resolveResource(packageRoot: string, rel: string): string {
 	const full = path.join(packageRoot, rel);
 	if (!fs.existsSync(full)) {
 		throw new Error(
-			`@inobit/pi-nvim: 找不到资源 ${rel}（包目录 ${packageRoot}）；` +
-				"若为手动安装请确认 lua/ 与 config/ 已随包发布（package.json files 须含 src,lua,config）。",
+			`@inobit/pi-nvim: resource not found: ${rel} (package root ${packageRoot}); ` +
+				"for manual installs make sure lua/ and config/ ship with the package (package.json files must include src,lua,config).",
 		);
 	}
 	return full;

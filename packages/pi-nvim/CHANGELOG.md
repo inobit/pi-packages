@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.1.1] - 2026-10-17
+
+- fix: diagnostics missed late pushes and reported them as clean
+  - root cause (measured): push has no completion signal; the old settle gave up after a 3s minimum + 0.5s quiet, while gopls' `slicescontains` analyzer publishes 5-7s after `:edit` (and 7-20s under load) — those waves were lost and the file came back `clean`
+  - per-buffer, two-phase flow: `:edit` all buffers -> startup phase (one batched wait until every buffer has an initialized client; each buffer is then judged on its own) -> diagnostic phase (every buffer's pull request is issued at once, callback-driven, and push publishes are observed in the same wait loop, sharing one `diagnosticMs` budget measured from the diagnostic-phase start `t_diag`) -> per-file assembly -> wipe. Buffers no longer serialize: total latency is the slowest one, not the sum
+  - routing is per client: pull-capable -> pull only (a failed pull is never retried through push); no pull -> observed through `publishDiagnostics`; formatter-only clients (e.g. oxfmt) are not diagnostics sources and are skipped entirely
+  - push data comes from a publish record (`_publishes[client_id+uri] = {at, hash, name, diags}`, empty publishes included) so it survives the batch wipe and carries its own client attribution (the namespace reverse-lookup is gone). A fresh publish (inside the diagnostic window) settles after the observation floor plus a 1.5s quiet period; an old record whose content hash matches and that has been quiet for at least the floor settles instantly (no floor paid)
+  - verdicts for unsettled push clients: unfinished `LspProgress` since the request -> `(client) diagnostics timed out`; observed at least the floor while the server is idle -> weak clean (best-effort note in `details` only); observed less than the floor (budget shorter than the floor) -> timeout failure, never clean
+  - `timeouts.pushObserveMs` (default 15000, `0` disables): the observation floor. Push has no completion signal, so a floor shorter than the gap between the early empty wave and the late real wave reports a false clean (measured: with an 8s floor a pure-Go batch missed 2 of 4 runs). Pull never pays it; the real fix is enabling `pullDiagnostics: true` for gopls (v0.17+)
+  - `timeouts.startupMs` (default 10000) replaces `attachMs` (default 20000) and `timeouts.diagnosticMs` (default 20000) replaces `diagMs`; old keys are still accepted as aliases. The settle knobs (`PI_NVIM_MIN_SETTLE_MS` etc.) are gone with the settle code
+  - `nvim_format` pulls post-write diagnostics through the same async path (no push wait: `:w` already gives a definite result for the write itself); the write path is unchanged
+  - existence is checked before `:edit` (a missing path used to become an empty buffer that LSPs happily diagnosed)
+
+- fix: diagnostics output could be misread, and daemon-level failures were mixed with file-level ones
+  - per-file envelope `{file, status: success|failed|skipped, message?, diags[], ms}`: success never carries a message; failures carry one line (semicolon-joined across clients) and keep whatever partial diagnostics arrived; skipped covers whitelist misses and zero-client files. The pi tool result has no status field (`AgentToolResult` only has content/details), so the state lives in our payload
+  - rendering: `clean` / diagnostic lines / `[failed] (client) reason` / `skipped (reason)`; the per-file count lines are gone (the header already totals); lines always use full paths; the header only counts (errors/warnings/hints/failed/skipped) and writes `clean` only when everything is zero
+  - LSP failures put the client in a slot (`[failed] (tsc) diagnostics timed out`); bridge-level failures (edit failure, lost buffer, Lua error) have no client slot and fall back to `unknown error` rather than an empty tail. Daemon-level failures (spawn, startup, request timeout) stay batch-level on the tool error channel — no per-file names
+  - multi-line diagnostic messages (e.g. oxlint's message plus `help:`) are folded onto one line so a diagnostic is always exactly one line
+
+- feat: per-call timeouts (`nvim_lsp`: `startupMs`/`diagnosticMs`; `nvim_format`: `startupMs`)
+  - optional tool parameters; omitted = the user's configured defaults, so existing behaviour is unchanged. Timeout failures name the knob and a suggested value (e.g. `retry with diagnosticMs=40000`), so the model can simply retry with the larger value instead of editing config
+  - `timeouts.maxRequestMs` (default 300000) is new: `requestMs` becomes the default window while a call may grow the daemon request window up to `clamp(startup + diagnostic + 5s, requestMs, maxRequestMs)`. Per-phase caps are 120s each, so the largest pair (120+120+5) still fits the 300s ceiling
+  - joint clamp invariant `startup + diagnostic + reserve <= window <= maxRequestMs`: over-large asks are scaled down (diagnostic first, down to 1s, then startup) instead of being accepted and then killed by the request window; when values are clamped the content starts with a `note:` line and `details` carries `effective`/`clamped_from`
+  - suggested retry values are `max(effective * 2, floor, 2s)` capped by the hard limits, with the diagnostic floor at `pushObserveMs + 5s` and the startup floor at 20s, so one retry is normally enough
+  - the bridge re-clamps both fields (120s each) as a defence against malformed requests; `nvim_format` only takes `startupMs` (the write itself has a definite `:w` result)
+
+- docs/prompts: tool descriptions stay basic (what the tool does, read-only vs writes-disk) while every parameter spec — required `files` array, `minimum`/`maximum` for the timeouts, semantics — lives in the tool JSON schema; a new `promptSnippet` finally puts both tools in the system prompt's tool list (custom tools without one are omitted); guidelines stay behaviour-only; every model-visible string (tool errors included) is English; config examples updated in both READMEs
+
 ## [0.1.0] - 2026-10-13
 
 - fix: scope abort state per request to close a cross-request leak (reviewer P2-4)

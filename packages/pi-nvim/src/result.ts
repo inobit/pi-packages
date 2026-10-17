@@ -124,6 +124,24 @@ function oneLine(text: string): string {
 	return text.replaceAll(/\s*\n+\s*/g, " ").trim();
 }
 
+/** 超时失败行追加"下次可调大"的旋钮建议，只认我们自己的两种超时口径。
+ * 建议值＝max(生效值×2, 地板, 2s) 再钳到硬顶：诊断的地板取 push 观测地板+5s
+ * （push-only 服务器迟到波需要的最短预算），避免模型每次只翻倍、反复失败。 */
+export function appendRetryHint(
+	message: string,
+	eff: { startupMs: number; diagnosticMs: number },
+	caps: { maxStartupMs: number; maxDiagnosticMs: number; diagnosticFloorMs?: number; startupFloorMs?: number },
+): string {
+	const suggest = (v: number, cap: number, floor: number): number => Math.min(cap, Math.max(2000, floor, v * 2));
+	if (message.includes("diagnostics timed out")) {
+		return `${message} (retry with diagnosticMs=${suggest(eff.diagnosticMs, caps.maxDiagnosticMs, caps.diagnosticFloorMs ?? 2000)})`;
+	}
+	if (message.includes("initialization timed out")) {
+		return `${message} (retry with startupMs=${suggest(eff.startupMs, caps.maxStartupMs, caps.startupFloorMs ?? 20000)})`;
+	}
+	return message;
+}
+
 function formatDiagLine(file: string, d: NvimDiag): string {
 	const origin = d.client !== undefined && d.client !== "" ? `${d.client}: ${d.source}` : d.source;
 	return `${file}:${d.line}:${d.col} [${severityLabel(d.severity)}] (${origin}) ${oneLine(d.message)}`;

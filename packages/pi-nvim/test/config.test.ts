@@ -3,7 +3,15 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { applyOverlay, clampTimeoutHierarchy, DEFAULT_CONFIG, normalizeConfig } from "../src/config.ts";
+import {
+	applyOverlay,
+	clampTimeoutHierarchy,
+	DEFAULT_CONFIG,
+	MAX_DIAGNOSTIC_MS,
+	MAX_STARTUP_MS,
+	normalizeConfig,
+	resolveCallTimeouts,
+} from "../src/config.ts";
 
 describe("normalizeConfig", () => {
 	it("空输入回默认（含 idleMs 300000／parentPollMs 15000／pollMs 50，无 truncation 节）", () => {
@@ -76,6 +84,59 @@ describe("clampTimeoutHierarchy（不变式 startupMs+diagnosticMs ≤ requestMs
 		const out = clampTimeoutHierarchy({ ...DEFAULT_CONFIG.timeouts, requestMs: 1500 });
 		expect(out.startupMs).toBe(1000);
 		expect(out.diagnosticMs).toBe(1000);
+	});
+});
+
+describe("resolveCallTimeouts（调用级时间：默认／钳制／联合不变式）", () => {
+	const T = DEFAULT_CONFIG.timeouts;
+
+	it("不传参 → 用配置默认，窗口＝requestMs，不标记钳制", () => {
+		const eff = resolveCallTimeouts(T, {});
+		expect(eff.startupMs).toBe(T.startupMs);
+		expect(eff.diagnosticMs).toBe(T.diagnosticMs);
+		expect(eff.windowMs).toBe(T.requestMs);
+		expect(eff.clamped).toBe(false);
+	});
+	it("传小值 → 生效并放大窗口到 startup+diagnostic+5s", () => {
+		const eff = resolveCallTimeouts(T, { startupMs: 30000, diagnosticMs: 60000 });
+		expect(eff.startupMs).toBe(30000);
+		expect(eff.diagnosticMs).toBe(60000);
+		expect(eff.windowMs).toBe(95000);
+		expect(eff.clamped).toBe(true); // 窗口变了，模型需要知道
+	});
+	it("各自超硬顶被钳（120s／120s），且窗口不超 maxRequestMs", () => {
+		const eff = resolveCallTimeouts(T, { startupMs: 999999, diagnosticMs: 999999 });
+		expect(eff.startupMs).toBe(MAX_STARTUP_MS);
+		expect(eff.diagnosticMs).toBe(MAX_DIAGNOSTIC_MS);
+		expect(eff.windowMs).toBeLessThanOrEqual(T.maxRequestMs);
+		expect(eff.startupMs + eff.diagnosticMs + 5000).toBeLessThanOrEqual(eff.windowMs);
+	});
+	it("maxRequestMs 收紧时联合缩小（先缩诊断到保底，再缩启动）", () => {
+		const tight = { ...T, requestMs: 60000, maxRequestMs: 60000 };
+		const eff = resolveCallTimeouts(tight, { startupMs: 120000, diagnosticMs: 120000 });
+		expect(eff.windowMs).toBe(60000);
+		expect(eff.startupMs + eff.diagnosticMs + 5000).toBeLessThanOrEqual(60000);
+		expect(eff.diagnosticMs).toBeGreaterThanOrEqual(1000);
+	});
+	it("不变式恒成立（遍历若干组合）", () => {
+		const combos: Array<[number | undefined, number | undefined]> = [
+			[undefined, undefined], [0, 0], [1, 1], [10000, 20000], [60000, 60000],
+			[120000, 120000], [999999, 1], [1, 999999],
+		];
+		for (const [a, b] of combos) {
+			const eff = resolveCallTimeouts(T, { startupMs: a, diagnosticMs: b });
+			expect(eff.startupMs).toBeGreaterThanOrEqual(0);
+			expect(eff.startupMs).toBeLessThanOrEqual(MAX_STARTUP_MS);
+			expect(eff.diagnosticMs).toBeGreaterThanOrEqual(1000);
+			expect(eff.diagnosticMs).toBeLessThanOrEqual(MAX_DIAGNOSTIC_MS);
+			expect(eff.startupMs + eff.diagnosticMs + 5000).toBeLessThanOrEqual(eff.windowMs);
+			expect(eff.windowMs).toBeLessThanOrEqual(T.maxRequestMs);
+			expect(eff.windowMs).toBeGreaterThanOrEqual(T.requestMs);
+		}
+	});
+	it("maxRequestMs 配置不得小于 requestMs（钳制后）", () => {
+		const t = normalizeConfig({ timeouts: { requestMs: 120000, maxRequestMs: 60000 } }).timeouts;
+		expect(t.maxRequestMs).toBeGreaterThanOrEqual(t.requestMs);
 	});
 });
 

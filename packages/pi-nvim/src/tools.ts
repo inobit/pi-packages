@@ -17,7 +17,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
-import type { NvimConfig } from "./config.ts";
+import { MAX_DIAGNOSTIC_MS, MAX_STARTUP_MS, resolveCallTimeouts, type CallTimeouts, type NvimConfig } from "./config.ts";
 import {
 	DaemonAbortedError,
 	DaemonManager,
@@ -25,6 +25,7 @@ import {
 	listenAbort,
 } from "./daemon.ts";
 import {
+	appendRetryHint,
 	degradedHeader,
 	parseDiagnosePayload,
 	parseFormatPayload,
@@ -35,17 +36,59 @@ import {
 } from "./result.ts";
 import { partitionFiles } from "./scope.ts";
 
-export const NvimFilesParams = Type.Object(
+const FILES_FIELD = {
+	files: Type.Array(Type.String(), {
+		minItems: 1,
+		description: "Required. Absolute file paths (absolute, not relative); pass ALL touched files in ONE call.",
+	}),
+};
+
+const TIMEOUT_HINT =
+	"Optional integer (0-120000 ms); omitted = user config. Timeout failures suggest the value to retry with.";
+
+/** nvim_lsp：启动段（startupMs）＋诊断段（diagnosticMs）可各自覆盖 */
+export const NvimLspParams = Type.Object(
 	{
-		files: Type.Array(Type.String(), {
-			minItems: 1,
-			description: "Absolute file paths; pass ALL touched files in ONE call",
-		}),
+		...FILES_FIELD,
+		startupMs: Type.Optional(
+			Type.Integer({
+				minimum: 0,
+				maximum: MAX_STARTUP_MS,
+				description: `Wait budget for LSP clients to attach before diagnostics start. ${TIMEOUT_HINT}`,
+			}),
+		),
+		diagnosticMs: Type.Optional(
+			Type.Integer({
+				minimum: 0,
+				maximum: MAX_DIAGNOSTIC_MS,
+				description: `Budget for diagnostics collection (pull requests and push observation share it). ${TIMEOUT_HINT}`,
+			}),
+		),
 	},
 	{ additionalProperties: false },
 );
 
-export type NvimFilesParamsType = Static<typeof NvimFilesParams>;
+/** nvim_format：只有启动段可覆盖（写盘有 :w 回执，不需要诊断预算） */
+export const NvimFormatParams = Type.Object(
+	{
+		...FILES_FIELD,
+		startupMs: Type.Optional(
+			Type.Integer({
+				minimum: 0,
+				maximum: MAX_STARTUP_MS,
+				description: `Wait budget for formatter clients to attach before writing. ${TIMEOUT_HINT}`,
+			}),
+		),
+	},
+	{ additionalProperties: false },
+);
+
+/** 兼容旧名（等价于 nvim_lsp 的参数形状） */
+export const NvimFilesParams = NvimLspParams;
+
+export type NvimLspParamsType = Static<typeof NvimLspParams>;
+export type NvimFormatParamsType = Static<typeof NvimFormatParams>;
+export type NvimFilesParamsType = NvimLspParamsType;
 
 export interface NvimToolDeps {
 	cfg: NvimConfig;
@@ -94,7 +137,7 @@ function textResult(text: string, details: NvimLspDetails | NvimFormatDetails): 
 }
 
 export const NVIM_LSP_DESCRIPTION =
-	"Run your Neovim LSP setup over the given files and return diagnostics (errors/warnings/hints from language servers and bridged linters). Read-only: never modifies files. Pass ALL touched files in ONE call.";
+	"Run your Neovim LSP setup over the given files and return diagnostics (errors/warnings/hints from language servers and bridged linters). Read-only: never modifies files.";
 
 export const NVIM_FORMAT_DESCRIPTION =
 	"Format the given files with your Neovim LSP formatters and write the result back, then return remaining diagnostics. MODIFIES files on disk.";
@@ -103,8 +146,13 @@ const NVIM_GUIDELINES = [
 	"nvim_lsp returns LSP diagnostics without modifying files; suitable for verifying edited files.",
 	"nvim_format formats through your Neovim setup and writes back; use it only when formatting is explicitly needed.",
 	"Both tools accept multiple files in ONE call; per-file loops are unnecessary.",
-	"Scope is allowlisted (diagnostics cover code plus md/Dockerfile, format covers code only); out-of-scope files return per-file skipped and are not executed.",
+	"Timeout failures suggest the value to retry with; pass the same files again with that override instead of giving up.",
+	"Scope is allowlisted (code plus md/Dockerfile for diagnostics, code only for format); out-of-scope files return per-file skipped.",
 ];
+
+/** 系统提示词 Available tools 段的一行短语（缺失则工具不出现在该段） */
+const NVIM_LSP_SNIPPET = "read-only LSP diagnostics for given files";
+const NVIM_FORMAT_SNIPPET = "format files through your Neovim setup (writes to disk)";
 
 async function ensureHandles(deps: NvimToolDeps, ctx: ExtensionContext): Promise<{
 	sessionId: string;
@@ -121,6 +169,27 @@ function withDegraded(text: string, degraded: string[] | undefined): string {
 	return `${degradedHeader(degraded)}\n${text}`;
 }
 
+/** 调用级时间解析：不传即配置默认；传了按硬顶与窗口联合钳制（见 resolveCallTimeouts） */
+function effectiveOf(cfg: NvimConfig, call: CallTimeouts) {
+	return resolveCallTimeouts(cfg.timeouts, call);
+}
+
+/** 生效值明细（details 用，机器可读） */
+function effectiveDetails(eff: ReturnType<typeof effectiveOf>): Record<string, unknown> {
+	return {
+		effective: { startupMs: eff.startupMs, diagnosticMs: eff.diagnosticMs, windowMs: eff.windowMs },
+		...(eff.clamped
+			? { clamped_from: { startupMs: eff.requestedStartupMs, diagnosticMs: eff.requestedDiagnosticMs } }
+			: {}),
+	};
+}
+
+/** 被钳制时在正文首行提示（不钳则原样返回）：模型才知道自己实际拿到多少 */
+function withClampNote(text: string, eff: ReturnType<typeof effectiveOf>): string {
+	if (!eff.clamped) return text;
+	return `note: timeouts clamped to startupMs=${eff.startupMs}, diagnosticMs=${eff.diagnosticMs} (request window ${eff.windowMs}ms)\n${text}`;
+}
+
 function degradedDetails(degraded: string[] | undefined): { degraded_lines?: string[] } {
 	if (!degraded || degraded.length === 0) return {};
 	return { degraded_lines: [...degraded] };
@@ -131,10 +200,18 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 		name: "nvim_lsp",
 		label: "Nvim LSP",
 		description: NVIM_LSP_DESCRIPTION,
+		promptSnippet: NVIM_LSP_SNIPPET,
 		promptGuidelines: [...NVIM_GUIDELINES],
-		parameters: NvimFilesParams,
+		parameters: NvimLspParams,
 		executionMode: "sequential",
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const eff = effectiveOf(deps.cfg, { startupMs: params.startupMs, diagnosticMs: params.diagnosticMs });
+			// 诊断建议值地板：push 观测地板 + 5s（够 push-only 的迟到波落地）
+			const hintCaps = {
+				maxStartupMs: MAX_STARTUP_MS,
+				maxDiagnosticMs: MAX_DIAGNOSTIC_MS,
+				diagnosticFloorMs: deps.cfg.timeouts.pushObserveMs + 5000,
+			};
 			// 调用守卫（TS 侧、ensure() 之前）：存在→是文件→可读文本→本工具白名单；
 			// 本地项行内表达，daemon-bound 走整批单调用，最后按请求原序合并单次返回。
 			const scope = partitionFiles(params.files, "diagnostics", deps.cfg.whitelist);
@@ -156,7 +233,7 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 			let payload: unknown;
 			try {
 				payload = await deps.daemon.runExclusive(() =>
-					deps.daemon.request(handles, "diagnose", [...scope.daemonFiles], signal),
+					deps.daemon.request(handles, "diagnose", [...scope.daemonFiles], signal, eff),
 				);
 			} catch (err) {
 				if (err instanceof DaemonTimeoutError) {
@@ -174,15 +251,23 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 				}
 				throw err;
 			}
-			const parsed = parseDiagnosePayload(payload, deps.cfg.errorCap);
+			const parsed = parseDiagnosePayload(payload, deps.cfg.errorCap).map((f) =>
+				f.message !== undefined
+					? { ...f, message: appendRetryHint(f.message, eff, hintCaps) }
+					: f,
+			);
 			// 按请求原序合并：本地项行内表达，daemon 未回的文件记失败（不虚构干净）
 			const byFile = new Map(parsed.map((p) => [p.file, p]));
 			const full = params.files.map((f) => localOf(f) ?? byFile.get(f) ?? { file: f, status: "failed" as const, message: "no result from daemon", diags: [], ms: 0 });
-			return textResult(withDegraded(renderLspContent(full, deps.cfg.errorCap), handles.degradedLines), {
-				kind: "nvim_lsp",
-				files: full,
-				...degradedDetails(handles.degradedLines),
-			});
+			return textResult(
+				withClampNote(withDegraded(renderLspContent(full, deps.cfg.errorCap), handles.degradedLines), eff),
+				{
+					kind: "nvim_lsp",
+					files: full,
+					...effectiveDetails(eff),
+					...degradedDetails(handles.degradedLines),
+				},
+			);
 		},
 	});
 
@@ -190,10 +275,12 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 		name: "nvim_format",
 		label: "Nvim Format",
 		description: NVIM_FORMAT_DESCRIPTION,
+		promptSnippet: NVIM_FORMAT_SNIPPET,
 		promptGuidelines: [...NVIM_GUIDELINES],
-		parameters: NvimFilesParams,
+		parameters: NvimFormatParams,
 		executionMode: "sequential",
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const eff = effectiveOf(deps.cfg, { startupMs: params.startupMs });
 			// 调用守卫（TS 侧、ensure() 之前）：本地项行内表达，daemon-bound 逐文件走
 			// per-file mutation queue 环，最后按请求原序合并单次返回。
 			const scope = partitionFiles(params.files, "format", deps.cfg.whitelist);
@@ -230,9 +317,14 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 						}
 						try {
 							const one = await withFileMutationQueue(file, () =>
-								deps.daemon.request(handles, "format", [file], signal),
+								deps.daemon.request(handles, "format", [file], signal, eff),
 							);
-							const parsed = parseFormatPayload(one, deps.cfg.errorCap);
+							let parsed = parseFormatPayload(one, deps.cfg.errorCap);
+							parsed = parsed.map((f) =>
+								f.note !== undefined
+									? { ...f, note: appendRetryHint(f.note, eff, { maxStartupMs: MAX_STARTUP_MS, maxDiagnosticMs: MAX_DIAGNOSTIC_MS }) }
+									: f,
+							);
 							const got = parsed.find((p) => p.file === file);
 							results.push(
 								got ?? {
@@ -268,9 +360,10 @@ export function registerNvimTools(pi: ExtensionAPI, deps: NvimToolDeps): void {
 			if (aborted) {
 				text += `\n…aborted (partial: ${params.files.length} files attempted, see failed section)`;
 			}
-			return textResult(text, {
+			return textResult(withClampNote(text, eff), {
 				kind: "nvim_format",
 				files: results,
+				...effectiveDetails(eff),
 				aborted: aborted ? true : undefined,
 				partial: aborted ? true : undefined,
 				...degradedDetails(degraded),

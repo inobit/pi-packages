@@ -22,7 +22,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import type { NvimConfig } from "./config.ts";
+import { MAX_DIAGNOSTIC_MS, MAX_STARTUP_MS, type NvimConfig } from "./config.ts";
 import { ERROR_TEXT_LIMIT, truncateError } from "./result.ts";
 
 /** daemon 启动日志文件名（stderr 重定向，启动健康检查用；daemon 优雅退出时自删，防 sockdir 泄漏） */
@@ -363,7 +363,7 @@ export class DaemonManager {
 			child.on("error", (err) => {
 				closeLogFd();
 				// spawn 失败 throw 不变（failed 档）；异常文走错误截断（非结构化、前重后轻）
-				reject(new Error(truncateError(`@inobit/pi-nvim: daemon spawn 失败：${err.message}`, this.cfg.errorCap)));
+				reject(new Error(truncateError(`@inobit/pi-nvim: daemon spawn failed: ${err.message}`, this.cfg.errorCap)));
 			});
 			// 先等 spawn 成功再 resolve：否则 ENOENT 类错误在 resolve 后触发即被吞。
 			child.on("spawn", () => {
@@ -385,8 +385,8 @@ export class DaemonManager {
 			if (Date.now() >= deadline) {
 				throw new Error(
 					truncateError(
-						`@inobit/pi-nvim: daemon 启动超时（${this.cfg.timeouts.spawnMs}ms，sock=${h.sockPath}）；` +
-							"请确认 nvim 可用且用户配置可 headless 加载。",
+						`@inobit/pi-nvim: daemon startup timed out (${this.cfg.timeouts.spawnMs}ms, sock=${h.sockPath}); ` +
+							"check that nvim runs and your config loads headless.",
 						this.cfg.errorCap,
 					),
 				);
@@ -404,30 +404,33 @@ export class DaemonManager {
 		fn: BridgeFn,
 		files: string[],
 		signal: AbortSignal | undefined,
+		budget?: { startupMs: number; diagnosticMs: number; windowMs: number },
 	): Promise<unknown> {
 		reqCounter += 1;
 		const n = reqCounter;
 		const reqId = `req-${n}`;
 		const reqPath = path.join(h.sockDir, `${reqId}.json`);
 		const resPath = path.join(h.sockDir, `res-${n}.json`);
+		// 调用级时间由 tools 层用 resolveCallTimeouts 算好（含联合钳制与窗口）；
+		// 缺省（未给 budget）时退回配置值，保持旧行为
 		const body: DaemonRequest = {
 			id: reqId,
 			files,
-			startupMs: this.cfg.timeouts.startupMs,
-			diagnosticMs: this.cfg.timeouts.diagnosticMs,
+			startupMs: budget?.startupMs ?? this.cfg.timeouts.startupMs,
+			diagnosticMs: budget?.diagnosticMs ?? this.cfg.timeouts.diagnosticMs,
 		};
 		fs.writeFileSync(reqPath, JSON.stringify(body), "utf8");
 		unlinkIfExists(resPath);
 		h.currentReqId = reqId;
 		try {
 			await this.kickDaemon(h, fn, reqPath, resPath);
-			const raw = await this.waitResult(resPath, signal, () => this.sendAbort(h, reqId));
+			const raw = await this.waitResult(resPath, signal, () => this.sendAbort(h, reqId), budget?.windowMs);
 			const parsed: unknown = JSON.parse(raw);
 			// Lua 侧异常／关闭中：{ error } 结果转抛错（绝不误报 clean；信封文走错误截断）
 			if (parsed && typeof parsed === "object" && "error" in parsed) {
 				const msg = (parsed as { error?: unknown }).error;
 				throw new Error(
-					truncateError(`@inobit/pi-nvim: daemon 回错：${typeof msg === "string" ? msg : "unknown"}`, this.cfg.errorCap),
+					truncateError(`@inobit/pi-nvim: daemon returned an error: ${typeof msg === "string" ? msg : "unknown"}`, this.cfg.errorCap),
 				);
 			}
 			return parsed;
@@ -469,7 +472,7 @@ export class DaemonManager {
 				reject(
 					new Error(
 						truncateError(
-							`@inobit/pi-nvim: sender 发起失败（判 daemon 死）：${err.message}；下次调用将重起 daemon。`,
+							`@inobit/pi-nvim: failed to reach the daemon (sender failed): ${err.message}; the next call restarts it.`,
 						),
 					),
 				);
@@ -479,15 +482,15 @@ export class DaemonManager {
 				else
 					reject(
 						new Error(
-							truncateError(`@inobit/pi-nvim: sender 退出码 ${String(code)}（判 daemon 死）；下次调用将重起 daemon。`, this.cfg.errorCap),
+							truncateError(`@inobit/pi-nvim: sender exited with code ${String(code)} (daemon considered dead); the next call restarts it.`, this.cfg.errorCap),
 						),
 					);
 			});
 		});
 	}
 
-	private async waitResult(resPath: string, signal: AbortSignal | undefined, onAbort?: () => void): Promise<string> {
-		const deadline = Date.now() + this.cfg.timeouts.requestMs;
+	private async waitResult(resPath: string, signal: AbortSignal | undefined, onAbort?: () => void, windowMs?: number): Promise<string> {
+		const deadline = Date.now() + (windowMs ?? this.cfg.timeouts.requestMs);
 		let aborted = signal?.aborted ?? false;
 		const off = listenAbort(signal, () => {
 			aborted = true;
@@ -496,7 +499,7 @@ export class DaemonManager {
 		try {
 			for (;;) {
 				if (aborted) {
-					throw new DaemonAbortedError(truncateError("请求被中断（signal aborted），返回 partial。", this.cfg.errorCap));
+					throw new DaemonAbortedError(truncateError("request aborted (signal aborted); returning partial results.", this.cfg.errorCap));
 				}
 			try {
 				// P2-8 已知残留：writefile 与 readFileSync 理论有部分读窗口；小文件风险极低，JSON.parse 失败抛错可重试
@@ -506,7 +509,11 @@ export class DaemonManager {
 			}
 			if (Date.now() >= deadline) {
 				throw new DaemonTimeoutError(
-					truncateError(`daemon 请求超时（${this.cfg.timeouts.requestMs}ms）；已判卡死，下次调用将杀重建。`, this.cfg.errorCap),
+					truncateError(
+						`daemon request timed out (${windowMs ?? this.cfg.timeouts.requestMs}ms); judged stuck, the next call kills and rebuilds it. ` +
+							`If the wait was intentional, pass startupMs/diagnosticMs (max ${MAX_STARTUP_MS / 1000}s/${MAX_DIAGNOSTIC_MS / 1000}s) or raise maxRequestMs in config.`,
+						this.cfg.errorCap,
+					),
 				);
 			}
 			await sleep(this.cfg.timeouts.pollMs);

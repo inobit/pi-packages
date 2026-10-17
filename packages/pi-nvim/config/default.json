@@ -7,6 +7,7 @@
     "diagnosticMs": 20000,
     "pushObserveMs": 15000,
     "requestMs": 60000,
+    "maxRequestMs": 300000,
     "pollMs": 50
   },
   "idleMs": 300000,

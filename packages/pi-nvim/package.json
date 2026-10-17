@@ -1,6 +1,6 @@
 {
   "name": "@inobit/pi-nvim",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Reuse your Neovim LSP setup inside Pi sessions: `nvim_lsp` (read-only diagnostics) and `nvim_format` (write-back formatting) backed by a per-session headless nvim daemon.",
   "type": "module",
   "exports": {
