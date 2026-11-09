@@ -11,3 +11,5 @@
 - feat: optional remote `chrome-devtools-mcp` — when `devToolsBox` is set, a generated `bin/devtools-connect.sh` helper plus an `instabox-devtools` MCP server with `codemode` exposure; config comes from `<agentDir>/extensions/pi-instabox/config.json` layered over defaults and `INSTABOX_MCP_*` environment variables, and the extension never calls `setActiveTools`
 - feat: gate devtools MCP behind --instabox-devtools with a runtime toggle
 - feat: write structured JSONL logs under `<agentDir>/logs/pi-instabox` (one record per event, `info` by default and `debug` with `PI_INSTABOX_DEBUG=1`, 1 MiB × 3 rotation, sensitive field names redacted, write failures swallowed)
+- feat: bind devtools box to the session and add /instabox-devtools reset
+- fix: cap the prepare phase at 60s

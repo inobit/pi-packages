@@ -42,7 +42,7 @@ Levels 1–3 are strict: an unknown name is an error and a message naming severa
 
 **`/instabox-status`** — one-shot diagnostics: config summary (`defaultBox`, `devToolsBox`, `autoInstallDevTools`, `remotePath` — `devToolsBox` there is only the DevTools default box, not the switch), session target, resolved target and how it was resolved, registered `instabox_desktop_*` tools with their exposure, which box's cached template the declarations came from (`tool declarations: from the cached template of box "…"`), active tools, codemode state, and the MCP servers registered by extensions — `instabox-devtools` appears in that last list only while the DevTools server is on; the switch itself is reported by `/instabox-devtools status` (see [DevTools MCP](#devtools-mcp)).
 
-**`/instabox-devtools [status|on [box]|off]`** — the runtime toggle for the remote DevTools MCP server: bare (or `status`) shows the switch, the box it would use and whether the server is registered; `on [box]` registers or replaces it; `off` unregisters it for the rest of the session. Details in [DevTools MCP](#devtools-mcp).
+**`/instabox-devtools [status|on [box]|off|reset]`** — the runtime toggle for the remote DevTools MCP server: bare (or `status`) shows the switch, the name of the server registered in this session, the box bound to this session and the box the next `on` would use with where that box comes from (`session` / `flag` / `config`); `on [box]` registers or replaces it and, when a box is given, binds it to this session; `off` unregisters it for the rest of the session without clearing that binding; `reset` clears the session binding only. Details in [DevTools MCP](#devtools-mcp).
 
 **Where the tools come from.** On load, a cache hit registers the desktop tools silently — no ssh, no notification. Otherwise the session start decides in the background: with a cache it re-validates the box the declarations came from (session target → `defaultBox` → most recently fetched box, each only if that box has a cache entry); with no cache it lists boxes and takes the first box in `state === "running"`, or — when nothing is running — the first box in the list. **Connecting wakes the box:** every connection, desktop tool calls and this background sync alike, first makes sure the box is running (`instabox wake`, then `instabox start`, then `instabox resume`), so a paused box is woken in the background — no progress UI, the session is not blocked — instead of being skipped. Success is silent: the tools simply appear. You only see a warning when there is no usable sandbox at all (`instabox ls` empty or failing) or when the sync itself fails; both are once per session and the latter names `/instabox-use <box>`.
 
@@ -66,11 +66,12 @@ Optional `config.json` (global `<agentDir>/extensions/pi-instabox/config.json`, 
     "--no-usage-statistics"
   ],
   "timeouts": {
-    "wakeMs": 50000,
-    "startMs": 120000,
+    "prepareMs": 60000,
+    "wakeMs": 20000,
+    "startMs": 30000,
     "connectMs": 15000,
-    "initializeMs": 20000,
-    "listToolsMs": 20000,
+    "initializeMs": 15000,
+    "listToolsMs": 15000,
     "callMs": 120000
   }
 }
@@ -79,16 +80,19 @@ Optional `config.json` (global `<agentDir>/extensions/pi-instabox/config.json`, 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `defaultBox` | `""` | Late fallback target; empty means unset (falls back to the first `instabox ls` box) |
-| `devToolsBox` | `""` | Default box for `chrome-devtools-mcp` once the DevTools server is switched on; it never enables the server by itself, and `--instabox-devtools-box` overrides it |
+| `devToolsBox` | `""` | Default box for `chrome-devtools-mcp` once the DevTools server is switched on; it never enables the server by itself, and both `--instabox-devtools-box` and the session binding (`/instabox-devtools on <box>`) override it |
 | `autoInstallDevTools` | `true` | Try `sudo -n env "PATH=<remotePath>" npm i -g chrome-devtools-mcp` on the box once when it is missing |
 | `remotePath` | `/opt/npm/bin:/usr/local/bin:/usr/bin:/bin` | PATH used inside the box; the defaults cover the npm prefixes seen so far on box templates |
 | `devToolsArgs` | see above | Passed verbatim to `chrome-devtools-mcp` |
-| `timeouts.wakeMs` | `50000` | Upper bound for `instabox wake` (self-paused boxes) |
-| `timeouts.startMs` | `120000` | Upper bound for `instabox start` / `instabox resume` |
-| `timeouts.connectMs` | `15000` | Spawn until the first byte from the remote MCP server |
-| `timeouts.initializeMs` | `20000` | `initialize` request |
-| `timeouts.listToolsMs` | `20000` | `tools/list` request |
-| `timeouts.callMs` | `120000` | `tools/call` request (desktop actions, screenshots included) |
+| `timeouts.prepareMs` | `60000` | Deadline for the whole prepare phase of one tool call: state check → wake chain → confirm `running` → connect |
+| `timeouts.wakeMs` | `20000` | Per-step cap for `instabox wake` (self-paused boxes) |
+| `timeouts.startMs` | `30000` | Per-step cap for `instabox start` / `instabox resume` |
+| `timeouts.connectMs` | `15000` | Per-step cap from spawn until the first byte from the remote MCP server |
+| `timeouts.initializeMs` | `15000` | `initialize` request |
+| `timeouts.listToolsMs` | `15000` | `tools/list` request |
+| `timeouts.callMs` | `120000` | `tools/call` request (desktop actions, screenshots included); not part of the prepare budget |
+
+`prepareMs` is a deadline, the other fields are single-step caps: every step's timeout is `min(step cap, remaining budget)`, and polling/backoff waits shrink the same way, so a step that hangs cannot stretch the total into the sum of the caps. When the budget runs out the call fails with `prepare timed out after 60000ms (box "<name>", step: wake|start|resume|confirm|connect)` plus that step's `stderr` tail; nothing is retried on another box. `timeouts.callMs` starts after the prepare phase, so it is not contained in `prepareMs`.
 
 Layers are applied in order, later wins: built-in defaults → the global `config.json` → the project `config.json` (trusted projects only) → environment variables. Invalid values are ignored, so that layer simply keeps the value below it; `timeouts` merges field by field, and an explicit `"devToolsArgs": []` clears the list.
 
@@ -127,7 +131,8 @@ Every session appends structured events to `<agentDir>/logs/pi-instabox/pi-insta
 | `resolve` | info | `param`, `source` (`param` / `message` / `session` / `config` / `first`), `box`, `mentions`, `candidates` (first 10), `degraded` (a missing `defaultBox` was skipped) |
 | `resolve.fail` | warn | `kind` (`no-boxes` / `invalid-param` / `invalid-session` / `ambiguous` / `invalid-config`), `message`, `candidates` (first 10) |
 | `pool.connect` | info | `box`, `ok`, `ms`, `error` |
-| `pool.wake` | info / warn | `box`, `step` (`wake` / `start` / `resume`), `ok`, `ms` |
+| `pool.prepare` | info / warn | `box`, `ok`, `ms` (the whole prepare phase), `step` (`wake` / `start` / `resume` / `confirm` / `connect`; only when the budget ran out), `timeoutMs` (the budget that step got) |
+| `pool.wake` | info / warn | `box`, `step` (`wake` / `start` / `resume`), `ok`, `ms`, `timeoutMs` (that step's budget) |
 | `pool.state` | debug | `box`, `state`, `desiredState` |
 | `pool.reuse` | debug | `box` |
 | `pool.dispose` | debug | `box` |
@@ -141,8 +146,9 @@ Every session appends structured events to `<agentDir>/logs/pi-instabox/pi-insta
 | `tool.call` | info | `tool`, `box`, `ok`, `ms`, `isError` |
 | `codemode` | debug | `state` (`active` / `inactive` / `missing`), `server` (a codemode-exposure MCP server exists) |
 | `devtools.register` | info | `box`, `ok` |
-| `devtools.enabled` | info | `box`, `via` (`flag` / `command`) |
+| `devtools.enabled` | info | `box`, `source` (`session` / `flag` / `config` / `command`) |
 | `devtools.disabled` | info | — (no fields) |
+| `devtools.reset` | info | — (no fields) |
 | `devtools.helper` | info | `ok`, `path`, `error` |
 | `error` | warn | `where`, `message` (a swallowed failure: session branch, `session_start` background task, `ui.notify`) |
 
@@ -161,14 +167,14 @@ The remote `chrome-devtools-mcp` server is **off by default**. Three inputs deci
 | Input | Meaning |
 | --- | --- |
 | `--instabox-devtools` | Switch the capability on (boolean, default `false`) |
-| `--instabox-devtools-box <name>` | The box that hosts the server; overrides `devToolsBox` (string, default `""`) |
-| `/instabox-devtools [status\|on [box]\|off]` | The runtime toggle (see below) |
+| `--instabox-devtools-box <name>` | The box that hosts the server; beats `devToolsBox`, loses to the session binding (string, default `""`) |
+| `/instabox-devtools [status\|on [box]\|off\|reset]` | The runtime toggle and the session binding (see below) |
 
-The box comes from `--instabox-devtools-box` first and `config.devToolsBox` second; with neither — and the switch on — one warning says the box is unspecified and **no server is registered**. A box that `instabox ls` does not list is refused with one warning naming the candidates — never silently swapped for another box. Passing only `--instabox-devtools-box` without the switch warns once and enables nothing; `config.devToolsBox` alone is silent, because the config only supplies a default box.
+The box is resolved in this order: the **session binding** written by `/instabox-devtools on <box>` (a branch-scoped session entry, so it survives `--continue` and follows `/tree`), then `--instabox-devtools-box`, then `config.devToolsBox`. With none of the three — and the switch on — one warning says the box is unspecified and **no server is registered**. A box that `instabox ls` does not list is refused with one warning naming the candidates — never silently swapped for another box. Passing only `--instabox-devtools-box` without the switch warns once and enables nothing; `config.devToolsBox` alone is silent, because the config only supplies a default box.
 
-With the switch on, the extension writes the helper and registers one MCP server named `instabox-devtools` whose `command` is that helper, so the remote `chrome-devtools-mcp` runs inside that fixed box over `instabox ssh`. Its `exposure` is `codemode` with a 180-second per-request timeout; before connecting, the helper makes sure the box is running (`instabox wake`, falling back to `instabox start`) — the MCP client never wakes a box itself, so a paused box would otherwise cost the whole session. If the binary is missing on the box and `autoInstallDevTools` is on, the helper then tries one `sudo -n env "PATH=<remotePath>" npm i -g chrome-devtools-mcp` (sudo rewrites PATH from `secure_path`, so the remote PATH is passed through explicitly), and all of its diagnostics go to stderr so the JSON-RPC framing on stdout stays clean. The budgets sit inside that timeout: 10 s for the presence check and 40 s for the install, both thrown away in `/dev/null`.
+With the switch on, the extension writes the helper and registers one MCP server named `instabox-devtools` whose `command` is that helper, so the remote `chrome-devtools-mcp` runs inside that fixed box over `instabox ssh`. Its `exposure` is `codemode` with a 180-second per-request timeout; before connecting, the helper makes sure the box is running (`instabox wake`, falling back to `instabox start`) — the MCP client never wakes a box itself, so a paused box would otherwise cost the whole session. If the binary is missing on the box and `autoInstallDevTools` is on, the helper then tries one `sudo -n env "PATH=<remotePath>" npm i -g chrome-devtools-mcp` (sudo rewrites PATH from `secure_path`, so the remote PATH is passed through explicitly), and all of its diagnostics go to stderr so the JSON-RPC framing on stdout stays clean. The budgets sit inside that timeout: each `wake`/`start` gets `timeout 60` when the box has the `timeout` command (the helper's own copy of the 60 s prepare budget), the presence check gets 10 s and the install 40 s, all thrown away in `/dev/null`.
 
-**`/instabox-devtools`** with no argument is `status`, and it prints three lines: the switch (`instabox-devtools: on (--instabox-devtools)` / `instabox-devtools: off (--instabox-devtools)`), the box that would be used together with whether the server is registered (`box: <name> (registered)` / `(not registered)`), and the candidate boxes (`candidates: …`). `on [box]` registers the server for that box (argument first, then `--instabox-devtools-box`, then `devToolsBox`); re-running `on` unregisters the old registration first, so the connection is new instead of reused. An unknown box name is refused and the current state is kept. `off` unregisters the server for the rest of the session: its tools become `exposure: "hidden"` (Pi cannot unregister a tool) and therefore disappear from codemode's `ALL_TOOLS` and `searchTools`, calls that are already in flight fail, earlier transcript messages do not change, and a later `on` opens a fresh connection.
+**`/instabox-devtools`** with no argument is `status`, and it prints five lines: the switch (`instabox-devtools: on (--instabox-devtools)` / `instabox-devtools: off (--instabox-devtools)`), the server registered in this session (`registration: <name> (via <source>)`, or `registration: (none)` when nothing is registered; `<source>` is `command` for a server registered by this command, otherwise the level that supplied the box — `session` / `flag` / `config`), the box bound to this session (`session binding: <name>` / `session binding: (unset)`), the box the next `on` or session start would use together with its source (`effective box: <name> (<source>)` / `effective box: (unset)`; the levels resolve `session` → `flag` → `config`), and the candidate boxes (`candidates: …`). The three middle lines stay separate on purpose: `reset` clears the session binding only, so `registration` keeps naming the server that is still running while `effective box` already shows where the next `on` would land. `on [box]` registers the server for that box (argument first, then the session binding, `--instabox-devtools-box`, `devToolsBox`) and, when a box argument is given, stores it as the session binding; re-running `on` unregisters the old registration first, so the connection is new instead of reused. An unknown box name is refused and the current state is kept. `off` unregisters the server for the rest of the session: its tools become `exposure: "hidden"` (Pi cannot unregister a tool) and therefore disappear from codemode's `ALL_TOOLS` and `searchTools`, calls that are already in flight fail, earlier transcript messages do not change, and a later `on` opens a fresh connection. `off` does **not** clear the session binding. `reset` clears the session binding only: the next `on` (and the next session start with the switch on) falls back to `--instabox-devtools-box` → `config.devToolsBox`, the switch keeps its state, and an already registered server stays registered.
 
 Its tools — DOM/accessibility snapshots, element screenshots, CSS cascade, network, console, traces — are not declared to the model. The model discovers them from a codemode script:
 
@@ -190,7 +196,7 @@ Because this server has `codemode` exposure, Pi activates codemode automatically
 - **Quiet by design:** a successful background sync says nothing at all — the tools simply show up, and the transcript carries no notification about the declaration. The only session-start warnings are "no usable sandbox" (`ls` empty or failing), a failed sync naming `/instabox-use <box>`, and a misconfigured DevTools switch (box missing, box not in `ls`, or `--instabox-devtools-box` without `--instabox-devtools`). Internal `[pi-instabox] …` stderr output and the `debug`-level half of the JSONL log (see [Logs](#logs)) are off by default; set `PI_INSTABOX_DEBUG=1` to see wakes, spawn argv and handshake internals. Box selection needs no switch: each tool call writes its `resolve` record at `info`.
 - **A fully paused fleet is still woken:** when no box is running, the first box from `instabox ls` is woken in the background and its template fetched — the wake happens on connect, so a cached box that is paused gets woken for the version check too; a wake failure degrades to that one warning, and the session is never blocked or held up.
 - **Desktop screenshots are expensive:** for browser work prefer the DevTools server when one is enabled; the namespace instructions tell the model the same.
-- **`box` covers desktop tools only:** it selects the sandbox for `instabox_desktop_*` calls. The DevTools server is bound to one box (`--instabox-devtools-box` first, then `devToolsBox`); switch it at runtime with `/instabox-devtools on <box>`, no reload needed.
+- **`box` covers desktop tools only:** it selects the sandbox for `instabox_desktop_*` calls. The DevTools server is bound to one box — session binding first, then `--instabox-devtools-box`, then `devToolsBox`; switch it at runtime with `/instabox-devtools on <box>` (which also updates the session binding), no reload needed, and `/instabox-devtools reset` drops the binding again.
 - **`off` leaves names behind:** `/instabox-devtools off` only hides the server's tools. Tool names that already appear in the transcript can still be tried by the model and then fail, because the connection is gone and Pi does not reload history.
 
 ## Development
