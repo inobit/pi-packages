@@ -2,7 +2,7 @@
  * @inobit/pi-instabox — `src/devtools.ts` 单测：helper 脚本内容（`set -eu`、stdout 纯净、
  * 先 `wake`/`start` 再检查、`--env PATH=`、ssh 形式、autoInstall 两种分支、单引号转义、
  * 脚本预算 < per-request timeout）、写盘幂等/`chmod`/失败只 warn、
- * `registerMcpServer` 参数（`exposure`/`timeout`/`description`）。全程内存文件系统，不落盘。
+ * `registerMcpServer` 参数（`exposure`/`timeout`/`description`/显式 box 覆盖）。全程内存文件系统，不落盘。
  */
 
 import path from "node:path";
@@ -321,5 +321,15 @@ describe("buildMcpServerConfig", () => {
 		expect(other.config.command).toBe(registration.config.command);
 		expect(other.config.description).not.toBe(registration.config.description);
 		expect(other.config.description).toContain("instabox 'libretv'");
+	});
+
+	it("显式 box 参数覆盖 cfg.devToolsBox（flag / `/instabox-devtools on` 的动态路径）", () => {
+		const dynamic = buildMcpServerConfig(cfg, PATHS, "libretv");
+		expect(dynamic.name).toBe(registration.name);
+		expect(dynamic.config.args).toEqual(["libretv", ...DEFAULT_CONFIG.devToolsArgs]);
+		expect(dynamic.config.description).toContain("instabox 'libretv'");
+		// cfg 本身不被写回：同一份配置可以反复构造不同 box 的注册
+		expect(cfg.devToolsBox).toBe("agent");
+		expect(buildMcpServerConfig(cfg, PATHS).config.args[0]).toBe("agent");
 	});
 });

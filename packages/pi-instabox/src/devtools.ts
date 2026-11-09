@@ -159,18 +159,23 @@ export interface DevToolsMcpServerRegistration {
 /**
  * 构造远端 `chrome-devtools-mcp` 的注册参数。
  *
- * `devToolsBox` 为空时调用方不该调用本函数（该能力整体不存在，方案 §4.3 验收③）；
+ * `box` 是唯一对应的箱名（flag / 命令解析后传入），缺省沿用 `cfg.devToolsBox`；为空时调用方
+ * 不该调用本函数（该能力整体不存在，方案 §4.3 验收③）。
  * `args` 每次新建数组，不与 `cfg.devToolsArgs` 共享引用。
  */
-export function buildMcpServerConfig(cfg: InstaboxConfig, paths: InstaboxPaths): DevToolsMcpServerRegistration {
+export function buildMcpServerConfig(
+	cfg: InstaboxConfig,
+	paths: InstaboxPaths,
+	box: string = cfg.devToolsBox,
+): DevToolsMcpServerRegistration {
 	// 双重 satisfies：本地细化类型 + 宿主 `McpServerConfig`（stdio 并集）。宿主增删字段或收窄
 	// `exposure` 时在编译期就炸，而不是留到 `registerMcpServer()` 或运行期。
 	const config = {
 		command: paths.helperScript,
-		args: [cfg.devToolsBox, ...cfg.devToolsArgs],
+		args: [box, ...cfg.devToolsArgs],
 		exposure: "codemode",
 		timeout: DEVTOOLS_REQUEST_TIMEOUT_SECONDS,
-		description: `Remote Chromium on instabox '${cfg.devToolsBox}' (fixed box): DOM/accessibility snapshots, clicks, element screenshots, CSS cascade, network, console, performance traces. Tools are not declared directly — discover them with describeNamespace("mcp__instabox_devtools") or searchTools("devtools").`,
+		description: `Remote Chromium on instabox '${box}' (fixed box): DOM/accessibility snapshots, clicks, element screenshots, CSS cascade, network, console, performance traces. Tools are not declared directly — discover them with describeNamespace("mcp__instabox_devtools") or searchTools("devtools").`,
 	} satisfies DevToolsMcpServerConfig satisfies McpServerConfig;
 
 	return { name: DEVTOOLS_SERVER_NAME, config };
