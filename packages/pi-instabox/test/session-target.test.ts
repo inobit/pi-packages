@@ -1,7 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
+	DEVTOOLS_TARGET_ENTRY,
 	TARGET_ENTRY,
+	devtoolsTargetEntryData,
 	isTargetEntry,
+	readDevtoolsTarget,
 	readTarget,
 	targetEntryData,
 	type SessionEntryLike,
@@ -12,6 +15,16 @@ const targetEntry = (box: string, at = "2026-01-01T00:00:00.000Z"): SessionEntry
 	customType: TARGET_ENTRY,
 	data: { box, at },
 });
+
+/** 分支上的一条 DevTools 绑定 entry（`reset` 为 true 时是清除标记） */
+const devtoolsEntry = (box: string, reset = false): SessionEntryLike => ({
+	type: "custom",
+	customType: DEVTOOLS_TARGET_ENTRY,
+	data: reset ? { box, at: "2026-01-01T00:00:00.000Z", reset: true } : { box, at: "2026-01-01T00:00:00.000Z" },
+});
+
+/** 清除标记（`reset` 子命令写的那种：`box` 空串 + `reset: true`） */
+const resetEntry: SessionEntryLike = devtoolsEntry("", true);
 
 const userEntry = (text: string): SessionEntryLike => ({ type: "message", data: { text } });
 const otherCustomEntry: SessionEntryLike = { type: "custom", customType: "pi-other", data: { box: "decoy" } };
@@ -96,5 +109,64 @@ describe("readTarget", () => {
 		// 对照：全量条目会读到「未来的」目标，传分支则读不到
 		expect(readTarget(allEntries)).toBe("agent");
 		expect(readTarget(branchAtFork)).toBeUndefined();
+	});
+});
+
+describe("devtoolsTargetEntryData", () => {
+	it("keeps the given timestamp and no reset flag for a real box", () => {
+		expect(devtoolsTargetEntryData("agent", "2026-02-03T04:05:06.789Z")).toEqual({
+			box: "agent",
+			at: "2026-02-03T04:05:06.789Z",
+		});
+	});
+
+	it("marks an empty box as a reset entry", () => {
+		const data = devtoolsTargetEntryData("", "2026-02-03T04:05:06.789Z");
+		expect(data).toEqual({ box: "", at: "2026-02-03T04:05:06.789Z", reset: true });
+	});
+
+	it("defaults at to an ISO timestamp", () => {
+		const data = devtoolsTargetEntryData("agent");
+		expect(data.box).toBe("agent");
+		expect(data.reset).toBeUndefined();
+		expect(data.at).toBe(new Date(data.at).toISOString());
+	});
+});
+
+describe("readDevtoolsTarget", () => {
+	it("returns undefined for an empty branch", () => {
+		expect(readDevtoolsTarget([])).toBeUndefined();
+	});
+
+	it("returns the box of the only binding", () => {
+		expect(readDevtoolsTarget([userEntry("hi"), devtoolsEntry("agent")])).toBe("agent");
+	});
+
+	it("returns the last binding on the branch", () => {
+		expect(readDevtoolsTarget([devtoolsEntry("agent"), userEntry("hi"), devtoolsEntry("general")])).toBe("general");
+	});
+
+	it("ignores other customType entries even when they carry a box field", () => {
+		// 桌面目标 entry 与 DevTools 绑定互不相干
+		expect(readDevtoolsTarget([devtoolsEntry("agent"), targetEntry("general")])).toBe("agent");
+		expect(readDevtoolsTarget([targetEntry("general"), otherCustomEntry])).toBeUndefined();
+	});
+
+	it("stops at a reset entry and does not look further back", () => {
+		expect(readDevtoolsTarget([devtoolsEntry("agent"), resetEntry])).toBeUndefined();
+		expect(readDevtoolsTarget([devtoolsEntry("agent"), userEntry("hi"), resetEntry, userEntry("hi")])).toBeUndefined();
+	});
+
+	it("a binding after a reset entry takes effect again", () => {
+		expect(readDevtoolsTarget([devtoolsEntry("agent"), resetEntry, devtoolsEntry("general")])).toBe("general");
+	});
+
+	it("ignores binding entries whose data or box is missing", () => {
+		const noData: SessionEntryLike = { type: "custom", customType: DEVTOOLS_TARGET_ENTRY };
+		const noBox: SessionEntryLike = { type: "custom", customType: DEVTOOLS_TARGET_ENTRY, data: { at: "2026-01-01T00:00:00.000Z" } };
+		expect(readDevtoolsTarget([noData])).toBeUndefined();
+		expect(readDevtoolsTarget([noBox])).toBeUndefined();
+		// 残缺条目不能遮蔽更早的有效绑定
+		expect(readDevtoolsTarget([devtoolsEntry("agent"), noData])).toBe("agent");
 	});
 });
