@@ -21,6 +21,8 @@
 import { CustomEditor, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 
+type EditorFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorComponent"]>>;
+
 // ---------- 纯逻辑（可单测） ----------
 
 /** 视口半页滚动量（与 TuiAltScreen 一致：floor(vh/2)） */
@@ -1153,6 +1155,8 @@ export default function (pi: ExtensionAPI) {
   let currentCtx: ExtensionContext | undefined;
   let ctxBroken = false;
   let savedInput = "";
+  let savedEditorFactory: EditorFactory | undefined;
+  let mainFactory: EditorFactory = (tui, theme, kb) => createEditor(undefined, tui, theme, kb);
   let latestTui: TUI | undefined;
   // 需求 B：最近一次 factory 收到的应用级 keybindings（terminal 通道回调无 kb 入参，需在外层记账）
   let latestKb: any;
@@ -1751,6 +1755,7 @@ export default function (pi: ExtensionAPI) {
     const anchor = tryCaptureAnchor();
     if (reading) {
       try { savedInput = ui.getEditorText?.() ?? ""; } catch { savedInput = ""; }
+      try { savedEditorFactory = ui.getEditorComponent?.(); } catch { savedEditorFactory = undefined; }
       safe(() => ui.setEditorComponent?.(readonlyEditorFactory(ui)));
       safe(() => ui.setEditorText?.(""));
       Promise.resolve().then(() => {
@@ -1758,7 +1763,9 @@ export default function (pi: ExtensionAPI) {
         scheduleScrollRestore(anchor);
       });
     } else {
-      safe(() => ui.setEditorComponent?.(mainFactory));
+      const restoreFactory = savedEditorFactory ?? mainFactory;
+      savedEditorFactory = undefined;
+      safe(() => ui.setEditorComponent?.(restoreFactory));
       Promise.resolve().then(() => {
         try { if (autoExpand) ui.setToolsExpanded?.(false); } catch {}
         scheduleScrollRestore(anchor);
@@ -1850,12 +1857,17 @@ export default function (pi: ExtensionAPI) {
   const terminalRoute = createReadingKeyRouter(routerIO, "terminal");
 
   // TUI inputListener 高可靠拦截（不依赖 editor focus）
-  const factory = (tui: TUI, theme: any, kb: any) => {
-    let ed: ScrollReaderEditor;
-    try {
-      ed = new ScrollReaderEditor(tui, theme, kb);
-    } catch {
-      ed = new ScrollReaderEditor(tui, theme ?? {}, kb ?? {});
+  const createEditor = (previous: EditorFactory | undefined, tui: TUI, theme: any, kb: any): ScrollReaderEditor => {
+    let ed: ScrollReaderEditor | undefined;
+    if (previous) {
+      try { ed = previous(tui, theme, kb) as ScrollReaderEditor; } catch { ed = undefined; }
+    }
+    if (!ed) {
+      try {
+        ed = new ScrollReaderEditor(tui, theme, kb);
+      } catch {
+        ed = new ScrollReaderEditor(tui, theme ?? {}, kb ?? {});
+      }
     }
     try { latestTui = tui; } catch {}
     // dialogOpen 焦点比对基准：登记 reader 自己创建的最新编辑器实例
@@ -1869,7 +1881,6 @@ export default function (pi: ExtensionAPI) {
     } catch {}
     return ed;
   };
-  const mainFactory = (tui: TUI, theme: any, kb: any) => factory(tui, theme, kb);
   const readonlyEditorFactory = (ui: any) => {
     const fg = themeFg(ui?.theme);
     return (tui: TUI, theme: any, kb: any) => {
@@ -1919,16 +1930,21 @@ export default function (pi: ExtensionAPI) {
     clearSearchUi();
     lastSemanticRow = null;
     savedInput = "";
+    savedEditorFactory = undefined;
     // 新会话聊天树重建，工具展开回到核心默认（收拢）；作废在途恢复监视器
     toolsExpandedMirror = false;
     advanceScrollGen();
     // 配置常驻缓存，reload / 新会话时重新读取
     __resetNavConfigCacheForTest();
     try {
-      ctx.ui.setEditorComponent((tui, theme, kb) => {
-        latestTui = tui;
-        return factory(tui, theme, kb);
-      });
+      const installed = ctx.ui.getEditorComponent?.();
+      if (installed !== mainFactory) {
+        const previous = installed;
+        mainFactory = (tui, theme, kb) => createEditor(previous, tui, theme, kb);
+      }
+    } catch {}
+    try {
+      ctx.ui.setEditorComponent(mainFactory);
     } catch {}
     installTerminalListener(ctx);
   };

@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.4] - 2026-11-10
+
+- fix: leaving READING dropped the whole editor decoration chain, so extensions that wrap the prompt editor (e.g. `pi-vim-editor`) silently disappeared until `/reload` — vim keys, the border mode label and cursor shapes all stopped working
+  - Root cause A: `applyReaderUI(false)` always reinstalled `mainFactory`. pi's contract is decorate-not-replace (`getEditorComponent()` → wrap → `setEditorComponent()`), and `pi-vim-editor` installs only once at `session_start`, so nothing restored the wrapper that READING had replaced
+  - Root cause B: the editor factory always constructed `ScrollReaderEditor` itself. When the reader is loaded after another editor extension (for example vendored under `~/.pi/agent/extensions/`, which loads after packages), the `session_start` install wiped that extension's factory before the first toggle
+  - Fix: `applyReaderUI` remembers `ui.getEditorComponent()` on entry and restores it on exit (`mainFactory` stays as the fallback); `session_start` now wraps the installed factory into `mainFactory`, and `createEditor(previous, …)` calls it first, constructing `ScrollReaderEditor` only when nothing is installed
+  - When the installed factory is already the current `mainFactory`, the wrapper is kept as-is (there is nothing new to wrap), so a repeated `session_start` neither discards the previous chain nor delegates to itself
+  - Verified with a mocked host (vim installed first, reader installed first, a `/reload`-style reset, and a repeated `session_start` without reset): three round trips keep exactly one decoration layer and restore the typed input
+
 ## [0.3.3] - 2026-09-20
 
 - fix: search (`/` plus `n`/`N`) silently did nothing after upgrading to pi 0.86.0
