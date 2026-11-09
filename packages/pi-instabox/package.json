@@ -1,6 +1,6 @@
 {
   "name": "@inobit/pi-instabox",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drive instabox sandboxes from Pi: `instabox_desktop_*` computer-use tools with per-call sandbox targeting, plus a config-driven remote `chrome-devtools-mcp` server.",
   "type": "module",
   "exports": {

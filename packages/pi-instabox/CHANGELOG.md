@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.1] - 2026-11-09
+
+- feat: expose desktop tools as deferred so they stay out of the codemode description
+- feat: derive the desktop discovery hint from the remote `initialize` instructions (first line, truncated to 250 chars, namespace-description fallback) so box upgrades carry through without code changes
+
 ## [0.1.0] - 2026-11-09
 
 - feat: nine `instabox_desktop_*` tools generated from the target box's remote `tools/list`, each taking an optional `box` parameter and returning `[box=<name>]` as the first line of every result
