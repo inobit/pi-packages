@@ -9,6 +9,7 @@
 import type { AgentToolResult, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import type { BoxInfo } from "../src/boxes.ts";
+import { createMemoryLogger, setLogger } from "../src/log.ts";
 import type { Pool, PoolGetOptions } from "../src/pool.ts";
 import type { CallToolResult, InitializeResult, RemoteClient, RemoteTool } from "../src/remote.ts";
 import type { ResolveResult } from "../src/resolve.ts";
@@ -536,5 +537,52 @@ describe("execute：失败路径（一律 isError，绝不 throw）", () => {
 		expect(result.isError).toBe(true);
 		expect(result.content[0]).toMatchObject({ type: "text" });
 		expect(JSON.stringify(result.content)).toContain("aborted");
+	});
+});
+
+describe("埋点：tool.call", () => {
+	it("每次 execute 恰好一条（成功 / 远端 isError / 解析失败 / 抛错四条路径都在 finally 落账）", async () => {
+		const logger = createMemoryLogger();
+		setLogger(logger);
+		try {
+			const success = build({ pool: fakePool({ client: new FakeClient(async () => ({ content: [] })) }).pool });
+			await run(toolNamed(success.tools, "click"), {});
+
+			const remoteError = build({
+				pool: fakePool({ client: new FakeClient(async () => ({ content: [], isError: true })) }).pool,
+			});
+			await run(toolNamed(remoteError.tools, "screenshot"), {});
+
+			const unresolved = build({
+				resolve: async () => ({ ok: false, kind: "no-boxes", message: "instabox ls returned no boxes", candidates: [] }),
+			});
+			await run(toolNamed(unresolved.tools, "click"), {});
+
+			const throwing = build({ pool: fakePool({ throwWith: new Error("boom-pool") }).pool });
+			await run(toolNamed(throwing.tools, "press_key"), {});
+		} finally {
+			setLogger(undefined);
+		}
+
+		const calls = logger.records.filter((record) => record.event === "tool.call");
+		expect(calls).toHaveLength(4);
+		expect(calls.every((record) => record.level === "info")).toBe(true);
+
+		expect(calls[0]?.fields).toMatchObject({
+			tool: "click",
+			box: "agent",
+			ok: true,
+			isError: false,
+		});
+		expect(calls[1]?.fields).toMatchObject({ tool: "screenshot", box: "agent", ok: false, isError: true });
+		// 解析失败：没拿到箱，`box` 字段整个缺席（只留命中 0 的结论）
+		expect(calls[2]?.fields).not.toHaveProperty("box");
+		expect(calls[2]?.fields).toMatchObject({ ok: false, isError: true });
+		expect(calls[3]?.fields).toMatchObject({ ok: false, isError: true });
+		// 耗时是一个非负数字（不记参数与结果内容）
+		for (const call of calls) {
+			expect(typeof call.fields?.["ms"]).toBe("number");
+			expect(Number(call.fields?.["ms"])).toBeGreaterThanOrEqual(0);
+		}
 	});
 });

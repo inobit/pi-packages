@@ -21,6 +21,7 @@
  */
 
 import { spawn as nodeSpawn } from "node:child_process";
+import { logEvent } from "./log.ts";
 
 /**
  * 请求的 MCP 协议版本。取 T10 spike 实测的远端版本（`open-computer-use` 0.3.6-instabox.1
@@ -407,11 +408,19 @@ class RemoteStdioClient implements RemoteClient {
 
 	async listTools(signal?: AbortSignal): Promise<RemoteTool[]> {
 		await this.initialize(signal);
-		const result = await this.request("tools/list", {}, this.timeouts.listTools, signal);
-		if (!isRecord(result) || !Array.isArray(result["tools"])) {
-			throw this.protocolFailure("tools/list returned no tools array");
+		const startedAt = this.now();
+		try {
+			const result = await this.request("tools/list", {}, this.timeouts.listTools, signal);
+			if (!isRecord(result) || !Array.isArray(result["tools"])) {
+				throw this.protocolFailure("tools/list returned no tools array");
+			}
+			const tools = toRemoteTools(result["tools"]);
+			logEvent("remote.listTools", { ok: true, count: tools.length, ms: this.now() - startedAt });
+			return tools;
+		} catch (error) {
+			logEvent("remote.listTools", { ok: false, count: 0, ms: this.now() - startedAt });
+			throw error;
 		}
-		return toRemoteTools(result["tools"]);
 	}
 
 	async callTool(
@@ -420,9 +429,23 @@ class RemoteStdioClient implements RemoteClient {
 		signal?: AbortSignal,
 	): Promise<CallToolResult> {
 		await this.initialize(signal);
-		const result = await this.request("tools/call", { name, arguments: args }, this.timeouts.callTool, signal);
-		if (!isRecord(result)) throw this.protocolFailure(`tools/call ${name} returned a non-object result`);
-		return result as CallToolResult;
+		const startedAt = this.now();
+		try {
+			const result = await this.request("tools/call", { name, arguments: args }, this.timeouts.callTool, signal);
+			if (!isRecord(result)) throw this.protocolFailure(`tools/call ${name} returned a non-object result`);
+			const call = result as CallToolResult;
+			// `isError: true` 是远端报的业务失败（协议上仍是成功响应），单独记一笔便于对比成功率
+			logEvent("remote.call", {
+				tool: name,
+				ok: true,
+				ms: this.now() - startedAt,
+				isError: call.isError === true ? true : undefined,
+			});
+			return call;
+		} catch (error) {
+			logEvent("remote.call", { tool: name, ok: false, ms: this.now() - startedAt });
+			throw error;
+		}
 	}
 
 	close(): void {
@@ -439,6 +462,7 @@ class RemoteStdioClient implements RemoteClient {
 	 */
 	private async runHandshake(signal?: AbortSignal): Promise<InitializeResult> {
 		if (this.dead) throw this.refuseDead("initialize");
+		const startedAt = this.now();
 		try {
 			this.startChild();
 			const result = await this.request(
@@ -449,11 +473,20 @@ class RemoteStdioClient implements RemoteClient {
 			);
 			if (!isRecord(result)) throw this.protocolFailure("initialize returned a non-object result");
 			this.notify("notifications/initialized", {});
-			return result as InitializeResult;
+			const initialized = result as InitializeResult;
+			logEvent("remote.initialize", {
+				ok: true,
+				ms: this.now() - startedAt,
+				protocolVersion: typeof initialized.protocolVersion === "string" ? initialized.protocolVersion : undefined,
+				serverInfoVersion:
+					typeof initialized.serverInfo?.version === "string" ? initialized.serverInfo.version : undefined,
+			});
+			return initialized;
 		} catch (error) {
 			const remoteError = error instanceof RemoteError ? error : new RemoteError(messageOf(error), "protocol");
 			// 握手失败即整条连接不可用：标记 dead，让 pool 下次重建
 			this.failAll(remoteError);
+			logEvent("remote.initialize", { ok: false, ms: this.now() - startedAt });
 			throw remoteError;
 		}
 	}
@@ -461,6 +494,8 @@ class RemoteStdioClient implements RemoteClient {
 	/** 建子进程并挂上三个事件源；同时臂化 connect 预算。 */
 	private startChild(): void {
 		if (this.child !== undefined) return;
+		// 只记命令与 argv（不含 env / token）；只在 debug 级别落盘
+		logEvent("remote.spawn", { command: this.command, args: [...this.args] }, "debug");
 		let child: RemoteChild;
 		try {
 			child = this.spawnFn(this.command, this.args, this.env === undefined ? {} : { env: this.env });

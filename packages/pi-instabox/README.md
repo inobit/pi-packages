@@ -13,7 +13,7 @@ Drive instabox sandboxes from Pi sessions: nine `instabox_desktop_*` computer-us
 
 - **`@earendil-works/pi-coding-agent >= 0.99.0`** — a hard floor. `exposure`, `namespace`, `registerMcpServer` and the codemode/MCP support this package builds on landed in 0.99.0; older hosts cannot load it.
 - Node.js **>= 24**.
-- The `instabox` CLI on `PATH` (`instabox version`, `instabox ls --json`, `instabox ssh`, `instabox wake|start|resume`, `instabox exec`). A missing CLI means the extension registers nothing — no tools, no commands, no MCP server, no files on disk — and shows one warning per session; a first `instabox version` probe that merely times out is retried once at session start with a larger budget before that verdict.
+- The `instabox` CLI on `PATH` (`instabox version`, `instabox ls --json`, `instabox ssh`, `instabox wake|start|resume`, `instabox exec`). A missing CLI means the extension registers nothing — no tools, no commands, no MCP server, no runtime files (no template cache, no helper) — and shows one warning per session; the only thing written is the single `cli.probe` record in the event log. A first `instabox version` probe that merely times out is retried once at session start with a larger budget before that verdict.
 - Sandboxes whose template ships `instabox-computer-use` (the remote MCP server this extension drives over `instabox ssh <box> -- instabox-computer-use mcp`).
 
 ## Installation
@@ -41,6 +41,8 @@ Levels 1–3 are strict: an unknown name is an error and a message naming severa
 **`/instabox-use [box]`** — set or show this session's target box. Without arguments it prints the current target and the candidate boxes. An unknown name is refused and the previous target is kept. The target is stored as a custom session entry (never injected into the LLM context, scoped to the current branch, so `/tree` switches and `--continue` restore it). If no desktop tool is registered yet (cold start, no cache), the command also wakes the box, fetches `tools/list` and registers the tools — this is the retry path when the box was not running at session start.
 
 **`/instabox-status`** — one-shot diagnostics: config summary, session target, resolved target and how it was resolved, registered `instabox_desktop_*` tools with their exposure, which box's cached template the declarations came from (`tool declarations: from the cached template of box "…"`), active tools, codemode state, and the MCP servers registered by extensions.
+
+**Where the tools come from.** On load, a cache hit registers the desktop tools silently — no ssh, no notification. Otherwise the session start decides in the background: with a cache it re-validates the box the declarations came from (session target → `defaultBox` → most recently fetched box, each only if that box has a cache entry); with no cache it lists boxes and takes the first box in `state === "running"`, which it never wakes. If every box is paused, the first box in the list is woken in the background — no progress UI, the session is not blocked — and its `tools/list` is fetched. Success is silent: the tools simply appear. You only see a warning when there is no usable sandbox at all (`instabox ls` empty or failing) or when the sync itself fails; both are once per session and the latter names `/instabox-use <box>`.
 
 **codemode prerequisite.** `codemode` exposure means the tools are registered and callable, but they are not declared to the model directly — the model reaches them from codemode scripts (`describeTool`, `searchTools`, `describeNamespace`). The extension never activates codemode for you, and it only judges the state once desktop tools are registered (at session start, and on every `/instabox-status`). If codemode is inactive and no `codemode`-exposure MCP server exists, you get one warning per session with the fix: start with `pi --tools +codemode`, or set `"defaultTools": ["+codemode"]` in settings. If the session has no `codemode` tool at all (filtered out by `--tools` / `--exclude-tools`, or a built-in extension replaced), a different one-time warning says the desktop tools are not callable in this session. With `devToolsBox` set, Pi activates codemode by itself (see below), so neither warning appears. `/instabox-use` and `/instabox-status` keep working either way.
 
@@ -97,12 +99,60 @@ Environment variables (empty means unset): `INSTABOX_MCP_DEFAULT_BOX`, `INSTABOX
 | Path | What |
 | --- | --- |
 | `<agentDir>/extensions/pi-instabox/config.json` | Configuration (the global layer above) |
-| `<agentDir>/pi-instabox/templates.json` | Per-box template cache: each box's `tools/list` plus the remote `serverInfo.version` and `fetchedAt`. Load-time declarations come from this file alone (no ssh), and the box they come from is picked cache-first: the session target (only if that box has a cache entry) → `defaultBox` (same condition) → the most recently fetched box in the cache; the resolution chain (last user message → session target → `defaultBox` → first `instabox ls` box) only runs when the cache is empty. Each session start then validates that box with one handshake: the same `serverInfo.version` reuses the cache untouched, a different version refetches `tools/list` and rewrites that box's entry, and a 168-hour TTL refetches regardless of version. The version compared is whatever that handshake returns — there is nothing to configure |
+| `<agentDir>/pi-instabox/templates.json` | Per-box template cache: each box's `tools/list` plus the remote `serverInfo.version` and `fetchedAt`. Load-time declarations come from this file alone (no ssh, no notification), and the box they come from is picked cache-first: the session target (only if that box has a cache entry) → `defaultBox` (same condition) → the most recently fetched box in the cache. With an empty cache the session start does not use the resolution chain: it takes the first box in `state === "running"` (never woken) or, when no box is running, the first box in the list, which it wakes in the background (no progress UI). Each session start then validates the chosen box with one handshake: the same `serverInfo.version` reuses the cache untouched, a different version refetches `tools/list` and rewrites that box's entry, a 168-hour TTL refetches regardless of version, and a failed validation silently falls back to the cached tools. The version compared is whatever that handshake returns — there is nothing to configure |
 | `<agentDir>/pi-instabox/bin/devtools-connect.sh` | Generated (mode `0755`) helper that connects the remote `chrome-devtools-mcp`. Only written when `devToolsBox` is set; safe to delete, it comes back with `chmod 0755` on the next load |
+| `<agentDir>/logs/pi-instabox/pi-instabox.jsonl` | Event log (`0700` directory, `0600` file): one JSON record per event, rotated at 1 MiB into `.1` … `.3`. Logging starts at extension load (config and paths resolved, before the CLI probe), so a failed probe is on record too; safe to delete. See [Logs](#logs) |
+
+## Logs
+
+Every session appends structured events to `<agentDir>/logs/pi-instabox/pi-instabox.jsonl` (directory `0700`, file `0600`) from the moment the extension loads — config and paths are resolved first, then logging is wired, and only then does the `instabox version` probe run. A probe that fails or times out is therefore on record too; a session with no CLI writes exactly one `cli.probe` record and nothing else. Assembly failures also write log records only: no template cache, no helper, no `bin/`.
+
+- **Format:** one JSON record per line — `{"ts":"2026-11-09T12:00:00.000Z","level":"info","event":"session.start","fields":{…}}`. Event data lives under `fields` rather than being flattened into the record: `undefined` values are dropped, string values are truncated at 2000 characters, and a field whose key matches `token|secret|password|api[-_]?key` is written as `"[redacted]"`. Messages and payloads are never logged — events carry names, states, counts and timings (`box`, `source`, `mentions`, `candidates`, `ms`, …), never prompt text or tool arguments.
+- **Levels:** `info` by default (lifecycle plus one `resolve` record per tool call, so box selection can be audited after the fact without any switch). `PI_INSTABOX_DEBUG=1` switches the file to `debug`, which additionally records pool state samples, spawn argv, template cache hits and per-tree target changes. `warn`/`error` records are written at both levels, so failures never disappear because you left debug off. `off` exists only in code (`createFileLogger({ level: "off" })`); there is no switch for it.
+- **Rotation:** at 1 MiB the file is rolled into `pi-instabox.jsonl.1` … `pi-instabox.jsonl.3` (`.1` is the newest). The size check runs after the write, so a freshly rolled main file is empty and reappears on the next event.
+- **Write failures never reach the session:** a directory or append failure is reported once through the internal debug channel and swallowed; logging is never a precondition for the tools working.
+
+| Event | Level | Fields |
+| --- | --- | --- |
+| `cli.probe` | info / warn | `ok`, `reason` (`missing` / `timeout` / `error`), `version`, `ms` |
+| `cli.ls` | info | `ok`, `count`, `reason`, `ms` |
+| `cli.lifecycle` | info | `command` (`start` / `wake` / `resume`), `box`, `ok`, `reason`, `ms` |
+| `cli.exec` | info | `box`, `timeoutSec`, `ok`, `ms` |
+| `load.assembled` | info | `cacheHit`, `box`, `tools` (declared at load time) |
+| `session.start` | info | `target`, `source` (session start reason), `mode` |
+| `session.tree` | debug | `target` |
+| `session.shutdown` | info | `open` (connections disposed) |
+| `resolve` | info | `param`, `source` (`param` / `message` / `session` / `config` / `first`), `box`, `mentions`, `candidates` (first 10), `degraded` (a missing `defaultBox` was skipped) |
+| `resolve.fail` | warn | `kind` (`no-boxes` / `invalid-param` / `invalid-session` / `ambiguous` / `invalid-config`), `message`, `candidates` (first 10) |
+| `pool.connect` | info | `box`, `ok`, `ms`, `error` |
+| `pool.wake` | info / warn | `box`, `step` (`wake` / `start` / `resume`), `ok`, `ms` |
+| `pool.state` | debug | `box`, `state`, `desiredState` |
+| `pool.reuse` | debug | `box` |
+| `pool.dispose` | debug | `box` |
+| `remote.spawn` | debug | `command`, `args` |
+| `remote.initialize` | info | `ok`, `ms`, `protocolVersion`, `serverInfoVersion` |
+| `remote.listTools` | info | `ok`, `count`, `ms` |
+| `remote.call` | info | `tool`, `ok`, `ms`, `isError` |
+| `template.hit` | debug | `box`, `serverInfoVersion`, `stale` (TTL expired) |
+| `template.refetch` | info | `box`, `reason`, `ms`, `tools` |
+| `template.fail` | warn | `box`, `error`, `stale` (a cached template was kept) |
+| `tool.call` | info | `tool`, `box`, `ok`, `ms`, `isError` |
+| `codemode` | debug | `state` (`active` / `inactive` / `missing`), `server` (a codemode-exposure MCP server exists) |
+| `devtools.register` | info | `box`, `ok` |
+| `devtools.helper` | info | `ok`, `path`, `error` |
+| `error` | warn | `where`, `message` (a swallowed failure: session branch, `session_start` background task, `ui.notify`) |
+
+**Diagnosing a wrong box.** The successful `resolve` records are `info`-level, so they are on disk at the default level — no switch needed, just filter:
+
+```bash
+grep '"event":"resolve"' ~/.pi/agent/logs/pi-instabox/pi-instabox.jsonl
+```
+
+Each record says which of the five levels won (`source`), which box that produced (`box`), every box name found in the last user message (`mentions` — recorded even when it is empty, and empty is exactly what sends the call to the next level), the names that were in play (`candidates`) and whether a stale `defaultBox` was skipped (`degraded`). Hard failures land right next to them as `resolve.fail` with `kind` and `candidates`: an unknown `box` parameter, an unknown session target, a message naming two boxes, or an empty box list. `PI_INSTABOX_DEBUG=1` adds the detail around the decision (pool state samples, spawn argv, template hits), not the decision itself.
 
 ## DevTools MCP
 
-`devToolsBox` empty → the capability is absent: no helper script, no MCP server, no directory created. `devToolsBox` set → the extension writes the helper and registers one MCP server named `instabox-devtools` whose `command` is that helper, so the remote `chrome-devtools-mcp` runs inside that fixed box over `instabox ssh`. Its `exposure` is `codemode` with a 120-second per-request timeout; if the binary is missing on the box and `autoInstallDevTools` is on, the helper tries one `sudo -n env "PATH=<remotePath>" npm i -g chrome-devtools-mcp` (sudo rewrites PATH from `secure_path`, so the remote PATH is passed through explicitly), and all of its diagnostics go to stderr so the JSON-RPC framing on stdout stays clean.
+`devToolsBox` empty → the capability is absent: no helper script, no MCP server, no directory created. `devToolsBox` set → the extension writes the helper and registers one MCP server named `instabox-devtools` whose `command` is that helper, so the remote `chrome-devtools-mcp` runs inside that fixed box over `instabox ssh`. Its `exposure` is `codemode` with a 180-second per-request timeout; before connecting, the helper wakes the target box first (`instabox wake`, falling back to `instabox start`) — the MCP client never wakes a box itself, so a paused box would otherwise cost the whole session. If the binary is missing on the box and `autoInstallDevTools` is on, the helper then tries one `sudo -n env "PATH=<remotePath>" npm i -g chrome-devtools-mcp` (sudo rewrites PATH from `secure_path`, so the remote PATH is passed through explicitly), and all of its diagnostics go to stderr so the JSON-RPC framing on stdout stays clean. The budgets sit inside that timeout: 10 s for the presence check and 40 s for the install, both thrown away in `/dev/null`.
 
 Its tools — DOM/accessibility snapshots, element screenshots, CSS cascade, network, console, traces — are not declared to the model. The model discovers them from a codemode script:
 
@@ -113,12 +163,16 @@ const ns = describeNamespace("mcp__instabox_devtools"); // { name, tools }
 
 Because this server has `codemode` exposure, Pi activates codemode automatically, which is also why desktop tools become reachable in the same session.
 
+**If the first connection fails, Pi does not retry it.** The MCP server stays dead for the rest of the session, so the namespace yields nothing until you reconnect it with `/mcp` (or restart the session). The helper therefore does its own recovery before handing over to `instabox ssh`: `wake` first, `start` if that fails. A wake/start that fails too is not fatal — the following step reports the real error on stderr.
+
 ## Compatibility & Limitations
 
 - **Host floor:** `pi-coding-agent >= 0.99.0` (see Requirements). The package pins the types it is compiled against, so an upgrade shows up as a `check` failure rather than a runtime surprise.
 - **Your tool selection is yours:** the extension never calls `setActiveTools`, never writes `settings.json` and never edits `defaultTools`. It only reports the codemode state and the command that fixes it.
 - **codemode inactive means uncallable:** the tools are registered but unreachable while codemode is off, and the model cannot see their names outside codemode. See the prerequisite in Usage.
 - **Tool sets follow the template, not the extension:** definitions come from the cached `tools/list` of the box they came from. Different boxes may run different `instabox-computer-use` versions, so the set and the schemas can differ per box. Validation is one handshake per session start: the same remote version keeps the cached tools as they are, a different version refetches `tools/list` and rewrites the entry, and a 168-hour TTL refetches on its own. Names are stable (`instabox_desktop_<remote_name>`), so a codemode script that names a tool keeps working across versions.
+- **Quiet by design:** a successful background sync says nothing at all — the tools simply show up, and the transcript carries no notification about the declaration. The only session-start warnings are "no usable sandbox" (`ls` empty or failing) and a failed sync naming `/instabox-use <box>`. Internal `[pi-instabox] …` stderr output and the `debug`-level half of the JSONL log (see [Logs](#logs)) are off by default; set `PI_INSTABOX_DEBUG=1` to see wakes, spawn argv and handshake internals. Box selection needs no switch: each tool call writes its `resolve` record at `info`.
+- **A fully paused fleet is still woken:** when no box is running, the first box from `instabox ls` is woken in the background and its template fetched; a wake failure degrades to that one warning, and the session is never blocked or held up.
 - **Desktop screenshots are expensive:** for browser work prefer the DevTools server when one is configured; the namespace instructions tell the model the same.
 - **`box` covers desktop tools only:** it selects the sandbox for `instabox_desktop_*` calls. The DevTools server is bound to `devToolsBox` and changing it requires reloading the extension.
 

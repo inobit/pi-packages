@@ -1,13 +1,22 @@
 /**
  * @inobit/pi-instabox — `src/resolve.ts` 单测：5 级解析链逐级命中/逐级失败、
  * 歧义不猜、参数与会话目标硬错误不降级、配置缺失的 skip/fail 两种语义、
- * 精确 token 匹配（子串/大小写/分隔符不误判）、空 `ls` 结果。
+ * 精确 token 匹配（子串/大小写/分隔符不误判）、空 `ls` 结果、
+ * `resolve` 埋点在默认 `info` 级别下即落盘。
  *
- * 全部是纯函数调用：不 spawn CLI、不读文件、不联网。
+ * 全部是纯函数调用：不 spawn CLI、不读写真实文件（日志走注入的假写入面）、不联网。
  */
 
 import { describe, expect, it } from "vitest";
 import type { BoxInfo } from "../src/boxes.ts";
+import {
+	type LogFileSystem,
+	type LogRecord,
+	createFileLogger,
+	createMemoryLogger,
+	logEvent,
+	setLogger,
+} from "../src/log.ts";
 import { findBoxMentions, resolveBox, type ResolveBoxInput } from "../src/resolve.ts";
 
 /** 构造一条 `ls` 结果（只有 `name` 参与解析，其余字段按未知态填） */
@@ -26,6 +35,31 @@ const NAMES = BOXES.map((b) => b.name);
 
 /** 只给 `boxes` 的最小输入 */
 const input = (patch: Partial<ResolveBoxInput> = {}): ResolveBoxInput => ({ boxes: BOXES, ...patch });
+
+/** 假写入面：内容留在内存里，`lines()` 按 JSONL 拆行（不碰真实磁盘）。 */
+function fakeLogIo(): LogFileSystem & { lines(): string[] } {
+	const files = new Map<string, string>();
+	return {
+		mkdir() {},
+		append(file, line) {
+			files.set(file, (files.get(file) ?? "") + line);
+		},
+		rename(from, to) {
+			files.set(to, files.get(from) ?? "");
+			files.delete(from);
+		},
+		exists(file) {
+			return files.has(file);
+		},
+		size(file) {
+			return Buffer.byteLength(files.get(file) ?? "", "utf8");
+		},
+		setMode() {},
+		lines() {
+			return [...files.values()].join("").split("\n").filter((line) => line !== "");
+		},
+	};
+}
 
 describe("findBoxMentions", () => {
 	it("finds a single exact token", () => {
@@ -398,5 +432,74 @@ describe("resolveBox — precedence matrix and duplicates", () => {
 		expect(invalid.ok).toBe(false);
 		if (invalid.ok) return;
 		expect(invalid.candidates).toEqual(["agent", "general"]);
+	});
+});
+
+describe("埋点", () => {
+	it("resolve / resolve.fail 记下命中的箱名、提及与候选（零命中与降级各一条）", () => {
+		const logger = createMemoryLogger();
+		setLogger(logger);
+		try {
+			// 1) 消息命中一台；2) 没有任何提及；3) 配置写错降级到第一台；4) 参数硬错误
+			resolveBox(input({ lastUserMessage: "screenshot on agent please" }));
+			resolveBox(input({ lastUserMessage: "just take a screenshot" }));
+			resolveBox(input({ configDefaultBox: "ghost" }));
+			resolveBox(input({ paramBox: "ghost" }));
+		} finally {
+			setLogger(undefined);
+		}
+
+		const resolved = logger.records.filter((record) => record.event === "resolve");
+		expect(resolved).toHaveLength(3);
+		expect(resolved.every((record) => record.level === "info")).toBe(true);
+		expect(resolved[0]?.fields).toEqual({
+			source: "message",
+			box: "agent",
+			mentions: ["agent"],
+			candidates: NAMES,
+			degraded: false,
+		});
+		// 零命中也会落一条（分析箱提取的关键样本），`param` 未传时整个键缺席
+		expect(resolved[1]?.fields).toEqual({
+			source: "first",
+			box: "general",
+			mentions: [],
+			candidates: NAMES,
+			degraded: false,
+		});
+		// 配置 `defaultBox` 写错：降级到 ls 第一台，degraded 标出来
+		expect(resolved[2]?.fields).toEqual({
+			source: "first",
+			box: "general",
+			mentions: [],
+			candidates: NAMES,
+			degraded: true,
+		});
+
+		const failed = logger.records.filter((record) => record.event === "resolve.fail");
+		expect(failed).toHaveLength(1);
+		expect(failed[0]?.level).toBe("warn");
+		expect(failed[0]?.fields).toMatchObject({ kind: "invalid-param", candidates: NAMES });
+		expect(String(failed[0]?.fields?.["message"])).toContain('unknown box "ghost"');
+	});
+
+	it("默认 info 级别的文件日志仍然记下 resolve（不靠 PI_INSTABOX_DEBUG）", () => {
+		// 走 `createFileLogger` 的级别过滤路径（不传 level ⇒ 默认 info）：同一批事件里
+		// `resolve` 必须落盘，`debug` 级事件必须被滤掉，证明过滤开着而 resolve 已升到 info。
+		const io = fakeLogIo();
+		const logger = createFileLogger({ dir: "/mem/agent/logs/pi-instabox", fs: io });
+		setLogger(logger);
+		try {
+			resolveBox(input({ lastUserMessage: "screenshot on agent please" }));
+			// 对照组：debug 级事件在默认级别下不该出现
+			logEvent("debug.probe", { box: "agent" }, "debug");
+		} finally {
+			setLogger(undefined);
+		}
+
+		const records = io.lines().map((line) => JSON.parse(line) as LogRecord);
+		expect(records.map((record) => record.event)).toEqual(["resolve"]);
+		expect(records[0]?.level).toBe("info");
+		expect(records[0]?.fields).toMatchObject({ source: "message", box: "agent", degraded: false });
 	});
 });

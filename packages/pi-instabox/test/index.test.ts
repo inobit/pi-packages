@@ -3,7 +3,8 @@
  *
  * 用手写假 `pi`（记录 `registerTool`/`registerCommand`/`registerEntryRenderer`/`registerMcpServer`/
  * `on`/`appendEntry`/`setActiveTools`/`getAllTools`/`getActiveTools`/`getMcpServers`/`exec`）验证：
- * - 无 CLI：零工具/零命令/零 MCP，`session_start` 恰一条 warning；
+ * - 无 CLI：零工具/零命令/零 MCP、无运行期目录（`templates.json` / `bin/`），只落一条
+ *   `cli.probe`（`ok:false`）日志，`session_start` 恰一条 warning；
  * - 有 CLI + 缓存命中：加载期即注册（且**不跑 `ls`**）、2 个命令、1 个 renderer、2 个事件；
  * - **`setActiveTools` 从未被调用**（裁决 V2；每个用例的 teardown 都断言一次）；
  * - `session_start` **不 await** 后台拉取（fire-and-forget），后台完成后才注册/提示；
@@ -16,7 +17,10 @@
  *   （无缓存 + suspended → 唤醒 → 拉模板 → 注册）；
  * - 后台拉取失败给一条可操作提示，且全程零唤醒；
  * - `session_tree` 后（实时读分支）目标更新；
- * - `/instabox-status` 打印配置/目标/工具声明来源/codemode 三态/MCP server。
+ * - `/instabox-status` 打印配置/目标/工具声明来源/codemode 三态/MCP server；
+ * - 文件日志的接线：**探测之前**就按 `<agentDir>/logs/pi-instabox` 建 logger（日志级别随
+ *   `PI_INSTABOX_DEBUG`），因此 `cli.probe` 先于 `load.assembled` 落盘；无 CLI 时同样只写探测记录、
+ *   不建运行期目录；`VITEST` 下默认不建；`session_shutdown` 后复位。
  *
  * 全部离线：`pi.exec` 是假实现（只回答 `version` / `ls` / `start`），远端 `RemoteClient` 由
  * `deps.clientFactory` 注入假实现（**绝不 spawn**），临时目录取代真实的 `<agentDir>`。
@@ -51,7 +55,8 @@ vi.mock("node:child_process", () => ({
 }));
 
 import type { ExecResultLike } from "../src/cli.ts";
-import instaboxExtension from "../src/index.ts";
+import instaboxExtension, { type InstaboxLoggerOptions } from "../src/index.ts";
+import { createFileLogger, createMemoryLogger, logEvent, setLogger } from "../src/log.ts";
 import type { CallToolResult, InitializeResult, RemoteClient, RemoteTool } from "../src/remote.ts";
 import { TARGET_ENTRY } from "../src/session-target.ts";
 
@@ -88,13 +93,17 @@ interface FakeExecOptions {
 	beforeList?: () => Promise<void> | undefined;
 	/** 第 `attempt` 次（0 起）`version` 之前 await 它：用来把重试探测卡住（不阻塞断言用） */
 	beforeVersion?: (attempt: number) => Promise<void> | undefined;
-	/** 本地状态机：`instabox start` 成功后把该箱记为 running（冷启动闭环用） */
+	/** 本地状态机：`instabox wake` / `instabox start` 成功后把该箱记为 running（唤醒闭环用） */
 	trackStart?: boolean;
+	/** `instabox wake` 报「箱没在跑」（退出码 0 + stderr 自报，实测行为）：用来验证退到 `start` */
+	wakeFails?: boolean;
+	/** `instabox ls` 直接失败（非 0 退出）：用来验证「没有可用沙箱」提示 */
+	lsFails?: boolean;
 }
 
 /**
- * 假 `pi.exec`：`version` / `ls` / `start` 可脚本化，`wake`/`resume`/其它子命令一律失败。
- * 记录每次调用的 argv，供「只跑过 version」「进入过 start 而不是 wake」「零唤醒」这类断言用。
+ * 假 `pi.exec`：`version` / `ls` / `wake` / `start` 可脚本化，`resume`/其它子命令一律失败。
+ * 记录每次调用的 argv，供「只跑过 version」「先 wake 再 start」「零唤醒」这类断言用。
  */
 function createFakeExec(options: FakeExecOptions = {}) {
 	const calls: string[][] = [];
@@ -132,6 +141,9 @@ function createFakeExec(options: FakeExecOptions = {}) {
 		}
 		if (subcommand === "ls") {
 			await options.beforeList?.();
+			if (options.lsFails === true) {
+				return { stdout: "", stderr: "instabox ls: boom", code: 1, killed: false, truncated: false };
+			}
 			const boxes = (options.boxes ?? []).map((box) => {
 				const resolved = boxState(box);
 				return {
@@ -143,14 +155,24 @@ function createFakeExec(options: FakeExecOptions = {}) {
 			});
 			return { stdout: JSON.stringify(boxes), stderr: "", code: 0, killed: false, truncated: false };
 		}
-		if (subcommand === "start" && options.trackStart === true) {
-			const box = args[1] ?? "";
+		const box = args[1] ?? "";
+		if (subcommand === "wake" && options.wakeFails === true) {
+			// 真实行为：退出码 0，但 stderr 自报 machine_not_running（`cli.ts` 据此判失败）
+			return {
+				stdout: "",
+				stderr: `instabox: error machine_not_running: machine is suspended; start it first [request id]\nhint: start it with \`instabox start ${box}\``,
+				code: 0,
+				killed: false,
+				truncated: false,
+			};
+		}
+		if ((subcommand === "wake" || subcommand === "start") && options.trackStart === true) {
 			started.add(box);
 			return { stdout: "", stderr: "", code: 0, killed: false, truncated: false };
 		}
 		return { stdout: "", stderr: `instabox ${subcommand}: unsupported in this test`, code: 1, killed: false, truncated: false };
 	};
-	return { exec, calls, timeouts };
+	return { exec, calls, timeouts, started };
 }
 
 /** 假远端客户端：`listTools` 返回构造时给的远端工具，`callTool` 回一条 text。 */
@@ -187,12 +209,20 @@ class FakeRemoteClient implements RemoteClient {
 }
 
 /** 注入给 `pool` 的假客户端工厂（每个 box 一个实例，按名字建远端工具）。 */
-function createFakeClientFactory(remoteNames: readonly string[] = ["click", "screenshot"]) {
+function createFakeClientFactory(
+	remoteNames: readonly string[] = ["click", "screenshot"],
+	options: { failInitialize?: boolean } = {},
+) {
 	const clients = new Map<string, FakeRemoteClient>();
 	const factory = (box: string): RemoteClient => {
 		const client = new FakeRemoteClient(
 			remoteNames.map((name) => ({ name, description: `${box} ${name}`, inputSchema: { type: "object", properties: {} } })),
 		);
+		if (options.failInitialize === true) {
+			client.initialize = async () => {
+				throw new Error("ssh: authentication failed");
+			};
+		}
 		clients.set(box, client);
 		return client;
 	};
@@ -368,6 +398,8 @@ const TEMPLATE_TOOL_NAMES = ["screenshot", "click", "type_text", "list_apps"] as
 interface TemplateCacheOptions {
 	/** 远端 schema 自带 `box`：`injectBoxParam` 拒绝注入 → `buildToolDefinitions` 走一次 warn */
 	boxConflict?: boolean;
+	/** 逐箱覆盖 `fetchedAt`（ISO 串）：用来构造「最近拉取的那台」 */
+	fetchedAt?: Record<string, string>;
 }
 
 /** 写 per-box 模板缓存（`<agentDir>/pi-instabox/templates.json`），`fetchedAt` 取当前时刻故 TTL 内。 */
@@ -387,7 +419,7 @@ function writeTemplateCache(
 			serverInfoVersion: "0.3.6-instabox.1",
 			templateId: "agent-browser",
 			templateVersion: "2026-10-25.23",
-			fetchedAt: new Date().toISOString(),
+			fetchedAt: options.fetchedAt?.[box] ?? new Date().toISOString(),
 			tools: names.map((name) => ({
 				name,
 				description: `remote ${name}`,
@@ -401,6 +433,24 @@ function writeTemplateCache(
 /** 每条通知的文本（断言用）。 */
 function messagesOf(notifications: readonly Notification[]): string[] {
 	return notifications.map((notification) => notification.message);
+}
+
+/** 一条落盘记录（JSONL 解析后的形状，只取断言要用的字段）。 */
+interface LogFileRecord {
+	level: string;
+	event: string;
+	fields?: Record<string, unknown>;
+}
+
+/** 读真实日志文件（`<agentDir>/logs/pi-instabox/pi-instabox.jsonl`）；不存在则空数组。 */
+function readLogRecords(agentDir: string): LogFileRecord[] {
+	const file = path.join(agentDir, "logs", "pi-instabox", "pi-instabox.jsonl");
+	if (!fs.existsSync(file)) return [];
+	return fs
+		.readFileSync(file, "utf8")
+		.split("\n")
+		.filter((line) => line !== "")
+		.map((line) => JSON.parse(line) as LogFileRecord);
 }
 
 /** 不设 `config.defaultBox`（空串＝未配置）。 */
@@ -444,22 +494,25 @@ describe("@inobit/pi-instabox 装配", () => {
 		} finally {
 			createdPis.length = 0;
 			spawnGuard.calls.length = 0;
+			setLogger(undefined); // 日志单例不能跨用例遗留（装配层会写它）
 			vi.unstubAllEnvs();
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
 	});
 
 	describe("无 instabox CLI", () => {
-		it("零工具/零命令/零 MCP、不写缓存与 helper，session_start 恰一条 warning", async () => {
+		it("零工具/零命令/零 MCP、无运行期目录，只落一条 cli.probe（ok:false），session_start 恰一条 warning", async () => {
 			const { exec } = createFakeExec({ cli: false });
 			const pi = new FakePi(exec);
-			await assembleExtension(pi);
+			// 注入真实文件 logger（只跳过 `VITEST` 的默认短路）：这条路径唯一允许的落盘证据就是它
+			await instaboxExtension(pi.asAPI(), { loggerFactory: createFileLogger });
 
 			expect(pi.tools).toHaveLength(0);
 			expect(pi.commands).toHaveLength(0);
 			expect(pi.registeredServers).toHaveLength(0);
 			expect(pi.renderers.size).toBe(0);
 			expect(pi.eventNames()).toEqual(["session_start"]);
+			// 运行期目录一律不建：没有 templates.json、没有 bin/，连状态目录都不出现
 			expect(fs.existsSync(path.join(agentDir, "pi-instabox"))).toBe(false);
 
 			const { ctx, notifications } = createFakeContext([]);
@@ -467,6 +520,218 @@ describe("@inobit/pi-instabox 装配", () => {
 
 			expect(messagesOf(notifications)).toEqual(["未找到 instabox CLI，instabox 扩展已禁用"]);
 			expect(notifications[0]?.type).toBe("warning");
+			// 探测失败同样留证：恰好一条 `cli.probe`，且 `session_start` 的提示不再追加记录
+			const records = readLogRecords(agentDir);
+			expect(records.map((record) => record.event)).toEqual(["cli.probe"]);
+			expect(records[0]?.fields).toMatchObject({ ok: false, reason: "missing" });
+		});
+	});
+
+	describe("后台声明来源（成功一律静默）", () => {
+		/**
+		 * 有缓存时的三级优先级：会话目标 → `config.defaultBox` → 最近拉取的那台。
+		 * 缓存里的箱**故意不在** `ls` 的返回里：这样「声明来源来自缓存」与「来自 live 列表」
+		 * 可区分（握手阶段 pool 仍会查一次状态，但那不是选源）。
+		 */
+		const OLD = "2026-11-01T00:00:00.000Z";
+		const MID = "2026-11-05T00:00:00.000Z";
+		const NEW = "2026-11-09T00:00:00.000Z";
+
+		function writeThreeCaches(): void {
+			writeTemplateCache(
+				agentDir,
+				{ alpha: ["click"], beta: ["screenshot"], gamma: ["list_apps"] },
+				{ fetchedAt: { alpha: OLD, beta: MID, gamma: NEW } },
+			);
+		}
+
+		/**
+		 * 跑一次 `session_start` 的后台判定。codemode 一律设为「已激活」：本 describe 只关心
+		 * 同步来源与静默性，不让无关的 codemode 提示混进 `notifications`。
+		 */
+		async function startBackground(branch: SessionEntry[] = []) {
+			const { exec, calls } = createFakeExec({ boxes: [{ name: "live-box", state: "running" }] });
+			const pi = new FakePi(exec);
+			pi.activeTools = ["codemode"];
+			pi.allTools = ["codemode"];
+			const { clients } = await assembleExtension(pi);
+			const fake = createFakeContext(branch);
+			await pi.emit("session_start", { type: "session_start", reason: "startup" }, fake.ctx);
+			await waitFor(() => pi.tools.length > 0 || fake.notifications.length > 0, "background decision");
+			await settleBackground();
+			return { pi, calls, clients, ...fake };
+		}
+
+
+		it("1 级：会话目标有缓存 → 用会话目标的缓存", async () => {
+			noDefaultBox();
+			writeThreeCaches();
+			const { pi, commandCtx, notifications } = await startBackground([targetEntry("alpha")]);
+
+			// 加载期已经按「最近拉取」声明过一份（gamma）；后台应改判到会话目标 alpha
+			expect(pi.toolNames()).toContain("instabox_desktop_click");
+			expect(messagesOf(notifications)).toEqual([]); // 后台成功静默
+			await invokeCommand(pi, "instabox-status", "", commandCtx);
+			expect(messagesOf(notifications).at(-1)).toContain('box "alpha"');
+		});
+
+		it("2 级：会话目标无缓存 → 用 config.defaultBox 的缓存", async () => {
+			vi.stubEnv("INSTABOX_MCP_DEFAULT_BOX", "beta");
+			writeThreeCaches();
+			const { pi, commandCtx, notifications } = await startBackground([targetEntry("ghost")]);
+
+			expect(pi.toolNames()).toContain("instabox_desktop_screenshot");
+			expect(messagesOf(notifications)).toEqual([]);
+			await invokeCommand(pi, "instabox-status", "", commandCtx);
+			expect(messagesOf(notifications).at(-1)).toContain('box "beta"');
+		});
+
+		it("3 级：都没配 → 用最近拉取的那台缓存", async () => {
+			noDefaultBox();
+			writeThreeCaches();
+			const { pi, commandCtx, notifications } = await startBackground();
+
+			expect(pi.toolNames()).toContain("instabox_desktop_list_apps");
+			expect(messagesOf(notifications)).toEqual([]);
+			await invokeCommand(pi, "instabox-status", "", commandCtx);
+			expect(messagesOf(notifications).at(-1)).toContain('box "gamma"');
+		});
+
+		it("无缓存 + 有 running → 用第一台 running（跳过前面的 suspended），零唤醒", async () => {
+			noDefaultBox();
+			const { exec, calls } = createFakeExec({
+				boxes: [
+					{ name: "alpha", state: "suspended", desiredState: "suspended" },
+					{ name: "beta", state: "running" },
+				],
+			});
+			const pi = new FakePi(exec);
+			pi.activeTools = ["codemode"];
+			pi.allTools = ["codemode"];
+			const { clients } = await assembleExtension(pi);
+			const { ctx, notifications } = createFakeContext([]);
+
+			await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+			await waitFor(() => pi.tools.length > 0, "background declaration");
+
+			expect(pi.toolNames()).toEqual(["instabox_desktop_click", "instabox_desktop_screenshot"]);
+			expect([...clients.keys()]).toEqual(["beta"]);
+			expect(calls.some((call) => ["wake", "start", "resume"].includes(call[1] ?? ""))).toBe(false);
+			// 成功一律不提示
+			expect(messagesOf(notifications)).toEqual([]);
+		});
+
+		it("无缓存 + 全是 suspended → 用列表第一台并 `wake` 唤醒（不传 onProgress）", async () => {
+			noDefaultBox();
+			const { exec, calls } = createFakeExec({
+				boxes: [
+					{ name: "alpha", state: "suspended", desiredState: "suspended" },
+					{ name: "beta", state: "suspended", desiredState: "suspended" },
+				],
+				trackStart: true,
+			});
+			const pi = new FakePi(exec);
+			pi.activeTools = ["codemode"];
+			pi.allTools = ["codemode"];
+			const { clients } = await assembleExtension(pi);
+			const { ctx, notifications } = createFakeContext([]);
+
+			await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+			await waitFor(() => pi.tools.length > 0, "background wake + declaration");
+
+			// 自动暂停的箱由 `wake` 拉起：只对列表第一台动手，且不跑 `start`/`resume`
+			expect(calls).toContainEqual(["instabox", "wake", "alpha"]);
+			expect(calls.some((call) => call[2] === "beta")).toBe(false);
+			expect(calls.some((call) => ["start", "resume"].includes(call[1] ?? ""))).toBe(false);
+			expect([...clients.keys()]).toEqual(["alpha"]);
+			expect(pi.toolNames()).toEqual(["instabox_desktop_click", "instabox_desktop_screenshot"]);
+			// 唤醒进度没往会话里塞提示（后台不传 onProgress），成功也不提示
+			expect(messagesOf(notifications)).toEqual([]);
+		});
+
+		it("ls 返回空 → 一条「没有可用沙箱」warning（每会话一次）", async () => {
+			noDefaultBox();
+			const { exec } = createFakeExec({ boxes: [] });
+			const pi = new FakePi(exec);
+			await assembleExtension(pi);
+			const { ctx, notifications } = createFakeContext([]);
+
+			await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+			await waitFor(() => notifications.length > 0, "no-box notice");
+
+			expect(messagesOf(notifications)).toHaveLength(1);
+			expect(messagesOf(notifications)[0]).toContain("没有可用沙箱");
+			expect(pi.tools).toHaveLength(0);
+		});
+
+		it("ls 失败 → 同样一条「没有可用沙箱」warning", async () => {
+			noDefaultBox();
+			const { exec } = createFakeExec({ boxes: [{ name: "alpha" }], lsFails: true });
+			const pi = new FakePi(exec);
+			await assembleExtension(pi);
+			const { ctx, notifications } = createFakeContext([]);
+
+			await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+			await waitFor(() => notifications.length > 0, "no-box notice");
+
+			expect(messagesOf(notifications)).toEqual([
+				"instabox: 没有可用沙箱（instabox ls 返回空或失败），桌面工具未注册；请检查 instabox CLI 与沙箱状态",
+			]);
+			expect(pi.tools).toHaveLength(0);
+		});
+
+		it("拉取失败（握手失败）→ 恰一条带 /instabox-use 的 warning", async () => {
+			noDefaultBox();
+			const { exec } = createFakeExec({ boxes: [{ name: "general", state: "running" }] });
+			const pi = new FakePi(exec);
+			const { factory } = createFakeClientFactory(["click"], { failInitialize: true });
+			await instaboxExtension(pi.asAPI(), { clientFactory: factory });
+			const { ctx, notifications } = createFakeContext([]);
+
+			await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+			await waitFor(() => notifications.length > 0, "sync failure notice");
+
+			expect(messagesOf(notifications)).toHaveLength(1);
+			expect(messagesOf(notifications)[0]).toContain("未能同步沙箱");
+			expect(messagesOf(notifications)[0]).toContain("/instabox-use general");
+			expect(pi.tools).toHaveLength(0);
+		});
+	});
+
+	describe("内部日志开关", () => {
+		it("默认完全静音：后台失败也不写任何日志", async () => {
+			noDefaultBox();
+			const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+			try {
+				const { exec } = createFakeExec({ boxes: [] });
+				const pi = new FakePi(exec);
+				await assembleExtension(pi);
+				const { ctx, notifications } = createFakeContext([]);
+				await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+				await waitFor(() => notifications.length > 0, "no-box notice");
+
+				expect(warn.mock.calls).toEqual([]);
+			} finally {
+				warn.mockRestore();
+			}
+		});
+
+		it("PI_INSTABOX_DEBUG=1 时才写日志", async () => {
+			vi.stubEnv("PI_INSTABOX_DEBUG", "1");
+			noDefaultBox();
+			const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+			try {
+				const { exec } = createFakeExec({ boxes: [] });
+				const pi = new FakePi(exec);
+				await assembleExtension(pi);
+				const { ctx, notifications } = createFakeContext([]);
+				await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+				await waitFor(() => notifications.length > 0, "no-box notice");
+
+				expect(warn.mock.calls.some(([line]) => String(line).startsWith("[pi-instabox]"))).toBe(true);
+			} finally {
+				warn.mockRestore();
+			}
 		});
 	});
 
@@ -583,6 +848,7 @@ describe("@inobit/pi-instabox 装配", () => {
 		});
 
 		it("ui.notify 抛错时重试失败路径不产生未处理 rejection", async () => {
+			vi.stubEnv("PI_INSTABOX_DEBUG", "1"); // 断言那条 debug 兜底日志
 			const { exec } = createFakeExec({
 				boxes: [{ name: "general" }],
 				versionPlan: ["timeout", "timeout"],
@@ -710,24 +976,6 @@ describe("@inobit/pi-instabox 装配", () => {
 			await waitFor(() => pi.tools.length > 0, "background registration");
 			expect(pi.toolNames()).toEqual(["instabox_desktop_click", "instabox_desktop_screenshot"]);
 			// 后台路径：只看过 ls（探活一次 version），没有任何唤醒命令
-			expect(calls.some((call) => ["wake", "start", "resume"].includes(call[1] ?? ""))).toBe(false);
-		});
-
-		it("拉取失败 → 一条可操作的 warning，且全程零唤醒", async () => {
-			noDefaultBox();
-			const { exec, calls } = createFakeExec({
-				boxes: [{ name: "agent", state: "suspended", desiredState: "suspended" }],
-			});
-			const pi = new FakePi(exec);
-			await assembleExtension(pi);
-			const { ctx, notifications } = createFakeContext([]);
-
-			await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
-			await waitFor(() => notifications.length > 0, "background failure notice");
-
-			expect(messagesOf(notifications)[0]).toContain("instabox: 桌面工具尚未注册");
-			expect(messagesOf(notifications)[0]).toContain("/instabox-use agent");
-			expect(pi.tools).toHaveLength(0);
 			expect(calls.some((call) => ["wake", "start", "resume"].includes(call[1] ?? ""))).toBe(false);
 		});
 
@@ -896,7 +1144,7 @@ describe("@inobit/pi-instabox 装配", () => {
 			const server = pi.registeredServers[0];
 			expect(server?.name).toBe("instabox-devtools");
 			expect(server?.config.exposure).toBe("codemode");
-			expect(server?.config.timeout).toBe(120);
+			expect(server?.config.timeout).toBe(180);
 			const config = server?.config;
 			expect(config).toMatchObject({ command: helper });
 			// stdio 配置的 `args` = [devToolsBox, ...DEFAULT_CONFIG.devToolsArgs]
@@ -941,11 +1189,12 @@ describe("@inobit/pi-instabox 装配", () => {
 			expect(messagesOf(notifications)).toEqual(["instabox target: general\ncandidates: general, agent"]);
 		});
 
-		it("冷启动闭环：无缓存 + suspended → 唤醒（start）→ 拉模板 → 注册", async () => {
+		it("冷启动闭环：无缓存 + suspended → `wake` 报没在跑 → `start` → 拉模板 → 注册", async () => {
 			noDefaultBox();
 			const { exec, calls } = createFakeExec({
 				boxes: [{ name: "agent", state: "suspended", desiredState: "suspended" }],
 				trackStart: true,
+				wakeFails: true,
 			});
 			const pi = new FakePi(exec);
 			const { clients } = await assembleExtension(pi);
@@ -956,15 +1205,37 @@ describe("@inobit/pi-instabox 装配", () => {
 
 			await invokeCommand(pi, "instabox-use", "agent", commandCtx);
 
-			// 人工 suspend 的箱走 `start`（`wake` 对它必然失败），随后同一条连接拉模板
+			// 用户手动暂停的箱：`wake` 自报 machine_not_running → 退到 `start` → 唤醒成功后拉模板
+			expect(calls).toContainEqual(["instabox", "wake", "agent"]);
 			expect(calls).toContainEqual(["instabox", "start", "agent"]);
-			expect(calls.some((call) => call[1] === "wake")).toBe(false);
+			expect(calls.findIndex((call) => call[1] === "wake")).toBeLessThan(
+				calls.findIndex((call) => call[1] === "start"),
+			);
+			expect(calls.filter((call) => call[1] === "start")).toHaveLength(1);
 			expect(pi.entries[0]?.data).toMatchObject({ box: "agent" });
 			expect(pi.toolNames()).toEqual(["instabox_desktop_click", "instabox_desktop_screenshot"]);
 			expect(messagesOf(notifications)).toContain('instabox: registered 2 desktop tool(s) for box "agent"');
 			// per-box 缓存写盘（下次启动零 ssh 即可声明工具）
 			expect(fs.existsSync(path.join(agentDir, "pi-instabox", "templates.json"))).toBe(true);
 			expect(clients.get("agent")?.callToolCalls).toEqual([]);
+		});
+
+		it("冷启动闭环：`wake` 成功即注册，不再跑 `start`（自动暂停的箱）", async () => {
+			noDefaultBox();
+			const { exec, calls } = createFakeExec({
+				boxes: [{ name: "agent", state: "suspended", desiredState: "suspended" }],
+				trackStart: true,
+			});
+			const pi = new FakePi(exec);
+			await assembleExtension(pi);
+			const { commandCtx, notifications } = createFakeContext([]);
+
+			await invokeCommand(pi, "instabox-use", "agent", commandCtx);
+
+			expect(calls).toContainEqual(["instabox", "wake", "agent"]);
+			expect(calls.some((call) => ["start", "resume"].includes(call[1] ?? ""))).toBe(false);
+			expect(pi.toolNames()).toEqual(["instabox_desktop_click", "instabox_desktop_screenshot"]);
+			expect(messagesOf(notifications)).toContain('instabox: registered 2 desktop tool(s) for box "agent"');
 		});
 	});
 
@@ -1047,6 +1318,153 @@ describe("@inobit/pi-instabox 装配", () => {
 
 			await invokeCommand(pi, "instabox-use", "", commandCtx);
 			expect(messagesOf(notifications).at(-1)).toContain("instabox target: agent");
+		});
+	});
+
+	describe("埋点", () => {
+		it("load.assembled / devtools.register / session.start / session.tree / session.shutdown 各落一条", async () => {
+			vi.stubEnv("INSTABOX_MCP_DEVTOOLS_BOX", "agent");
+			writeTemplateCache(agentDir, { general: ["click"] });
+			const { exec } = createFakeExec({ boxes: [{ name: "general" }] });
+			const pi = new FakePi(exec);
+			pi.activeTools = ["codemode"];
+			pi.allTools = ["codemode"];
+			const logger = createMemoryLogger();
+
+			setLogger(logger);
+			try {
+				await assembleExtension(pi, ["click"]);
+				const { ctx } = createFakeContext([targetEntry("general")]);
+				await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+				await waitFor(() => pi.tools.length > 0, "background declaration");
+				await settleBackground();
+				await pi.emit("session_tree", { type: "session_tree", newLeafId: "entry-general", oldLeafId: null }, ctx);
+				await pi.emit("session_shutdown", { type: "session_shutdown" }, ctx);
+			} finally {
+				setLogger(undefined);
+			}
+
+			const find = (event: string) => logger.records.filter((record) => record.event === event);
+
+			// 日志在探测前就接上：`cli.probe` 必须出现在 `load.assembled` 之前
+			const eventNames = logger.records.map((record) => record.event);
+			expect(eventNames.indexOf("cli.probe")).toBeGreaterThanOrEqual(0);
+			expect(eventNames.indexOf("cli.probe")).toBeLessThan(eventNames.indexOf("load.assembled"));
+
+			// 加载期用缓存声明：cacheHit / 声明的箱 / 工具数
+			const assembled = find("load.assembled");
+			expect(assembled).toHaveLength(1);
+			expect(assembled[0]?.fields).toEqual({ cacheHit: true, box: "general", tools: 1 });
+
+			// 假设层不记 helper 内容（那是 devtools.helper），只记注册结果
+			expect(find("devtools.helper")[0]?.fields).toMatchObject({ ok: true });
+			expect(find("devtools.register")[0]?.fields).toEqual({ box: "agent", ok: true });
+
+			// `source` = session_start 的 reason；`target` 是会话已有目标；`mode` 来自 ctx
+			expect(find("session.start")[0]?.fields).toEqual({ target: "general", source: "startup", mode: "tui" });
+			expect(find("session.tree")[0]?.level).toBe("debug");
+			expect(find("session.tree")[0]?.fields).toEqual({ target: "general" });
+			expect(find("session.shutdown")[0]?.fields).toMatchObject({ open: expect.any(Number) });
+
+			// codemode 埋点把内部三态 `unavailable` 记成 `missing`；本会话已激活 → `active`
+			const codemode = find("codemode");
+			expect(codemode.length).toBeGreaterThan(0);
+			expect(codemode[0]?.level).toBe("debug");
+			expect(codemode[0]?.fields).toEqual({ state: "active", server: true });
+		});
+	});
+
+	describe("文件日志接线", () => {
+		/**
+		 * 注入替身：记下装配层给的构造参数，返回内存 logger。
+		 * 注入即跳过「`VITEST` 不建」的短路，因此可以断言 `dir` / `level`，全程不碰真实磁盘。
+		 */
+		function captureLogger() {
+			const options: InstaboxLoggerOptions[] = [];
+			const logger = createMemoryLogger();
+			const loggerFactory = (given: InstaboxLoggerOptions): ReturnType<typeof createMemoryLogger> => {
+				options.push(given);
+				return logger;
+			};
+			return { options, logger, loggerFactory };
+		}
+
+		it("装配成功 → 按 <agentDir>/logs/pi-instabox 建 logger（默认 info），探测与装配埋点都落到它上", async () => {
+			writeTemplateCache(agentDir, { general: ["click"] });
+			const { exec } = createFakeExec({ boxes: [{ name: "general" }] });
+			const pi = new FakePi(exec);
+			const { factory } = createFakeClientFactory(["click"]);
+			const { options, logger, loggerFactory } = captureLogger();
+
+			await instaboxExtension(pi.asAPI(), { clientFactory: factory, loggerFactory });
+
+			expect(options).toHaveLength(1);
+			expect(options[0]?.dir).toBe(path.join(agentDir, "logs", "pi-instabox"));
+			expect(options[0]?.level).toBe("info");
+			// 不只是「工厂被调了一次」：探测与装配的埋点真的落到了这个 logger 上，且顺序正确
+			const events = logger.records.map((record) => record.event);
+			expect(events.indexOf("cli.probe")).toBeGreaterThanOrEqual(0);
+			expect(events.indexOf("cli.probe")).toBeLessThan(events.indexOf("load.assembled"));
+			// 替身接管后再没别的写入面：日志目录没有被建出来
+			expect(fs.existsSync(path.join(agentDir, "logs"))).toBe(false);
+		});
+
+		it("PI_INSTABOX_DEBUG=1 → debug 级别（记 `debug` 事件）", async () => {
+			vi.stubEnv("PI_INSTABOX_DEBUG", "1");
+			writeTemplateCache(agentDir, { general: ["click"] });
+			const { exec } = createFakeExec({ boxes: [{ name: "general" }] });
+			const pi = new FakePi(exec);
+			const { factory } = createFakeClientFactory(["click"]);
+			const { options, loggerFactory } = captureLogger();
+
+			await instaboxExtension(pi.asAPI(), { clientFactory: factory, loggerFactory });
+
+			expect(options[0]?.level).toBe("debug");
+		});
+
+		it("VITEST 下默认不建 logger：不替换已注册的那个，也不建日志目录", async () => {
+			const logger = createMemoryLogger();
+			setLogger(logger);
+			writeTemplateCache(agentDir, { general: ["click"] });
+			const { exec } = createFakeExec({ boxes: [{ name: "general" }] });
+			const pi = new FakePi(exec);
+
+			await assembleExtension(pi); // 不注入 loggerFactory
+
+			// 已注册的 logger 还在，且埋点还是落在它上面（装配层没拿文件 logger 顶上）
+			expect(logger.records.map((record) => record.event)).toContain("load.assembled");
+			expect(fs.existsSync(path.join(agentDir, "logs"))).toBe(false);
+		});
+
+		it("无 instabox CLI → logger 仍在探测前建好，只落一条 cli.probe（ok:false）", async () => {
+			const { exec } = createFakeExec({ cli: false });
+			const pi = new FakePi(exec);
+			const { options, logger, loggerFactory } = captureLogger();
+
+			await instaboxExtension(pi.asAPI(), { loggerFactory });
+
+			expect(options).toHaveLength(1);
+			const probes = logger.records.filter((record) => record.event === "cli.probe");
+			expect(probes).toHaveLength(1);
+			expect(probes[0]?.fields).toMatchObject({ ok: false, reason: "missing" });
+			expect(logger.records.map((record) => record.event)).not.toContain("load.assembled");
+		});
+
+		it("session_shutdown → 复位 logger，之后的事件不再落盘", async () => {
+			writeTemplateCache(agentDir, { general: ["click"] });
+			const { exec } = createFakeExec({ boxes: [{ name: "general" }] });
+			const pi = new FakePi(exec);
+			const { factory } = createFakeClientFactory(["click"]);
+			const { logger, loggerFactory } = captureLogger();
+
+			await instaboxExtension(pi.asAPI(), { clientFactory: factory, loggerFactory });
+			const { ctx } = createFakeContext([]);
+			await pi.emit("session_shutdown", { type: "session_shutdown" }, ctx);
+
+			expect(logger.records.map((record) => record.event)).toContain("session.shutdown");
+			const before = logger.records.length;
+			logEvent("after.shutdown");
+			expect(logger.records).toHaveLength(before);
 		});
 	});
 });

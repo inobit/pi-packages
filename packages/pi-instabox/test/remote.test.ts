@@ -8,6 +8,7 @@
 
 import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
+import { createMemoryLogger, setLogger } from "../src/log.ts";
 import {
 	CLIENT_INFO,
 	DEFAULT_TIMEOUTS,
@@ -713,5 +714,27 @@ describe("abort", () => {
 		expect(ctx.client.isDead()).toBe(true);
 		expect(ctx.child.killed).toEqual([undefined]);
 		expect(ctx.clock.pendingCount()).toBe(0);
+	});
+});
+
+describe("埋点（logEvent）", () => {
+	it("tools/call 成功记一条 remote.call（tool/ok/isError）", async () => {
+		const logger = createMemoryLogger();
+		setLogger(logger);
+		try {
+			const ctx = setup();
+			await handshake(ctx);
+			const pending = ctx.client.callTool("list_apps", {});
+			await flush();
+			ctx.child.send(lineFrame({ jsonrpc: "2.0", id: 2, result: { content: [], isError: true } }));
+			await expect(pending).resolves.toEqual({ content: [], isError: true });
+		} finally {
+			setLogger(undefined);
+		}
+
+		const calls = logger.records.filter((record) => record.event === "remote.call");
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.fields).toMatchObject({ tool: "list_apps", ok: true, isError: true });
+		expect(logger.records.some((record) => record.event === "remote.initialize")).toBe(true);
 	});
 });

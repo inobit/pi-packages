@@ -26,6 +26,9 @@
  *   在闭包里负责，本模块不为它加回调。`ctx` 作为**第二个可选参数**透传给 `resolve`，让装配层
  *   能在每次调用时实时读会话分支（解析链第 2 级是「本轮最后一条 user 消息」，不能缓存）。
  * - 注入面：`resolve` / `pool` / `listBoxes` / `warn` 全部可替；单测不 spawn、不联网、不读盘。
+ * - 埋点：每次 `execute` 记一条 `tool.call`（`tool` / `box` / `ok` / `ms` / `isError`），成功、失败、
+ *   异常三条路径都经 `finally` 落账；`tool` 用远端名（与 `remote.call` 同一拼写），只记箱名与工具名，
+ *   不记参数与结果内容。
  */
 
 import type {
@@ -35,6 +38,7 @@ import type {
 	ToolNamespace,
 } from "@earendil-works/pi-coding-agent";
 import type { BoxInfo } from "./boxes.ts";
+import { logEvent } from "./log.ts";
 import type { Pool } from "./pool.ts";
 import { type CallToolResult, type RemoteClient, type RemoteTool } from "./remote.ts";
 import type { ResolveResult } from "./resolve.ts";
@@ -155,41 +159,61 @@ function buildToolDefinition(
 		exposure: "codemode",
 		namespace,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const boxParam = boxParamOf(params);
-			let resolution: ResolveResult;
+			const startedAt = Date.now();
+			// 埋点面：`box` 在解析成功后才知；`ok` = 远端正常回了结果，`isError` = 返回给宿主的错误标记
+			let box: string | undefined;
+			let ok = false;
+			let isError = true;
 			try {
-				// `ctx` 透传给解析链：每次调用都要实时读分支（解析链第 2 级不能缓存）
-				resolution = await input.resolve(boxParam, ctx);
-			} catch (error) {
-				return errorResult(`instabox: box resolution failed: ${messageOf(error)}`);
-			}
-			if (!resolution.ok) return errorResult(await failureText(resolution, input.listBoxes));
+				const boxParam = boxParamOf(params);
+				let resolution: ResolveResult;
+				try {
+					// `ctx` 透传给解析链：每次调用都要实时读分支（解析链第 2 级不能缓存）
+					resolution = await input.resolve(boxParam, ctx);
+				} catch (error) {
+					return errorResult(`instabox: box resolution failed: ${messageOf(error)}`);
+				}
+				if (!resolution.ok) return errorResult(await failureText(resolution, input.listBoxes));
+				box = resolution.box;
 
-			let client: RemoteClient;
-			try {
-				const got = await input.pool.get(resolution.box, {
-					signal,
-					onProgress: (message) => onUpdate?.({ content: [textItem(message)], details: undefined }),
+				let client: RemoteClient;
+				try {
+					const got = await input.pool.get(box, {
+						signal,
+						onProgress: (message) => onUpdate?.({ content: [textItem(message)], details: undefined }),
+					});
+					if (!got.ok) return errorResult(`instabox: cannot use box "${box}": ${got.error}`);
+					client = got.client;
+				} catch (error) {
+					return errorResult(`instabox: cannot use box "${box}": ${messageOf(error)}`);
+				}
+
+				let called: CallToolResult;
+				try {
+					called = await client.callTool(remote.name, forwardArgs(params), signal);
+				} catch (error) {
+					return errorResult(`instabox: ${remote.name} on box "${box}" failed: ${messageOf(error)}`);
+				}
+
+				const content: ToolContent = [textItem(`[box=${box}]`), ...remoteContent(called.content)];
+				if (called.isError === true) {
+					content.push(textItem(IS_ERROR_REMEDY));
+					return { content, details: undefined, isError: true };
+				}
+				ok = true;
+				isError = false;
+				return { content, details: undefined };
+			} finally {
+				// 三条路径（成功 / 远端报错或本层失败 / 抛错）都在这里收口，埋点本身绝不外抛。
+				// `tool` 用远端名（与 `remote.call` 同一拼写，便于跨层对账）；pi 工具名只多一层前缀。
+				logEvent("tool.call", {
+					tool: remote.name,
+					box,
+					ok,
+					ms: Date.now() - startedAt,
+					isError,
 				});
-				if (!got.ok) return errorResult(`instabox: cannot use box "${resolution.box}": ${got.error}`);
-				client = got.client;
-			} catch (error) {
-				return errorResult(`instabox: cannot use box "${resolution.box}": ${messageOf(error)}`);
 			}
-
-			let called: CallToolResult;
-			try {
-				called = await client.callTool(remote.name, forwardArgs(params), signal);
-			} catch (error) {
-				return errorResult(`instabox: ${remote.name} on box "${resolution.box}" failed: ${messageOf(error)}`);
-			}
-
-			const content: ToolContent = [textItem(`[box=${resolution.box}]`), ...remoteContent(called.content)];
-			if (called.isError === true) {
-				content.push(textItem(IS_ERROR_REMEDY));
-				return { content, details: undefined, isError: true };
-			}
-			return { content, details: undefined };
 		},
 	};
 }

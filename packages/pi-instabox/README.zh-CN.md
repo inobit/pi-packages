@@ -13,7 +13,7 @@
 
 - **`@earendil-works/pi-coding-agent >= 0.99.0`**——硬门槛。本包依赖的 `exposure`、`namespace`、`registerMcpServer` 与 codemode/MCP 支持自 0.99.0 起才有，更早的宿主无法加载。
 - Node.js **>= 24**。
-- `PATH` 上有 `instabox` CLI（`instabox version`、`instabox ls --json`、`instabox ssh`、`instabox wake|start|resume`、`instabox exec`）。没有 CLI 时扩展零注册——无工具、无命令、无 MCP server、不写任何文件——只每会话给一条 warning；若只是首次 `instabox version` 探测超时，会在会话启动时用更大预算重试一次再下这个结论。
+- `PATH` 上有 `instabox` CLI（`instabox version`、`instabox ls --json`、`instabox ssh`、`instabox wake|start|resume`、`instabox exec`）。没有 CLI 时扩展零注册——无工具、无命令、无 MCP server、不写运行期文件（无模板缓存、无 helper）——只每会话给一条 warning；唯一的落盘产物是事件日志里那一条 `cli.probe`。若只是首次 `instabox version` 探测超时，会在会话启动时用更大预算重试一次再下这个结论。
 - 沙箱模板带 `instabox-computer-use`（本扩展通过 `instabox ssh <box> -- instabox-computer-use mcp` 驱动这个远端 MCP server）。
 
 ## 安装
@@ -41,6 +41,8 @@ pi install npm:@inobit/pi-instabox
 **`/instabox-use [box]`**——设置或查看本会话的目标箱。不带参数时打印当前目标与候选箱；箱名不存在则拒绝，原目标保留。目标以一条自定义会话条目存储（不进 LLM 上下文，按分支生效，因此 `/tree` 切分支与 `--continue` 都能恢复）。若当时还没注册任何桌面工具（冷启动、无缓存），这条命令还会唤醒该箱、拉取 `tools/list` 并注册工具——这就是会话启动时箱子没在跑的重试路径。
 
 **`/instabox-status`**——一次性诊断：配置摘要、会话目标、解析出的目标及其来源、已注册的 `instabox_desktop_*` 工具与 exposure、当前声明来自哪台箱的缓存模板（`tool declarations: from the cached template of box "…"`）、active tools、codemode 状态，以及扩展注册的 MCP server。
+
+**工具声明的来源。**加载期命中缓存就静默注册桌面工具——零 ssh、零提示。否则会话启动在后台替你决定：有缓存时对「声明来源」那台箱做一次版本校验（会话目标 → `defaultBox` → 缓存里最近拉取的那台，均要求该箱有缓存条目）；没有缓存时先 `ls`，取**第一台 `state === "running"`** 的箱且不唤醒它；若一台 running 都没有，则取列表第一台并**后台异步唤醒**（不显示进度、不阻塞会话）再拉 `tools/list`。成功一律静默——工具出现就是唯一的成功信号。只有真的同步不了才提示：`instabox ls` 为空或失败 → 一条「没有可用沙箱」；同步本身失败 → 一条带 `/instabox-use <box>` 的提示，都是每会话一次。
 
 **codemode 前提。** `codemode` exposure 的含义是：工具已注册、可调用，但不直接声明给模型——模型要在 codemode 脚本里通过 `describeTool`、`searchTools`、`describeNamespace` 找到它们。扩展不会替你激活 codemode，且只在**已注册桌面工具**时才判定状态（会话启动一次，`/instabox-status` 每次实时读）。若 codemode 未激活、且会话里没有 `codemode` exposure 的 MCP server，你会收到每会话一条 warning 并附带补救命令：用 `pi --tools +codemode` 启动，或在 settings 里设 `"defaultTools": ["+codemode"]`。若本会话根本没有 `codemode` 工具条目（被 `--tools` / `--exclude-tools` 剔除，或内置扩展被替换），则用另一条一次性文案明说桌面工具在本会话不可调用。配了 `devToolsBox` 时 pi 会自动激活 codemode（见下文），因此两条提示都不会出现。两种情况下 `/instabox-use` 与 `/instabox-status` 都可用。
 
@@ -97,12 +99,60 @@ pi install npm:@inobit/pi-instabox
 | 路径 | 内容 |
 | --- | --- |
 | `<agentDir>/extensions/pi-instabox/config.json` | 配置文件（即上文的全局层） |
-| `<agentDir>/pi-instabox/templates.json` | per-box 模板缓存：每台箱的 `tools/list` 加远端 `serverInfo.version` 与 `fetchedAt`。加载期的工具声明只读这个文件（零 ssh），声明来自哪台箱是**缓存优先**的：会话目标（该箱有缓存条目才算）→ `config.defaultBox`（同上）→ 缓存里最近拉取的那台；只有缓存为空时才走解析链（本轮 user 消息 → 会话目标 → `defaultBox` → `ls` 第一台）。随后每次会话启动用一次握手校验该箱：`serverInfo.version` 相同就复用缓存、不动磁盘，不同则重拉 `tools/list` 并重写该箱条目；另有 168 小时 TTL 兜底（超期无论版本是否相同都会重拉）。比对用的就是这次握手返回的 `serverInfo.version`，无需额外配置 |
+| `<agentDir>/pi-instabox/templates.json` | per-box 模板缓存：每台箱的 `tools/list` 加远端 `serverInfo.version` 与 `fetchedAt`。加载期的工具声明只读这个文件（零 ssh、零提示），声明来自哪台箱是**缓存优先**的：会话目标（该箱有缓存条目才算）→ `config.defaultBox`（同上）→ 缓存里最近拉取的那台。**缓存为空时后台不走解析链**：取第一台 `state === "running"` 的箱（不唤醒）；一台 running 都没有时取列表第一台并**后台异步唤醒**（不显示进度）。随后每次会话启动用一次握手校验该箱：`serverInfo.version` 相同就复用缓存、不动磁盘，不同则重拉 `tools/list` 并重写该箱条目；另有 168 小时 TTL 兜底（超期无论版本是否相同都会重拉），校验失败则静默沿用缓存。比对用的就是这次握手返回的 `serverInfo.version`，无需额外配置 |
 | `<agentDir>/pi-instabox/bin/devtools-connect.sh` | 生成的 helper（权限 `0755`），用于连接远端 `chrome-devtools-mcp`。只在设置了 `devToolsBox` 时写入；可以删，下次加载会重新生成并 `chmod 0755` |
+| `<agentDir>/logs/pi-instabox/pi-instabox.jsonl` | 事件日志（目录 `0700`、文件 `0600`）：一行一事件，超 1 MiB 轮转为 `.1` … `.3`。**扩展加载时**（配置与路径解析完、CLI 探测前）就开始记，因此探测失败也有记录；可以删。见[日志](#日志) |
+
+## 日志
+
+每个会话从**扩展加载时**起就往 `<agentDir>/logs/pi-instabox/pi-instabox.jsonl` 追加结构化事件（目录 `0700`、文件 `0600`）：先解析配置与路径，随即接上日志，然后才跑 `instabox version` 探测——所以探测失败/超时也有记录；没有 CLI 的会话只有 `cli.probe` 那一条，别的不写。装配失败同样只写日志，不建模板缓存、不写 helper、不建 `bin/`。
+
+- **格式：**一行一条 JSON —— `{"ts":"2026-11-09T12:00:00.000Z","level":"info","event":"session.start","fields":{…}}`。事件数据在 `fields` 子对象里，不摊平到顶层：`undefined` 字段被丢掉，字符串截断到 2000 字符，键名命中 `token|secret|password|api[-_]?key` 的字段整体写成 `"[redacted]"`。**消息正文与调用参数从不写盘**——事件只带名字、状态、计数与耗时（`box`、`source`、`mentions`、`candidates`、`ms` 等）。
+- **级别：**默认 `info`（生命周期 + 每一次工具调用一条 `resolve`，选箱可事后复盘，不需要任何开关）。`PI_INSTABOX_DEBUG=1` 把文件切到 `debug`，额外记池状态采样、spawn 参数、模板缓存命中与 `session_tree` 的目标切换。`warn` / `error` 记录在两个级别下都写，所以「忘了开 debug」不会让失败消失。`off` 只存在于代码层（`createFileLogger({ level: "off" })`），没有对外开关。
+- **轮转：**到 1 MiB 就滚动成 `pi-instabox.jsonl.1` … `pi-instabox.jsonl.3`（`.1` 最新）。大小判定在**写入之后**，所以刚滚动完的主文件是空的，下一条事件写入时重新出现。
+- **写盘失败不进会话：**建目录或追加失败只经内部 debug 渠道报一次然后吞掉；日志永远不是工具可用的前提。
+
+| 事件 | 级别 | 字段 |
+| --- | --- | --- |
+| `cli.probe` | info / warn | `ok`、`reason`（`missing` / `timeout` / `error`）、`version`、`ms` |
+| `cli.ls` | info | `ok`、`count`、`reason`、`ms` |
+| `cli.lifecycle` | info | `command`（`start` / `wake` / `resume`）、`box`、`ok`、`reason`、`ms` |
+| `cli.exec` | info | `box`、`timeoutSec`、`ok`、`ms` |
+| `load.assembled` | info | `cacheHit`、`box`、`tools`（加载期声明的工具数） |
+| `session.start` | info | `target`、`source`（会话启动原因）、`mode` |
+| `session.tree` | debug | `target` |
+| `session.shutdown` | info | `open`（收掉的连接数） |
+| `resolve` | info | `param`、`source`（`param` / `message` / `session` / `config` / `first`）、`box`、`mentions`、`candidates`（前 10 个）、`degraded`（跳过了失效的 `defaultBox`） |
+| `resolve.fail` | warn | `kind`（`no-boxes` / `invalid-param` / `invalid-session` / `ambiguous` / `invalid-config`）、`message`、`candidates`（前 10 个） |
+| `pool.connect` | info | `box`、`ok`、`ms`、`error` |
+| `pool.wake` | info / warn | `box`、`step`（`wake` / `start` / `resume`）、`ok`、`ms` |
+| `pool.state` | debug | `box`、`state`、`desiredState` |
+| `pool.reuse` | debug | `box` |
+| `pool.dispose` | debug | `box` |
+| `remote.spawn` | debug | `command`、`args` |
+| `remote.initialize` | info | `ok`、`ms`、`protocolVersion`、`serverInfoVersion` |
+| `remote.listTools` | info | `ok`、`count`、`ms` |
+| `remote.call` | info | `tool`、`ok`、`ms`、`isError` |
+| `template.hit` | debug | `box`、`serverInfoVersion`、`stale`（TTL 已过） |
+| `template.refetch` | info | `box`、`reason`、`ms`、`tools` |
+| `template.fail` | warn | `box`、`error`、`stale`（沿用了缓存模板） |
+| `tool.call` | info | `tool`、`box`、`ok`、`ms`、`isError` |
+| `codemode` | debug | `state`（`active` / `inactive` / `missing`）、`server`（存在 codemode exposure 的 MCP server） |
+| `devtools.register` | info | `box`、`ok` |
+| `devtools.helper` | info | `ok`、`path`、`error` |
+| `error` | warn | `where`、`message`（被吞掉的失败：会话分支、`session_start` 后台任务、`ui.notify`） |
+
+**排查一次选错箱。**成功的 `resolve` 是 `info` 级，默认级别下就已经落盘——不用切级别，直接过滤：
+
+```bash
+grep '"event":"resolve"' ~/.pi/agent/logs/pi-instabox/pi-instabox.jsonl
+```
+
+每条记录说明：五级里哪一级命中（`source`）、命中的是哪台箱（`box`）、本轮 user 消息里出现了哪些箱名（`mentions`——**零命中也记**，而零命中正是「落到下一级」的原因）、当时备选的名字（`candidates`）、是否跳过了失效的 `defaultBox`（`degraded`）。硬失败就在旁边，以 `resolve.fail` 落盘，带 `kind` 与 `candidates`：`box` 参数不存在、会话目标不存在、消息里提到两台箱、或箱列表为空。`PI_INSTABOX_DEBUG=1` 打开的是决策周边的细节（池状态采样、spawn 参数、模板命中），不是决策本身。
 
 ## DevTools MCP
 
-`devToolsBox` 为空 → 该能力整体不存在：不写 helper、不注册 MCP server、不建目录。`devToolsBox` 有值 → 扩展写 helper，并注册一个名为 `instabox-devtools` 的 MCP server，其 `command` 就是该 helper，于是远端 `chrome-devtools-mcp` 在这台固定箱里经 `instabox ssh` 运行。它的 `exposure` 是 `codemode`，每请求超时 120 秒；箱上缺该二进制且 `autoInstallDevTools` 开启时，helper 会尝试一次 `sudo -n env "PATH=<remotePath>" npm i -g chrome-devtools-mcp`（sudo 会按 `secure_path` 重写 PATH，所以远端 PATH 显式再传一遍），其全部诊断信息只写 stderr，避免污染 stdout 上的 JSON-RPC 帧。
+`devToolsBox` 为空 → 该能力整体不存在：不写 helper、不注册 MCP server、不建目录。`devToolsBox` 有值 → 扩展写 helper，并注册一个名为 `instabox-devtools` 的 MCP server，其 `command` 就是该 helper，于是远端 `chrome-devtools-mcp` 在这台固定箱里经 `instabox ssh` 运行。它的 `exposure` 是 `codemode`，每请求超时 180 秒；连接前 helper 会先把目标箱唤醒（`instabox wake`，失败再 `instabox start`）——MCP 客户端自己从不唤醒箱，一台暂停的箱否则会赔上整场会话。箱上缺该二进制且 `autoInstallDevTools` 开启时，helper 接着尝试一次 `sudo -n env "PATH=<remotePath>" npm i -g chrome-devtools-mcp`（sudo 会按 `secure_path` 重写 PATH，所以远端 PATH 显式再传一遍），其全部诊断信息只写 stderr，避免污染 stdout 上的 JSON-RPC 帧。预算都在那个超时之内：检查 10 秒、安装 40 秒，输出一律丢进 `/dev/null`。
 
 它的工具——DOM/无障碍快照、元素截图、CSS 级联、网络、console、性能 trace——不会声明给模型。模型在 codemode 脚本里发现它们：
 
@@ -113,12 +163,16 @@ const ns = describeNamespace("mcp__instabox_devtools"); // { name, tools }
 
 正因为这个 server 是 `codemode` exposure，pi 会自动激活 codemode，这也是同一会话里桌面工具变得可调用的原因。
 
+**首次连接失败时 pi 不会自己重试。**该 MCP server 会一直处于失败状态直到你用 `/mcp` 重连（或重启会话），期间命名空间里拿不到任何工具。所以 helper 在交给 `instabox ssh` 之前先自己补救一次：先 `wake`，失败再 `start`；这一步也失败不阻断，真正的原因由后续步骤原样报到 stderr。
+
 ## 兼容与限制
 
 - **宿主门槛：**`pi-coding-agent >= 0.99.0`（见环境要求）。本包钉死编译所用类型，升级只会体现为 `check` 失败，而不是运行期意外。
 - **工具选择集归你：**扩展从不调用 `setActiveTools`，不写 `settings.json`，也不改 `defaultTools`；它只报告 codemode 状态与补救命令。
 - **codemode 未激活＝不可调用：**工具已注册，但 codemode 关掉时模型够不到它们，在 codemode 之外也看不到工具名。见「用法」里的前提说明。
 - **工具集跟随模板而非扩展：**定义来自该箱缓存的 `tools/list`。不同箱可能跑不同版本的 `instabox-computer-use`，因此工具集与 schema 可能逐箱不同。校验口径是每次会话启动一次握手：远端版本相同则沿用缓存的工具、不动磁盘，不同则重拉并重写该箱条目，另有 168 小时 TTL 单独触发重拉。工具名稳定（`instabox_desktop_<远端名>`），所以写死了名字的 codemode 脚本跨版本仍可用。
+- **默认安静：**后台声明成功不提示——成功路径没有任何通知，工具直接出现。会话启动只有两种提示：`ls` 空/失败的「没有可用沙箱」，以及同步失败并给出 `/instabox-use <box>`。内部 `[pi-instabox] …` 的 stderr 输出与 JSONL 日志的 `debug` 级记录（见[日志](#日志)）默认关闭，设 `PI_INSTABOX_DEBUG=1` 才能看到唤醒、spawn 参数与握手内部细节；**选箱不需要开关**：每次工具调用都会以 `info` 落一条 `resolve`。
+- **全部暂停也会被拉起：**没有 running 的箱时，取 `instabox ls` 第一台在后台唤醒并拉模板；唤醒失败降级为那一条提示，会话不会被阻塞或拖住。
 - **桌面截图成本高：**配置了 DevTools server 时，浏览器相关工作优先走它；命名空间说明里也对模型传达了同一条。
 - **`box` 只作用于桌面工具：**它为 `instabox_desktop_*` 调用选择沙箱。DevTools server 固定绑定 `devToolsBox`，改它需要重新加载扩展。
 

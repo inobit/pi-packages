@@ -16,9 +16,14 @@
  * - 只把 `boxes` 里存在的名字当作候选：消息里提到一个不存在的箱名等于没提（那种名字
  *   本来也打不到），因此走下一级。
  * - 纯函数：不 import pi 运行时、不调 CLI、不读文件、无时钟；`boxes` 的顺序是唯一语义。
+ *   埋点只经 `logEvent`（未配置 logger 时 no-op），不参与结果构造。
  */
 
 import type { BoxInfo } from "./boxes.ts";
+import { logEvent } from "./log.ts";
+
+/** 埋点里候选名单的上限：`ls` 可能很长，日志只记前 N 个名字（箱数本身另由名单长度体现）。 */
+const LOG_CANDIDATE_LIMIT = 10;
 
 /** 命中来源，与解析链 5 级一一对应 */
 export type ResolveSource = "param" | "message" | "session" | "config" | "first";
@@ -65,32 +70,68 @@ export interface ResolveBoxInput {
  */
 export function resolveBox(input: ResolveBoxInput): ResolveResult {
 	const names = boxNames(input.boxes);
-
 	const param = nonEmpty(input.paramBox);
+	// 提及名单提前算好（纯函数，下面第 2 级用的就是这一份）：零命中也要留下一条埋点
+	const mentions = findBoxMentions(input.lastUserMessage ?? "", names);
+
+	/**
+	 * 埋点出口：成功记 `resolve`（命中的箱、来源、提及、本次扫描的候选、是否降级），
+	 * 失败记 `resolve.fail`。只记名字，不记消息全文。
+	 * `resolve` 是 `info` 级（每次工具调用最多一条，量小）：默认级别下也要能事后分析选箱。
+	 */
+	const done = (result: ResolveResult): ResolveResult => {
+		if (result.ok) {
+			logEvent(
+				"resolve",
+				{
+					param,
+					source: result.source,
+					box: result.box,
+					mentions,
+					candidates: names.slice(0, LOG_CANDIDATE_LIMIT),
+					degraded: result.skippedConfig === true,
+				},
+				"info",
+			);
+		} else {
+			logEvent(
+				"resolve.fail",
+				{
+					kind: result.kind,
+					message: result.message,
+					candidates: result.candidates.slice(0, LOG_CANDIDATE_LIMIT),
+				},
+				"warn",
+			);
+		}
+		return result;
+	};
+
 	if (param !== undefined) {
-		if (names.includes(param)) return { ok: true, box: param, source: "param" };
-		return failure("invalid-param", `unknown box "${param}"`, names);
+		if (names.includes(param)) return done({ ok: true, box: param, source: "param" });
+		return done(failure("invalid-param", `unknown box "${param}"`, names));
 	}
 
-	const mentions = findBoxMentions(input.lastUserMessage ?? "", names);
 	const mention = mentions.length === 1 ? mentions[0] : undefined;
-	if (mention !== undefined) return { ok: true, box: mention, source: "message" };
+	if (mention !== undefined) return done({ ok: true, box: mention, source: "message" });
 	if (mentions.length > 1) {
-		return failure("ambiguous", `the message mentions ${mentions.length} boxes (${mentions.join(", ")})`, mentions);
+		return done(
+			failure("ambiguous", `the message mentions ${mentions.length} boxes (${mentions.join(", ")})`, mentions),
+		);
 	}
 
 	const session = nonEmpty(input.sessionTarget);
 	if (session !== undefined) {
-		if (names.includes(session)) return { ok: true, box: session, source: "session" };
-		return failure("invalid-session", `session target "${session}" is not an existing box`, names);
+		if (names.includes(session)) return done({ ok: true, box: session, source: "session" });
+		return done(failure("invalid-session", `session target "${session}" is not an existing box`, names));
 	}
 
 	const config = nonEmpty(input.configDefaultBox);
 	let skippedConfig = false;
 	if (config !== undefined) {
-		if (names.includes(config)) return { ok: true, box: config, source: "config" };
+		if (names.includes(config)) return done({ ok: true, box: config, source: "config" });
 		if ((input.onConfigMissing ?? "skip") === "fail") {
-			return failure("invalid-config", `config defaultBox "${config}" is not an existing box`, names);
+			return done(failure("invalid-config", `config defaultBox "${config}" is not an existing box`, names));
 		}
 		// 配置写错只降级、不硬失败；用 skippedConfig 让调用方仍能 warn 一次
 		skippedConfig = true;
@@ -99,9 +140,9 @@ export function resolveBox(input: ResolveBoxInput): ResolveResult {
 	// 取过滤后的名字（而非 `boxes[0]`）：`name: ""` 的条目在别处都被当无效，
 	// 这里也不能把空箱名当成命中的第一台。
 	const first = names[0];
-	if (first === undefined) return failure("no-boxes", "instabox ls returned no boxes", []);
-	if (skippedConfig) return { ok: true, box: first, source: "first", skippedConfig: true };
-	return { ok: true, box: first, source: "first" };
+	if (first === undefined) return done(failure("no-boxes", "instabox ls returned no boxes", []));
+	if (skippedConfig) return done({ ok: true, box: first, source: "first", skippedConfig: true });
+	return done({ ok: true, box: first, source: "first" });
 }
 
 /**

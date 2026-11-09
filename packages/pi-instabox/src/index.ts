@@ -2,7 +2,11 @@
  * @inobit/pi-instabox — 扩展入口（装配层，方案 §4.2/§4.4/§4.5/§4.6、§5.1、T15）。
  *
  * 装配顺序：
- * 1. **加载期**只做一件事：`probeVersion`（`cli.ts` 默认 3000ms 预算），失败按原因分两种：
+ * 0. **加载期第一件事**：`loadConfig()` + `resolvePaths(getAgentDir())`，随即接上文件日志
+ *    `<agentDir>/logs/pi-instabox/pi-instabox.jsonl`（渠道与级别见 {@link attachLogger}）。
+ *    接线必须早于探测：否则 `cli.probe`（尤其失败/超时那条）会被丢掉，而它正是事后判断
+ *    「扩展为什么自禁用」的第一手证据。
+ * 1. 之后**加载期**只做一件事：`probeVersion`（`cli.ts` 默认 3000ms 预算），失败按原因分两种：
  *    - **明确没有 CLI**（`reason: "missing"` / 非 0 退出 / 无版本串）→ 只挂一条 `session_start`
  *      warning，不注册任何工具/命令/MCP、不写缓存与 helper、不 throw，也不重试。
  *      （这条「零注册」是方案 §7 验收 1 的硬要求；§6 的 T18 冒烟行只验证「无工具 / 无 MCP /
@@ -11,21 +15,26 @@
  *      5 次里 2 次吃满预算）**不等于没有 CLI**：本次仍零注册，但等第一次 `session_start` 用
  *      {@link RETRY_PROBE_TIMEOUT_MS}（5000ms）重试一次——成功就当场走完整装配并在本会话补跑
  *      后台任务，仍失败才按「无 CLI」禁用。只重试一次（一次性状态机）。
- * 2. 有 CLI：`loadConfig()` + `resolvePaths(getAgentDir())`，建 `BoxLister` / `Pool` /
- *    `TemplateStore` 三个会话级单例；**模板缓存命中就立刻注册工具**（加载期绝不跑 `ls`、
+ * 2. 有 CLI：建 `BoxLister` / `Pool` / `TemplateStore` 三个会话级单例（`cfg` / `paths` 已在第 0 步备好）；
+ *    **模板缓存命中就立刻注册工具**（加载期绝不跑 `ls`、
  *    绝不连远端），未命中等到 `session_start` 的**后台**拉取。整段装配在 `assemble()` 里，
- *    加载期与「超时后重试成功」共用同一份逻辑。
+ *    加载期与「超时后重试成功」共用同一份逻辑。日志已在第 0 步接上，因此装配全程的埋点都落盘；
+ *    装配失败 / 无 CLI 时**只**写日志，不建 `templates.json`、`bin/` 等运行期目录。
  * 3. 命令 `/instabox-use`（含冷启动唯一重试入口）与 `/instabox-status`（诊断）、目标 entry
  *    renderer、`devToolsBox` 非空时的 helper 写盘 + `registerMcpServer`。
  * 4. `session_start`：**同步段只做内存赋值与通知 drain**（`sessionCtx` 赋值、清一次性提示键、
- *    drain 队列），随后把后台任务丢到一个宏任务之后再跑：拉模板（`pool.get(…, { allowWake: false })`，
- *    **绝不唤醒**）→ 注册 → 实时读 codemode 状态，三分支里至多提示一次。
+ *    drain 队列），随后把后台任务丢到一个宏任务之后再跑。后台声明「成功即静默」，来源按
+ *    「有缓存 → 会话目标 / `config.defaultBox` / 最近拉取」「无缓存 → 第一台 running（不唤醒），
+ *    全暂停才后台唤醒列表第一台」选，只有**真的同步不了**才提示一次；成功后实时读 codemode
+ *    状态，三分支里至多提示一次。
  *    连「后台任务的同步前奏」都不放进事件处理器：`TemplateStore` / `readCache` 是同步磁盘读，
  *    放在 handler 帧里就等于阻塞会话启动（gate 型单测也测不出这一层，见 §4.4）。
+ *    内部日志默认静音，只有 `PI_INSTABOX_DEBUG=1` 时才写（见 {@link debug}）。
  * 5. `session_tree`：只换掉本次事件的 ctx（不写 prompt、不注入上下文）；目标状态本就不缓存，
  *    见下一条。
  * 6. `session_shutdown`：`pool.disposeAll()` 收掉本实例持有的远端连接（否则换会话 / `/reload`
- *    之后会残留 ssh 子进程），并丢掉已失效的 ctx。
+ *    之后会残留 ssh 子进程），并丢掉已失效的 ctx；随后 `setLogger(undefined)` 复位日志，
+ *    不留进程内残留（下一个会话重新装配时再建）。
  *
  * 会话状态一律**实时读** `ctx.sessionManager.getBranch()`：解析链第 2 级是「本轮最后一条 user
  * 消息」，缓存它会让这一级永远读到会话开始时的快照而失效；因此每次工具调用都用工具自带的
@@ -40,6 +49,7 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 	SessionEntry,
+	SessionStartEvent,
 	ToolExposure,
 } from "@earendil-works/pi-coding-agent";
 import { type BoxInfo, createBoxLister } from "./boxes.ts";
@@ -47,6 +57,7 @@ import { type ExecFn, type ProbeVersionResult, probeVersion } from "./cli.ts";
 import { getAgentDir, loadConfig, resolvePaths } from "./config.ts";
 import { buildMcpServerConfig, ensureHelperScript } from "./devtools.ts";
 import { createTargetRendererWithHostText } from "./entry-render.ts";
+import { type LogLevel, type Logger, createFileLogger, logEvent, setLogger } from "./log.ts";
 import { type Pool, createPool } from "./pool.ts";
 import type { RemoteClient, RemoteTool } from "./remote.ts";
 import { resolveBox, type ResolveResult } from "./resolve.ts";
@@ -56,6 +67,13 @@ import { buildToolDefinitions } from "./tools.ts";
 
 /** 无 `instabox` CLI 时的唯一提示（每会话一条；方案 §7 验收 1）。 */
 const NO_CLI_MESSAGE = "未找到 instabox CLI，instabox 扩展已禁用";
+
+/** `ls` 里唯一算「健康」的状态：后台声明优先挑它，且绝不唤醒它。 */
+const RUNNING_STATE = "running";
+
+/** 没有可用沙箱（`ls` 空或失败）：不可恢复，每会话至多一条。 */
+const NO_BOX_MESSAGE =
+	"instabox: 没有可用沙箱（instabox ls 返回空或失败），桌面工具未注册；请检查 instabox CLI 与沙箱状态";
 
 /** codemode 工具的注册名（只读判定用，绝不用来 `setActiveTools`）。 */
 const CODEMODE_TOOL = "codemode";
@@ -95,15 +113,39 @@ interface PendingNotification {
 }
 
 /**
+ * 日志构造参数（`createFileLogger` 的子集）：单测注入替身只需实现这些。
+ */
+export interface InstaboxLoggerOptions {
+	/** 日志目录（装配层给 `<agentDir>/logs/pi-instabox`） */
+	dir: string;
+	/** `PI_INSTABOX_DEBUG=1` → `debug`（含 `debug` 事件），否则 `info`（只记生命周期） */
+	level: LogLevel;
+	/** 写盘失败回调（默认转 {@link debug}，因此只有开 debug 时才见到） */
+	onError: (message: string) => void;
+}
+
+/**
  * 装配注入面：真实调用由 pi 只传 `pi`（默认值即生产行为），单测用它替掉会 spawn 的真远端客户端。
  */
 export interface InstaboxAssemblyDeps {
 	/** 覆盖 `pool` 的远端客户端工厂（默认 `createRemoteClient`，会 spawn `instabox ssh`） */
 	clientFactory?: (box: string) => RemoteClient;
+	/**
+	 * 覆盖文件日志构造（默认 `createFileLogger`）。
+	 *
+	 * 注入即视为显式测试接缝：`VITEST` 下**只有**注入时才建 logger，否则一律不建、不碰磁盘。
+	 */
+	loggerFactory?: (options: InstaboxLoggerOptions) => Logger;
 }
 
-/** 后台失败只记日志：不打断会话，也不覆盖旧缓存（调用方各自决定是否 notify）。 */
+/**
+ * 内部排查日志：**默认完全静音**，只有 `PI_INSTABOX_DEBUG=1` 才写一条。
+ *
+ * 后台同步成功即静默（不发 notice），日志也只在显式开启时出现，免得把会话输出搅乱；
+ * 排查时 `PI_INSTABOX_DEBUG=1 pi …` 就能看到来源选择、唤醒、握手失败这些细节。
+ */
 function debug(message: string): void {
+	if (process.env.PI_INSTABOX_DEBUG !== "1") return;
 	try {
 		console.warn(`${LOG_PREFIX} ${message}`);
 	} catch {
@@ -156,16 +198,17 @@ function namesOf(boxes: readonly BoxInfo[]): string[] {
 /**
  * 把异步的 `pool.get` 桥成 `template.ts` 要的**同步**客户端工厂。
  *
- * 工厂只记下 box；第一次 RPC 才去池里取连接，且固定 `allowWake: false`
- * （后台拉取绝不唤醒箱子，方案 §4.4 D4）。取不到就把原因抛给 `template.ensure`，
+ * 工厂只记下 box；第一次 RPC 才去池里取连接。`allowWake` 由 `template.ensure()` 透传：
+ * 后台路径自己决定（有 running 的箱就不唤醒；全是暂停的箱才允许唤醒），省略时保守地按
+ * `false` 处理——**模板层永远不会偷偷唤醒一台箱子**。取不到就把原因抛给 `template.ensure`，
  * 由它自己收成 `{ ok: false, error }` 并保留旧缓存。连接归 `pool` 所有，这里不 `close()`。
  */
-function lazyPoolClient(pool: Pool, box: string): RemoteClient {
+function lazyPoolClient(pool: Pool, box: string, options?: { allowWake?: boolean }): RemoteClient {
 	let client: RemoteClient | undefined;
 
 	async function use(): Promise<RemoteClient> {
 		if (client !== undefined && !client.isDead()) return client;
-		const got = await pool.get(box, { allowWake: false });
+		const got = await pool.get(box, { allowWake: options?.allowWake ?? false });
 		if (!got.ok) throw new Error(got.error);
 		client = got.client;
 		// `remote.ts` 的 initialize 幂等（重复调用共享同一次握手），因此这里只是把
@@ -204,15 +247,40 @@ export default async function instaboxExtension(
 ): Promise<void> {
 	const exec: ExecFn = (command, args, options) => pi.exec(command, args, options);
 
+	// —— 加载期第 0 步：配置与路径（探测之前，因此配置只在这里解析一次） ——
+	const cfg = loadConfig();
+	const paths = resolvePaths(getAgentDir());
+
 	/**
-	 * 成功路径的完整装配：配置 / 路径 / 池 / 模板缓存 / 命令 / renderer / DevTools MCP / 事件。
+	 * 接上文件日志（`<agentDir>/logs/pi-instabox/pi-instabox.jsonl`）：级别由 `PI_INSTABOX_DEBUG` 定。
 	 *
-	 * 加载期探测通过时调一次；「探测超时 → `session_start` 重试通过」时也调它
-	 * （同一份逻辑，不复制）。返回的 `startSession` 供重试路径在当前会话补跑后台任务。
+	 * **探测之前**就调（配置与路径解析完之后立刻），这样 `cli.probe`（含失败/超时）与装配失败
+	 * 都有记录；`log.ts` 的 `createFileLogger` 只在写入时建目录，因此「只写日志、不建运行期目录」
+	 * 由写入路径本身保证。`VITEST` 下不建（否则单测会写真实磁盘），此时 `logEvent` 就是 no-op；
+	 * 注入 `loggerFactory` 即视为显式测试接缝，跳过这个短路。
 	 */
-	function assemble(): { startSession: (ctx: ExtensionContext) => void } {
-		const cfg = loadConfig();
-		const paths = resolvePaths(getAgentDir());
+	function attachLogger(): void {
+		if (deps.loggerFactory === undefined && process.env.VITEST) return;
+		const factory = deps.loggerFactory ?? createFileLogger;
+		setLogger(
+			factory({
+				dir: paths.logDir,
+				level: process.env.PI_INSTABOX_DEBUG === "1" ? "debug" : "info",
+				onError: (message) => debug(message),
+			}),
+		);
+	}
+
+	attachLogger();
+
+	/**
+	 * 成功路径的完整装配：池 / 模板缓存 / 命令 / renderer / DevTools MCP / 事件。
+	 *
+	 * `cfg` / `paths` 来自加载期（第 0 步），日志已在那时接上。加载期探测通过时调一次；
+	 * 「探测超时 → `session_start` 重试通过」时也调它（同一份逻辑，不复制）。
+	 * 返回的 `startSession` 供重试路径在当前会话补跑后台任务。
+	 */
+	function assemble(): { startSession: (ctx: ExtensionContext, source?: SessionStartEvent["reason"]) => void } {
 		const boxLister = createBoxLister({ exec });
 		const pool = createPool({
 			exec,
@@ -222,7 +290,7 @@ export default async function instaboxExtension(
 		});
 		const templateStore = createTemplateStore({
 			paths,
-			clientFactory: (box) => lazyPoolClient(pool, box),
+			clientFactory: (box, options) => lazyPoolClient(pool, box, options),
 			warn: (message) => debug(message),
 		});
 
@@ -248,6 +316,7 @@ export default async function instaboxExtension(
 				return source.sessionManager.getBranch();
 			} catch (error) {
 				debug(`instabox: cannot read session branch: ${messageOf(error)}`);
+				logEvent("error", { where: "session branch", message: messageOf(error) }, "warn");
 				return [];
 			}
 		}
@@ -290,6 +359,7 @@ export default async function instaboxExtension(
 				await body();
 			} catch (error) {
 				debug(`instabox: ${label} failed: ${messageOf(error)}`);
+				logEvent("error", { where: label, message: messageOf(error) }, "warn");
 				ctx.ui.notify(`instabox: ${label} 失败：${messageOf(error)}`, "warning");
 			}
 		}
@@ -379,22 +449,24 @@ export default async function instaboxExtension(
 			return mostRecentlyFetchedCachedBox();
 		}
 
-		/** 后台拉取的目标箱：先看缓存（零 ssh），没有缓存才按解析链挑一个（会跑一次 `ls`）。 */
-		async function targetBoxForFetch(
-			ctx: ExtensionContext,
-		): Promise<{ ok: true; box: string } | { ok: false; error: string }> {
-			const cached = cachedTargetBox(ctx);
-			if (cached !== undefined) return { ok: true, box: cached };
-			const resolved = await resolveTarget(undefined, ctx);
-			if (!resolved.ok) return { ok: false, error: resolved.message };
-			return { ok: true, box: resolved.box };
-		}
-
 		/** codemode 三态：实时读 `getActiveTools()` / `getAllTools()`（加载期一律不判定）。 */
 		function codemodeState(): CodemodeState {
 			if (pi.getActiveTools().includes(CODEMODE_TOOL)) return "active";
 			const registered = pi.getAllTools().some((tool) => tool.name === CODEMODE_TOOL);
 			return registered ? "inactive" : "unavailable";
+		}
+
+		/**
+		 * codemode 三态 + 是否有 codemode-exposure 的 MCP server，落一条 `codemode` 埋点。
+		 * 日志里的 `missing` 对应内部三态的 `unavailable`（本会话根本没有 codemode 条目）。
+		 */
+		function logCodemode(): void {
+			const state = codemodeState();
+			logEvent(
+				"codemode",
+				{ state: state === "unavailable" ? "missing" : state, server: hasCodemodeExposureServer() },
+				"debug",
+			);
 		}
 
 		/**
@@ -429,31 +501,67 @@ export default async function instaboxExtension(
 
 		/** `session_start` 的 codemode 判定：至多一次，且只在确实有桌面工具时才有意义。 */
 		function notifyCodemodeOnce(): void {
+			logCodemode();
 			if (registeredTools.size === 0) return;
 			const notice = codemodeNotice();
 			if (notice !== undefined) notifyOnce("codemode", notice);
 		}
 
+		/** 同步失败的可操作提示（每会话至多一条）：只给 `/instabox-use <box>` 这条重试入口。 */
+		function notifySyncFailure(box: string, reason: string): void {
+			debug(`instabox: cannot sync desktop tools for "${box}": ${reason}`);
+			notifyOnce(
+				"sync-failed",
+				`instabox: 未能同步沙箱 "${box}" 的桌面工具（${reason}）；执行 /instabox-use ${box} 唤醒并重试。`,
+			);
+		}
+
 		/**
-		 * `session_start` 的后台拉取：**绝不唤醒**（惰性客户端固定 `allowWake: false`），
-		 * 失败只 debug + 一条可操作的 notify，不动旧缓存。
+		 * `session_start` 的后台声明：**成功一律静默**，只有真的同步不了才提示。
+		 *
+		 * 来源（按顺序）：
+		 * 1. 有缓存：会话目标 → `config.defaultBox` → 最近拉取的那台（都要有缓存条目才算）；
+		 *    `ensure(box, { allowWake: false })` 只做一次版本校验，失败**静默**沿用 `stale`。
+		 * 2. 无缓存：`ls --json`（`force: true`，跳过 5s 缓存）
+		 *    - 有 `state === "running"` 的箱 → 取**第一台** running，`allowWake: false`（不打扰）；
+		 *    - 全是非 running（列表非空）→ 取**列表第一台**，`allowWake: true`（后台唤醒，
+		 *      不传 `onProgress`，因此不会往会话里塞进度提示）。
+		 * 3. `ls` 空或失败 → 一条「没有可用沙箱」warning（不可恢复，每会话一次）。
+		 * 4. 拉到失败（无缓存、唤醒失败、认证/网络）→ 一条带 `/instabox-use <box>` 的 warning。
 		 */
 		async function refreshTemplateInBackground(ctx: ExtensionContext): Promise<void> {
-			const target = await targetBoxForFetch(ctx);
-			if (!target.ok) {
-				debug(`instabox: no target box for template fetch: ${target.error}`);
-				notifyOnce("no-template", `instabox: 桌面工具尚未注册（${target.error}）；执行 /instabox-use <box> 唤醒并重试。`);
+			const cachedBox = cachedTargetBox(ctx);
+			if (cachedBox !== undefined) {
+				// 一次握手做版本校验；失败沿用旧缓存（新鲜度放弃），静默不提示
+				const fetched = await templateStore.ensure(cachedBox, { allowWake: false });
+				const template = fetched.ok ? fetched.template : fetched.stale;
+				if (template === undefined) {
+					notifySyncFailure(cachedBox, fetched.ok ? "no cached template" : fetched.error);
+					return;
+				}
+				if (!fetched.ok) debug(`instabox: version check failed for "${cachedBox}", using cached tools: ${fetched.error}`);
+				registerDesktopTools(template.tools, cachedBox);
 				return;
 			}
-			const fetched = await templateStore.ensure(target.box);
-			const template = fetched.ok ? fetched.template : fetched.stale;
-			if (template === undefined) {
-				const reason = fetched.ok ? "no cached template" : fetched.error;
-				debug(`instabox: template unavailable for "${target.box}": ${reason}`);
-				notifyOnce("no-template", `instabox: 桌面工具尚未注册（${reason}）；执行 /instabox-use ${target.box} 唤醒并重试。`);
+
+			const listed = await boxLister.list({ force: true });
+			const names = listed.ok ? namesOf(listed.boxes) : [];
+			const running = listed.ok ? listed.boxes.find((box) => box.state === RUNNING_STATE) : undefined;
+			const box = running?.name ?? names[0];
+			if (box === undefined) {
+				debug(
+					`instabox: no boxes available (${listed.ok ? "empty list" : (listed.error ?? "unknown error")})`,
+				);
+				notifyOnce("no-box", NO_BOX_MESSAGE);
 				return;
 			}
-			registerDesktopTools(template.tools, target.box);
+			// 有 running 的箱就不唤醒；全是暂停的箱才允许后台唤醒（不传 onProgress，不阻塞会话）
+			const fetched = await templateStore.ensure(box, { allowWake: running === undefined });
+			if (!fetched.ok) {
+				notifySyncFailure(box, fetched.error);
+				return;
+			}
+			registerDesktopTools(fetched.template.tools, box);
 		}
 
 		/**
@@ -489,6 +597,11 @@ export default async function instaboxExtension(
 			const cached = templateStore.get(loadTarget);
 			if (cached !== undefined) registerDesktopTools(cached.tools, loadTarget);
 		}
+		logEvent("load.assembled", {
+			cacheHit: declaredFromBox !== undefined,
+			box: declaredFromBox,
+			tools: registeredTools.size,
+		});
 
 		/** `/instabox-use`：空参数列目标 + 候选；无效名拒绝；有效名写 entry（冷启动再唤醒 + 注册）。 */
 		async function handleUse(args: string, ctx: ExtensionCommandContext): Promise<void> {
@@ -590,14 +703,17 @@ export default async function instaboxExtension(
 				});
 			}
 			const registration = buildMcpServerConfig(cfg, paths);
+			let registered = true;
 			try {
 				pi.registerMcpServer(registration.name, registration.config);
 			} catch (error) {
+				registered = false;
 				pendingNotifications.push({
 					message: `instabox: 远端 DevTools MCP 注册失败（${messageOf(error)}）；桌面工具不受影响。`,
 					type: "warning",
 				});
 			}
+			logEvent("devtools.register", { box: cfg.devToolsBox, ok: registered });
 		}
 
 		/**
@@ -623,6 +739,7 @@ export default async function instaboxExtension(
 			const timer = setTimeout(() => {
 				void backgroundSessionStart(ctx).catch((error: unknown) => {
 					debug(`instabox: session_start background task failed: ${messageOf(error)}`);
+					logEvent("error", { where: "session_start background", message: messageOf(error) }, "warn");
 				});
 			}, 0);
 			(timer as unknown as { unref?: () => void }).unref?.();
@@ -635,24 +752,29 @@ export default async function instaboxExtension(
 		 * **当前**会话里补跑一次（那次 `session_start` 已经派发过了），所以这里必须单独成函数。
 		 */
 		let startedCtx: ExtensionContext | undefined;
-		function startSession(ctx: ExtensionContext): void {
+		function startSession(ctx: ExtensionContext, source?: SessionStartEvent["reason"]): void {
 			// 同一会话只启动一次：重试路径显式补跑时，若 pi 把刚注册的处理器也算进同一轮派发，不会跑两遍
 			if (startedCtx === ctx) return;
 			startedCtx = ctx;
 			sessionCtx = ctx;
 			notified.clear();
 			flushPendingNotifications(ctx);
+			// `source` = `session_start` 的 reason（startup / reload / new / resume / fork）；
+			// `target` 是本会话已有的目标 entry（未设则不记），与解析链结果无关。
+			logEvent("session.start", { target: readTarget(branchOf(ctx)), source, mode: ctx.mode });
 			// 不 await、也不在这里调用 async 体：pi 会 await 事件处理器，等在这里（甚至只是让 async
 			// 函数的同步前奏跑起来）就等于把 ssh/握手/读盘算进会话启动（方案 §4.4）
 			startBackgroundSessionStart(ctx);
 		}
 
-		pi.on("session_start", (_event, ctx) => startSession(ctx));
+		pi.on("session_start", (event, ctx) => startSession(ctx, event.reason));
 
 		// —— 事件：`/tree` 换分支后换掉 ctx（目标状态不缓存，解析链每次调用实时读分支） ——
 		pi.on("session_tree", async (_event, ctx) => {
 			sessionCtx = ctx;
-			debug(`instabox: session_tree → target=${readTarget(branchOf(ctx)) ?? "(not set)"}`);
+			const target = readTarget(branchOf(ctx));
+			logEvent("session.tree", { target }, "debug");
+			debug(`instabox: session_tree → target=${target ?? "(not set)"}`);
 		});
 
 		// —— 事件：会话结束（换会话 / `/reload` / 退出）→ 收掉本实例的远端连接，避免残留 ssh ——
@@ -662,6 +784,9 @@ export default async function instaboxExtension(
 			// 在飞的建连由池自己按代数校验丢弃（`dispose` 会把 clients 与 inflight 两侧都驱逐），
 			// 这里只把已失效的 ctx 放掉：之后的 `notifyOnce` 会走排队，等下一个会话 drain。
 			sessionCtx = undefined;
+			logEvent("session.shutdown", { open });
+			// 本实例已收尾：复位日志单例，避免进程内遗留（下一个会话重新装配时再建）
+			setLogger(undefined);
 			// 只在真的收过连接时记一条（没有连接时 shutdown 不该产生任何日志噪音）
 			if (open > 0) debug(`instabox: session_shutdown → disposed ${open} connection(s)`);
 		});
@@ -677,7 +802,7 @@ export default async function instaboxExtension(
 	 * 因此在**第一次** `session_start` 里用更长预算（{@link RETRY_PROBE_TIMEOUT_MS}）再探一次：
 	 * 成功 → 立刻装配并在本会话补跑后台任务；仍失败 → 才按「无 CLI」禁用。只重试一次。
 	 */
-	async function retryProbe(ctx: ExtensionContext): Promise<void> {
+	async function retryProbe(ctx: ExtensionContext, source?: SessionStartEvent["reason"]): Promise<void> {
 		const retried = await probeVersion(exec, { timeout: RETRY_PROBE_TIMEOUT_MS });
 		if (!retried.ok) {
 			disable(ctx, NO_CLI_MESSAGE, `CLI retry probe failed: ${retried.error}`);
@@ -685,7 +810,7 @@ export default async function instaboxExtension(
 		}
 		// 装配成功之后才算「可用」：`assemble()` 抛错时若已置 `assembled`，后续会话就再也不会
 		// 重试，而且会把「初始化失败」误报成「未找到 instabox CLI」
-		let session: { startSession: (ctx: ExtensionContext) => void };
+		let session: { startSession: (ctx: ExtensionContext, source?: SessionStartEvent["reason"]) => void };
 		try {
 			session = assemble();
 		} catch (error) {
@@ -699,7 +824,7 @@ export default async function instaboxExtension(
 		state = "assembled";
 		try {
 			// 本次会话已经派发过 session_start（处理器还没注册）→ 手动补跑后台拉取与 codemode 判定
-			session.startSession(ctx);
+			session.startSession(ctx, source);
 		} catch (error) {
 			// 装配已完成，只是本次补跑失败：只记日志，不改变状态（下一个会话正常启动）
 			debug(`instabox: startSession after retry failed: ${messageOf(error)}`);
@@ -718,6 +843,7 @@ export default async function instaboxExtension(
 			ctx.ui.notify(message, type);
 		} catch (error) {
 			debug(`instabox: ui.notify failed: ${messageOf(error)}`);
+			logEvent("error", { where: "ui.notify", message: messageOf(error) }, "warn");
 		}
 	}
 
@@ -734,7 +860,7 @@ export default async function instaboxExtension(
 		notifyQuietly(ctx, message);
 	}
 
-	// —— 加载期：只探测 CLI（默认 3000ms），没有就零注册、零写盘 ——
+	// —— 加载期：探测 CLI（默认 3000ms）；没有就零注册、不建运行期目录（日志已接上，只写日志） ——
 	const probe = await probeVersion(exec);
 	if (probe.ok) {
 		assemble();
@@ -749,7 +875,7 @@ export default async function instaboxExtension(
 	}
 	// 只是被超时击杀：本次零注册，等第一次 session_start 用更长预算重试
 	debug(`instabox CLI probe timed out; retrying on session_start with ${RETRY_PROBE_TIMEOUT_MS}ms: ${probe.error}`);
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", (event, ctx) => {
 		if (state === "assembled") return;
 		if (state === "disabled") {
 			notifyQuietly(ctx, disabledMessage);
@@ -758,7 +884,7 @@ export default async function instaboxExtension(
 		if (state === "probing") return;
 		state = "probing";
 		// 不 await：5000ms 的探测不能算进会话启动（与 `session_start` 其余部分同一口径）
-		void retryProbe(ctx).catch((error: unknown) => {
+		void retryProbe(ctx, event.reason).catch((error: unknown) => {
 			disable(ctx, `instabox 扩展初始化失败：${messageOf(error)}`, `retry probe failed: ${messageOf(error)}`);
 		});
 	});
