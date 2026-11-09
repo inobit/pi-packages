@@ -22,6 +22,8 @@
  *   （无缓存 + suspended → 唤醒 → 拉模板 → 注册）；
  * - 后台拉取失败给一条可操作提示，**连接即唤醒**（暂停箱的缓存也会被唤醒后取连接）；
  * - `session_tree` 后（实时读分支）目标更新；
+ * - `before_agent_start` 的发现提示：仅在已注册桌面工具时写，描述由远端 `initialize` 的
+ *   `instructions` 首行生成（远端数据变了，下一次注册后跟着变，同一模板内不变）；
  * - `/instabox-status` 打印配置/目标/工具声明来源/codemode 三态/MCP server；
  * - 文件日志的接线：**探测之前**就按 `<agentDir>/logs/pi-instabox` 建 logger（日志级别随
  *   `PI_INSTABOX_DEBUG`），因此 `cli.probe` 先于 `load.assembled` 落盘；无 CLI 时同样只写探测记录、
@@ -185,6 +187,14 @@ function createFakeExec(options: FakeExecOptions = {}) {
 	return { exec, calls, timeouts, started };
 }
 
+/** 假远端客户端的可调项（构造时固定，跨用例不共享）。 */
+interface FakeClientOptions {
+	/** `initialize` 直接失败（`ssh: authentication failed`） */
+	failInitialize?: boolean;
+	/** 按箱返回 `initialize` 的 `instructions`（`undefined` = 远端没报这句话） */
+	instructions?: (box: string) => string | undefined;
+}
+
 /** 假远端客户端：`listTools` 返回构造时给的远端工具，`callTool` 回一条 text。 */
 class FakeRemoteClient implements RemoteClient {
 	readonly callToolCalls: { name: string; args: Record<string, unknown> | undefined }[] = [];
@@ -193,11 +203,19 @@ class FakeRemoteClient implements RemoteClient {
 	/** 是否被 `close()`（`session_shutdown` → `pool.disposeAll()` 的观察点） */
 	closed = false;
 
-	constructor(private readonly tools: readonly RemoteTool[]) {}
+	constructor(
+		private readonly tools: readonly RemoteTool[],
+		/** 远端对整组工具的一句话描述（`initialize.instructions`）；`undefined` = 远端没报 */
+		private readonly instructions: string | undefined = undefined,
+	) {}
 
 	async initialize(): Promise<InitializeResult> {
 		this.initializeCalls += 1;
-		return { protocolVersion: "2025-03-26", serverInfo: { name: "instabox-computer-use", version: "0.3.6-instabox.1" } };
+		return {
+			protocolVersion: "2025-03-26",
+			serverInfo: { name: "instabox-computer-use", version: "0.3.6-instabox.1" },
+			...(this.instructions === undefined ? {} : { instructions: this.instructions }),
+		};
 	}
 
 	async listTools(): Promise<RemoteTool[]> {
@@ -221,12 +239,13 @@ class FakeRemoteClient implements RemoteClient {
 /** 注入给 `pool` 的假客户端工厂（每个 box 一个实例，按名字建远端工具）。 */
 function createFakeClientFactory(
 	remoteNames: readonly string[] = ["click", "screenshot"],
-	options: { failInitialize?: boolean } = {},
+	options: FakeClientOptions = {},
 ) {
 	const clients = new Map<string, FakeRemoteClient>();
 	const factory = (box: string): RemoteClient => {
 		const client = new FakeRemoteClient(
 			remoteNames.map((name) => ({ name, description: `${box} ${name}`, inputSchema: { type: "object", properties: {} } })),
+			options.instructions?.(box),
 		);
 		if (options.failInitialize === true) {
 			client.initialize = async () => {
@@ -263,8 +282,9 @@ function enableDevTools(pi: FakePi, box?: string): void {
 async function assembleExtension(
 	pi: FakePi,
 	remoteNames: readonly string[] = DEFAULT_REMOTE_NAMES,
+	options: FakeClientOptions = {},
 ): Promise<{ clients: Map<string, FakeRemoteClient> }> {
-	const { factory, clients } = createFakeClientFactory(remoteNames);
+	const { factory, clients } = createFakeClientFactory(remoteNames, options);
 	await instaboxExtension(pi.asAPI(), { clientFactory: factory });
 	return { clients };
 }
@@ -476,11 +496,38 @@ function userMessageEntry(text: string): SessionEntry {
 
 const TEMPLATE_TOOL_NAMES = ["screenshot", "click", "type_text", "list_apps"] as const;
 
+/**
+ * `before_agent_start` 的最小载荷：装配层只读 `systemPromptOptions.sections`。
+ * 真宿主里其余字段由 `normalizeBuildSystemPromptOptions` 补全，这里只留断言用得上的那几样。
+ */
+interface PromptEvent {
+	type: "before_agent_start";
+	messageType: "user";
+	prompt: string;
+	systemPrompt: string;
+	systemPromptOptions: { sections: Record<string, string> };
+}
+
+/** 一次 run 的开始（每次新建一份 `sections`，模拟宿主每次重新构建 prompt options）。 */
+function promptEvent(): PromptEvent {
+	return {
+		type: "before_agent_start",
+		messageType: "user",
+		prompt: "take a screenshot of the desktop",
+		systemPrompt: "(default system prompt)",
+		systemPromptOptions: { sections: {} },
+	};
+}
+
 interface TemplateCacheOptions {
 	/** 远端 schema 自带 `box`：`injectBoxParam` 拒绝注入 → `buildToolDefinitions` 走一次 warn */
 	boxConflict?: boolean;
 	/** 逐箱覆盖 `fetchedAt`（ISO 串）：用来构造「最近拉取的那台」 */
 	fetchedAt?: Record<string, string>;
+	/** 逐箱的 `initialize.instructions`（发现提示的来源）；缺省则不写该字段（模拟旧缓存） */
+	instructions?: Record<string, string>;
+	/** 覆盖所有箱的 `serverInfoVersion`（与假远端版本不同才会触发重拉） */
+	serverInfoVersion?: string;
 }
 
 /** 写 per-box 模板缓存（`<agentDir>/pi-instabox/templates.json`），`fetchedAt` 取当前时刻故 TTL 内。 */
@@ -496,10 +543,12 @@ function writeTemplateCache(
 	fs.mkdirSync(dir, { recursive: true });
 	const entries: Record<string, unknown> = {};
 	for (const [box, names] of Object.entries(boxes)) {
+		const instructions = options.instructions?.[box];
 		entries[box] = {
-			serverInfoVersion: "0.3.6-instabox.1",
+			serverInfoVersion: options.serverInfoVersion ?? "0.3.6-instabox.1",
 			templateId: "agent-browser",
 			templateVersion: "2026-10-25.23",
+			...(instructions === undefined ? {} : { serverInstructions: instructions }),
 			fetchedAt: options.fetchedAt?.[box] ?? new Date().toISOString(),
 			tools: names.map((name) => ({
 				name,
@@ -867,7 +916,8 @@ describe("@inobit/pi-instabox 装配", () => {
 			]);
 			expect([...pi.renderers.keys()]).toEqual([TARGET_ENTRY]);
 			expect(pi.registeredServers.map((server) => server.name)).toEqual(["instabox-devtools"]);
-			expect(pi.eventNames()).toEqual(["session_start", "session_tree", "session_shutdown"]);
+			// `session_start` 排在最前：超时路径的“会话内重试”处理器在装配之前就登了
+			expect(pi.eventNames()).toEqual(["session_start", "before_agent_start", "session_tree", "session_shutdown"]);
 			// 没有「无 CLI」warning（超时不是「没有 CLI」）
 			expect(messagesOf(notifications)).toEqual([]);
 
@@ -1032,14 +1082,14 @@ describe("@inobit/pi-instabox 装配", () => {
 			const { pi, calls } = await assemble();
 
 			expect(pi.toolNames()).toEqual(TEMPLATE_TOOL_NAMES.map((name) => `instabox_desktop_${name}`).sort());
-			expect(pi.tools.every((tool) => tool.exposure === "codemode")).toBe(true);
+			expect(pi.tools.every((tool) => tool.exposure === "deferred")).toBe(true);
 			expect(pi.commands.map((command) => command.name)).toEqual([
 				"instabox-use",
 				"instabox-status",
 				"instabox-devtools",
 			]);
 			expect([...pi.renderers.keys()]).toEqual([TARGET_ENTRY]);
-			expect(pi.eventNames()).toEqual(["session_start", "session_tree", "session_shutdown"]);
+			expect(pi.eventNames()).toEqual(["before_agent_start", "session_start", "session_tree", "session_shutdown"]);
 			expect(calls).toEqual([["instabox", "version"]]);
 		});
 
@@ -1841,6 +1891,97 @@ describe("@inobit/pi-instabox 装配", () => {
 		});
 	});
 
+	describe("before_agent_start 的发现提示（deferred 工具，文案由远端数据生成）", () => {
+		/** 与 pi 写 MCP 工具那段同款的 intro（恒定） */
+		const INTRO = "instabox desktop tools whose declarations are not loaded. Call them from codemode scripts.";
+		/** 一句话描述行（内容来自远端 `initialize.instructions` 首行） */
+		const line = (description: string): string => `- instabox-desktop (codemode): ${description}`;
+
+		/** 每一次 run 新建一份 sections（模拟宿主每次重新构建 prompt options），返回写进去的 section。 */
+		async function sectionOf(pi: FakePi, ctx: ExtensionContext): Promise<string | undefined> {
+			const event = promptEvent();
+			await pi.emit("before_agent_start", event, ctx);
+			return event.systemPromptOptions.sections["instabox-desktop"];
+		}
+
+		it("没有注册桌面工具 → 不写 section（不空承诺）", async () => {
+			noDefaultBox();
+			const { exec } = createFakeExec({ boxes: [] });
+			const pi = new FakePi(exec);
+			await assembleExtension(pi);
+			const { ctx } = createFakeContext([]);
+
+			const event = promptEvent();
+			await pi.emit("before_agent_start", event, ctx);
+
+			expect(pi.tools).toHaveLength(0);
+			expect(event.systemPromptOptions.sections).toEqual({});
+			expect(pi.setActiveToolsCalls).toEqual([]);
+		});
+
+		it("注册时按远端 instructions 首行生成两行 section；连续两次 run 文本不变", async () => {
+			noDefaultBox();
+			const { exec } = createFakeExec({ boxes: [{ name: "general", state: "running" }] });
+			const pi = new FakePi(exec);
+			await assembleExtension(pi, DEFAULT_REMOTE_NAMES, {
+				instructions: () =>
+					"Computer Use tools let you interact with Linux desktop apps by performing UI actions.\nSecond line is ignored.",
+			});
+			const { ctx } = createFakeContext([]);
+
+			// 无缓存 → session_start 的后台拉取 → 注册 → 提示按这份模板生成
+			await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+			await waitFor(() => pi.tools.length > 0, "background registration");
+
+			const expected = [
+				INTRO,
+				line("Computer Use tools let you interact with Linux desktop apps by performing UI actions."),
+			].join("\n");
+			expect(await sectionOf(pi, ctx)).toBe(expected);
+			expect(expected.split("\n")).toHaveLength(2);
+
+			// 第二个 run：同一段文字（宿主按内容 diff，不变就不会打 mid-conversation 的 system 补丁）
+			expect(await sectionOf(pi, ctx)).toBe(expected);
+			// 远端没给的细节一律不进文案：第二行、工具数都不该出现
+			expect(expected).not.toContain("Second line");
+			expect(expected).not.toMatch(/\d/);
+			// 只碰 `sections`：绝不激活/改写工具选择集
+			expect(pi.setActiveToolsCalls).toEqual([]);
+		});
+
+		it("远端 instructions 变化（版本也变了）→ 下一次注册后 section 跟着变", async () => {
+			noDefaultBox();
+			// 缓存版本比假远端低一档：后台握手发现版本变了就会重拉，拿回新的 instructions
+			writeTemplateCache(
+				agentDir,
+				{ general: ["click"] },
+				{ serverInfoVersion: "0.3.5-instabox.1", instructions: { general: "Old server instructions." } },
+			);
+			const { exec } = createFakeExec({ boxes: [{ name: "general", state: "running" }] });
+			const pi = new FakePi(exec);
+			await assembleExtension(pi, DEFAULT_REMOTE_NAMES, {
+				instructions: () =>
+					"Computer Use tools let you interact with Linux desktop apps by performing UI actions.",
+			});
+			const { ctx } = createFakeContext([targetEntry("general")]);
+
+			// 加载期按缓存声明：文案来自缓存里的 instructions
+			expect(await sectionOf(pi, ctx)).toBe([INTRO, line("Old server instructions.")].join("\n"));
+
+			await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+			await waitFor(
+				() => pi.tools.some((tool) => tool.name === "instabox_desktop_screenshot"),
+				"refetch after the remote version changed",
+			);
+
+			expect(await sectionOf(pi, ctx)).toBe(
+				[INTRO, line("Computer Use tools let you interact with Linux desktop apps by performing UI actions.")].join(
+					"\n",
+				),
+			);
+		});
+	});
+
 	describe("/instabox-status", () => {
 		it("打印配置摘要、解析目标、工具声明来源、active tools、codemode 与 MCP server", async () => {
 			writeTemplateCache(agentDir, { general: ["click"] });
@@ -1857,7 +1998,7 @@ describe("@inobit/pi-instabox 装配", () => {
 			expect(lines[0]).toContain("config: defaultBox=general");
 			expect(lines).toContain("session target: (not set)");
 			expect(lines).toContain("resolved target: general (via config)");
-			expect(lines).toContain("tools: instabox_desktop_click (codemode)");
+			expect(lines).toContain("tools: instabox_desktop_click (deferred)");
 			expect(lines).toContain(
 				'tool declarations: from the cached template of box "general" (the per-call target is resolved at call time)',
 			);

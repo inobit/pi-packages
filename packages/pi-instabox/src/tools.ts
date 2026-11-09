@@ -12,9 +12,12 @@
  * - `parameters` = `injectBoxParam(jsonSchemaToTypeBox(remote.inputSchema))`：`box` 只加在**顶层**
  *   `properties`、永不进 `required`。远端自带 `box`（或顶层不是 object schema）→ 不注入、
  *   只 `warn`（解析链退到 2–5 级，方案 §4.8 ④）。
- * - `exposure: "codemode"`（裁决 V2：本模块连 `ExtensionAPI` 都不碰，绝不 `setActiveTools`）；
- *   所有工具共享同一 `namespace`（`instabox-desktop`，别名 `instabox_desktop`），codemode 才会
- *   按组展示、`describeNamespace()` 才找得到它们。
+ * - `exposure: "deferred"`（裁决 V2：本模块连 `ExtensionAPI` 都不碰，绝不 `setActiveTools`）：
+ *   与 MCP 工具同一档——**不进** codemode 描述（连计数都不占），但仍可从 codemode 脚本调用。
+ *   所有工具共享同一 `namespace`（`instabox-desktop`，别名 `instabox_desktop`），这个字段必须留着：
+ *   codemode 脚本靠它 `describeNamespace()` / `searchTools({ namespace })` 才找得到声明。因为
+ *   `deferred` 既不声明也不列描述，发现手段必须由装配层说明（{@link buildDiscoveryHint}，
+ *   由 `index.ts` 的 `before_agent_start` 写进 system prompt）。
  * - `execute`：取 `box` 参数 → 注入的 `resolve`（5 级解析链）→ `pool.get`（复用/唤醒/建连）→
  *   `client.callTool(remote_name, 其余参数, signal)`。结果**首行固定** `[box=<name>]`（第一个
  *   text content），远端 `content` 原样透传（含 image），`isError` 保留并追加一行修复建议。
@@ -66,6 +69,43 @@ export const DESKTOP_NAMESPACE_INSTRUCTIONS = [
 	"The first line of every result is [box=<name>]: it states which box actually ran the call, so check it whenever more than one box is in play.",
 	'Desktop screenshots are expensive. For browser work prefer the DevTools server when one is configured: discover it with describeNamespace("mcp__instabox_devtools") or searchTools("devtools") and only use desktop clicks/screenshots when DevTools cannot do the job.',
 ].join("\n");
+
+/** 发现提示里 `(codemode): …` 那段描述的最大长度（与 pi 的 `mcp_servers` 段同口径）。 */
+const DISCOVERY_DESCRIPTION_MAX_CHARS = 250;
+
+/**
+ * 发现提示：装配层在每次 run 之前把它写进 system prompt 的 `instabox-desktop` section。
+ *
+ * `deferred` 的工具既不在工具列表里、也不进 codemode 描述，宿主也不会替非 MCP 的工具提示它们
+ * 存在，所以模型只能靠这一段知道「先 `describeNamespace()` / `searchTools()` 拿到声明，再调用」。
+ * 格式与 pi 自己写给 MCP 工具的 `mcp_servers` 段同款：一行 intro，加每个能力一行
+ * `- <namespace> (codemode): <一句话描述>`——模型已经在 MCP 段里学会读这种形状，不需要第二种写法。
+ *
+ * 描述**由远端数据生成**：取远端 `initialize` 的 `instructions` 首行（远端没报时回退到
+ * {@link DESKTOP_NAMESPACE_DESCRIPTION}），与 pi 给 MCP server 写的那行同源。同一份模板内文案恒定
+ * （不含数量、箱名、时间），只有远端真的改了 `instructions` 才会变；内容不变就不会产生
+ * mid-conversation 的 system 补丁，前缀缓存也就不失效。
+ *
+ * `toolCount` 是**诊断用**的入参：刻意**不**渲染进文案——工具数会随着远端版本漂移，
+ * 写进 section 只会制造无意义的 system 补丁。
+ */
+export function buildDiscoveryHint(input: { toolCount: number; serverInstructions?: string }): string {
+	return [
+		"instabox desktop tools whose declarations are not loaded. Call them from codemode scripts.",
+		`- ${DESKTOP_NAMESPACE_NAME} (codemode): ${discoveryDescription(input.serverInstructions)}`,
+	].join("\n");
+}
+
+/**
+ * `instructions` → 一行描述：取首行，超过 {@link DISCOVERY_DESCRIPTION_MAX_CHARS} 时按 pi 的
+ * `truncate` 口径裁到总长 250（保留 249 字符 + `…`）。空 / 缺失时回退到命名空间描述。
+ */
+function discoveryDescription(serverInstructions: string | undefined): string {
+	const firstLine = (serverInstructions ?? "").split("\n", 1)[0]?.trim() ?? "";
+	const text = firstLine === "" ? DESKTOP_NAMESPACE_DESCRIPTION : firstLine;
+	if (text.length <= DISCOVERY_DESCRIPTION_MAX_CHARS) return text;
+	return `${text.slice(0, DISCOVERY_DESCRIPTION_MAX_CHARS - 1).trimEnd()}…`;
+}
 
 /** `isError` 结果追加的一行：说清「没有自动重试、也没有换箱」，给出两条可执行补救。 */
 const IS_ERROR_REMEDY =
@@ -156,7 +196,7 @@ function buildToolDefinition(
 		label: desktopToolLabel(remote.name),
 		description: descriptionOf(remote),
 		parameters: schema,
-		exposure: "codemode",
+		exposure: "deferred",
 		namespace,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const startedAt = Date.now();

@@ -6,7 +6,8 @@
  * 写盘失败只 warn、`initialize` 失败保留旧缓存、`allowWake` 原样透传给 clientFactory、
  * 拉取过程**只**走 `initialize` + `listTools`（不唤醒箱、不动唤醒链）；
  * 以及 review 补的：原型键（`constructor` / `__proto__`）不误命中、
- * `templateId` / `templateVersion` 入参优先、失败结果带出旧缓存（`stale`）。
+ * `templateId` / `templateVersion` 入参优先、失败结果带出旧缓存（`stale`）；
+ * 以及 `serverInstructions`：握手的 `initialize.instructions` 进缓存、缺失时为 `undefined`、旧缓存兼容。
  */
 
 import fs from "node:fs";
@@ -480,6 +481,60 @@ describe("createTemplateStore — 命中与过期", () => {
 		const harness = new StoreHarness({ initializeResult: {} });
 		const result = await harness.store.ensure("general");
 		expect(result.ok && result.template.serverInfoVersion).toBe("");
+	});
+});
+
+describe("serverInstructions（握手的 instructions 进缓存）", () => {
+	const INSTRUCTIONS = "Computer Use tools let you interact with Linux desktop apps by performing UI actions.\nSecond line.";
+
+	it("initialize 带 instructions → 内存缓存与磁盘缓存都有", async () => {
+		const harness = new StoreHarness({
+			initializeResult: { serverInfo: { version: BOX_VERSION }, instructions: INSTRUCTIONS },
+		});
+		const result = await harness.store.ensure("general");
+		expect(result.ok && result.template.serverInstructions).toBe(INSTRUCTIONS);
+		expect(harness.store.get("general")?.serverInstructions).toBe(INSTRUCTIONS);
+		expect(readCache(harness.fs.readText, CACHE_FILE).boxes["general"]?.serverInstructions).toBe(INSTRUCTIONS);
+	});
+
+	it("initialize 不带 instructions → undefined（不凭空造字段，也不写空串）", async () => {
+		const harness = new StoreHarness();
+		const result = await harness.store.ensure("general");
+		expect(result.ok && result.template.serverInstructions).toBeUndefined();
+		expect(harness.store.get("general")).not.toHaveProperty("serverInstructions");
+		expect(readCache(harness.fs.readText, CACHE_FILE).boxes["general"]).not.toHaveProperty("serverInstructions");
+	});
+
+	it("instructions 为空白 → 同样记 undefined（不允许空描述进缓存）", async () => {
+		const harness = new StoreHarness({ initializeResult: { serverInfo: { version: BOX_VERSION }, instructions: " \n " } });
+		const result = await harness.store.ensure("general");
+		expect(result.ok && result.template.serverInstructions).toBeUndefined();
+	});
+
+	it("重拉时以这次握手为准：旧缓存的 instructions 不被继承", async () => {
+		const harness = new StoreHarness();
+		seedDisk(harness.fs, {
+			general: entry({
+				serverInstructions: "stale instructions",
+				fetchedAt: new Date(NOW - DEFAULT_TEMPLATE_TTL_MS * 2).toISOString(),
+			}),
+		});
+		const result = await harness.store.ensure("general");
+		expect(result.ok && result.refetched).toBe(true);
+		expect(harness.store.get("general")).not.toHaveProperty("serverInstructions");
+	});
+
+	it("旧缓存没有该字段也照常命中、不报错，并在读盘时保留已有值", async () => {
+		const harness = new StoreHarness();
+		seedDisk(harness.fs, { general: entry() });
+		const hit = await harness.store.ensure("general");
+		expect(hit.ok && hit.refetched).toBe(false);
+		expect(hit.ok && hit.template.serverInstructions).toBeUndefined();
+		expect(harness.warnings).toEqual([]);
+
+		const withInstructions = new MemoryFileSystem();
+		seedDisk(withInstructions, { general: entry({ serverInstructions: "kept" }) });
+		expect(readCache(withInstructions.readText, CACHE_FILE).boxes["general"]?.serverInstructions).toBe("kept");
 	});
 });
 

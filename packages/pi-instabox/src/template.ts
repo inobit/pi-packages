@@ -9,6 +9,8 @@
  * - 版本比对的 `serverInfoVersion` **只能**取自远端 `initialize` 的 `serverInfo.version`
  *   （即 `instabox-computer-use` 版本），不是 `ls` 的 `template.version`。`templateId` /
  *   `templateVersion` 只作为诊断字段透传保留，本模块不采集。
+ * - 同一次握手的 `instructions`（远端对整组工具的一句话描述）随工具一起缓存（
+ *   `serverInstructions`）：发现提示由它生成，不该在装配层另写一份文案。
  * - **绝不唤醒 box**：本模块不 import `cli.ts`，也不调用任何 `wake` / `start` / `resume`；
  *   只通过注入的 `clientFactory` 拿连接、`initialize()` + `listTools()`。`instabox ssh` 到
  *   暂停箱会直接失败，失败即返回 `ok: false` 并保留旧缓存——唤醒链归 `pool.ts`。
@@ -50,6 +52,11 @@ export interface CachedTemplate {
 	templateId?: string;
 	/** 诊断字段（来自 `ls`；本模块不采集远端值，只保留入参或旧缓存里的值） */
 	templateVersion?: string;
+	/**
+	 * 远端 `initialize` 的 `instructions`（裁掉两侧空白后的全文）；远端没报时为 `undefined`
+	 * （旧缓存没有该字段也照常可用）。发现提示取它的首行，见 `tools.buildDiscoveryHint`。
+	 */
+	serverInstructions?: string;
 	/** 拉取时间（ISO 8601，用于 TTL 判定） */
 	fetchedAt: string;
 	/** 远端 `tools/list` 原样结果（schema 未转 TypeBox） */
@@ -225,6 +232,16 @@ function parseTools(raw: unknown): RemoteTool[] | undefined {
 	return tools;
 }
 
+/**
+ * 远端 `instructions` 归一：非字符串 / 空白 → `undefined`。
+ * 空串不进缓存，免得发现提示里出现空描述（回退到命名空间描述更诚实）。
+ */
+function normalizeInstructions(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	return trimmed === "" ? undefined : trimmed;
+}
+
 /** 单个缓存条目：字段不全就整条丢弃（不拿半条缓存去注册工具）。 */
 function parseCachedTemplate(raw: unknown): CachedTemplate | undefined {
 	if (!isRecord(raw)) return undefined;
@@ -239,6 +256,9 @@ function parseCachedTemplate(raw: unknown): CachedTemplate | undefined {
 	if (typeof templateId === "string") entry.templateId = templateId;
 	const templateVersion = raw["templateVersion"];
 	if (typeof templateVersion === "string") entry.templateVersion = templateVersion;
+	// 旧缓存没有这个字段：缺了就用命名空间描述兜底，不算坏条目
+	const serverInstructions = normalizeInstructions(raw["serverInstructions"]);
+	if (serverInstructions !== undefined) entry.serverInstructions = serverInstructions;
 	return entry;
 }
 
@@ -387,6 +407,7 @@ class FileTemplateStore implements TemplateStore {
 		// 每次 ensure 都握手一次：版本校验的唯一可靠来源是远端 `serverInfo.version`
 		let client: RemoteClient;
 		let handshakeVersion: string;
+		let handshakeInstructions: string | undefined;
 		try {
 			// `allowWake` 只透传：没传第二参就交给工厂的默认策略
 			const allowWake = options.allowWake;
@@ -394,6 +415,7 @@ class FileTemplateStore implements TemplateStore {
 			const initialized = await client.initialize();
 			if (isAborted(options.signal)) return abortFailure(box, cached);
 			handshakeVersion = serverVersionOf(initialized);
+			handshakeInstructions = normalizeInstructions(initialized["instructions"]);
 		} catch (error) {
 			// 握手失败保留旧缓存（不写盘、不改内存），让调用方还能用上次的 schema 降级
 			this.warn?.(`template ensure failed for ${box}: ${messageOf(error)}`);
@@ -428,6 +450,8 @@ class FileTemplateStore implements TemplateStore {
 			fetchedAt: new Date(this.clock()).toISOString(),
 			tools,
 		};
+		// 不继承旧缓存的 instructions：这次握手没报就说明远端现在没有这句话
+		if (handshakeInstructions !== undefined) entry.serverInstructions = handshakeInstructions;
 		const cache = this.load();
 		cache.boxes[box] = entry;
 		writeCache(this.fs.writeText, this.cacheFile, cache, this.warn);

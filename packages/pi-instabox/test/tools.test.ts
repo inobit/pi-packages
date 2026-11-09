@@ -1,7 +1,8 @@
 /**
  * @inobit/pi-instabox — `src/tools.ts` 单测：远端 `tools/list` → pi 工具定义（名字/label/exposure/
  * namespace）、`box` 只加在顶层 `properties`、成功首行 `[box=…]`、远端 `content`（含 image）原样透传、
- * `isError` 透传 + 修复建议、解析失败不降级也不调池、`signal` 透传、一切异常转 `isError`。
+ * `isError` 透传 + 修复建议、解析失败不降级也不调池、`signal` 透传、一切异常转 `isError`；
+ * 以及 `buildDiscoveryHint`：两行形状、取 `instructions` 首行、超长裁 250、缺失回退到命名空间描述。
  *
  * 全部走假 `pool` / 假 `resolve` / 假 `listBoxes`：不 spawn 真进程、不联网、不读盘。
  */
@@ -17,7 +18,9 @@ import { jsonSchemaToTypeBox } from "../src/schema.ts";
 import {
 	BOX_PARAM,
 	DESKTOP_NAMESPACE_ALIASES,
+	DESKTOP_NAMESPACE_DESCRIPTION,
 	DESKTOP_NAMESPACE_NAME,
+	buildDiscoveryHint,
 	buildToolDefinitions,
 	desktopToolLabel,
 	desktopToolName,
@@ -187,12 +190,13 @@ describe("工具定义形状", () => {
 		expect(desktopToolLabel("click")).toBe("instabox desktop click");
 	});
 
-	it("exposure 全为 codemode，且共享同一 namespace（name/aliases/description/instructions）", () => {
+	it("exposure 全为 deferred，且共享同一 namespace（name/aliases/description/instructions）", () => {
 		const { tools } = build();
 		const first = tools[0]?.namespace;
 		expect(first).toBeDefined();
 		for (const tool of tools) {
-			expect(tool.exposure).toBe("codemode");
+			// `deferred`：不声明、也不进 codemode 描述（与 MCP 工具同档），但仍能从 codemode 脚本调用
+			expect(tool.exposure).toBe("deferred");
 			expect(tool.namespace).toBe(first);
 			expect(tool.namespace?.name).toBe(DESKTOP_NAMESPACE_NAME);
 			expect(tool.namespace?.aliases).toEqual([...DESKTOP_NAMESPACE_ALIASES]);
@@ -224,6 +228,54 @@ describe("工具定义形状", () => {
 		expect(warnings).toHaveLength(1);
 		expect(warnings[0]).toContain("more than once");
 		expect(warnings[0]).toContain("click");
+	});
+});
+
+describe("buildDiscoveryHint（从远端数据生成发现提示）", () => {
+	const INTRO = "instabox desktop tools whose declarations are not loaded. Call them from codemode scripts.";
+
+	/** 第二行 `- <namespace> (codemode): <描述>` 的描述部分（形状断言都用它）。 */
+	function descriptionOf(hint: string): string {
+		return hint.split("\n")[1]?.slice(`- ${DESKTOP_NAMESPACE_NAME} (codemode): `.length) ?? "";
+	}
+
+	it("固定两行：intro + `- <namespace> (codemode): <instructions 首行>`", () => {
+		const instructions = "Computer Use tools let you interact with Linux desktop apps by performing UI actions.";
+		const lines = buildDiscoveryHint({ toolCount: 9, serverInstructions: instructions }).split("\n");
+		expect(lines).toHaveLength(2);
+		expect(lines[0]).toBe(INTRO);
+		expect(lines[1]).toBe(`- ${DESKTOP_NAMESPACE_NAME} (codemode): ${instructions}`);
+	});
+
+	it("只取 instructions 首行（其余行不进描述）", () => {
+		const hint = buildDiscoveryHint({
+			toolCount: 9,
+			serverInstructions: "First line describes the server.\nSecond line is not part of the section.",
+		});
+		expect(descriptionOf(hint)).toBe("First line describes the server.");
+		expect(hint).not.toContain("Second line");
+	});
+
+	it("超长首行裁到 250 字符（与 pi 的 mcp_servers 段同口径：249 字符 + `…`）", () => {
+		const long = "x".repeat(400);
+		const description = descriptionOf(buildDiscoveryHint({ toolCount: 9, serverInstructions: long }));
+		expect(description).toHaveLength(250);
+		expect(description).toBe(`${"x".repeat(249)}…`);
+	});
+
+	it("instructions 缺失 / 空白 → 回退到命名空间描述", () => {
+		for (const serverInstructions of [undefined, "", "   \n  "]) {
+			const hint = buildDiscoveryHint({ toolCount: 9, ...(serverInstructions === undefined ? {} : { serverInstructions }) });
+			expect(descriptionOf(hint)).toBe(DESKTOP_NAMESPACE_DESCRIPTION);
+			expect(hint.split("\n")).toHaveLength(2);
+		}
+	});
+
+	it("工具数不进文案（不随工具增减产生无意义的 system 补丁）", () => {
+		const one = buildDiscoveryHint({ toolCount: 1, serverInstructions: "Desktop tools." });
+		const many = buildDiscoveryHint({ toolCount: 42, serverInstructions: "Desktop tools." });
+		expect(one).toBe(many);
+		expect(one).not.toMatch(/\d/);
 	});
 });
 

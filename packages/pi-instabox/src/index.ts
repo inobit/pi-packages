@@ -42,6 +42,11 @@
  * 6. `session_shutdown`：`pool.disposeAll()` 收掉本实例持有的远端连接（否则换会话 / `/reload`
  *    之后会残留 ssh 子进程），并丢掉已失效的 ctx；随后 `setLogger(undefined)` 复位日志，
  *    不留进程内残留（下一个会话重新装配时再建）。
+ * 7. `before_agent_start`：桌面工具是 `deferred`（既不声明、也不进 codemode 描述），所以每次 run
+ *    之前把一段发现提示写进 system prompt 的 `instabox-desktop` section
+ *    （{@link buildDiscoveryHint}），仅在确实注册过桌面工具时写。提示内容**由远端数据生成**：
+ *    每次注册桌面工具时用当前模板的 `tools.length` 与 `initialize` 的 `instructions` 重新算一次，
+ *    同一份模板内保持恒定（不产生 mid-conversation 的 system 补丁）。
  *
  * 会话状态一律**实时读** `ctx.sessionManager.getBranch()`：解析链第 2 级是「本轮最后一条 user
  * 消息」，缓存它会让这一级永远读到会话开始时的快照而失效；因此每次工具调用都用工具自带的
@@ -66,7 +71,7 @@ import { buildMcpServerConfig, ensureHelperScript } from "./devtools.ts";
 import { createTargetRendererWithHostText } from "./entry-render.ts";
 import { type LogLevel, type Logger, createFileLogger, logEvent, setLogger } from "./log.ts";
 import { type Pool, createPool } from "./pool.ts";
-import type { RemoteClient, RemoteTool } from "./remote.ts";
+import type { RemoteClient } from "./remote.ts";
 import { resolveBox, type ResolveResult } from "./resolve.ts";
 import {
 	DEVTOOLS_TARGET_ENTRY,
@@ -76,8 +81,8 @@ import {
 	readTarget,
 	targetEntryData,
 } from "./session-target.ts";
-import { createTemplateStore, nodeReadText, readCache } from "./template.ts";
-import { buildToolDefinitions } from "./tools.ts";
+import { type CachedTemplate, createTemplateStore, nodeReadText, readCache } from "./template.ts";
+import { buildDiscoveryHint, buildToolDefinitions } from "./tools.ts";
 
 /** 无 `instabox` CLI 时的唯一提示（每会话一条；方案 §7 验收 1）。 */
 const NO_CLI_MESSAGE = "未找到 instabox CLI，instabox 扩展已禁用";
@@ -361,6 +366,11 @@ export default async function instaboxExtension(
 		const notified = new Set<string>();
 		/** 已注册的桌面工具名 → exposure（`/instabox-status` 与「是否有工具」判定都读它） */
 		const registeredTools = new Map<string, ToolExposure>();
+		/**
+		 * 当前发现提示（`before_agent_start` 写入）；每次注册桌面工具时按当时模板的
+		 * `tools.length` 与 `serverInstructions` 重算，因此不必在事件里回读缓存。
+		 */
+		let discoveryHint: string | undefined;
 		/** 当前工具声明来自哪台箱的模板缓存（**不是**解析链结果：实际目标在调用时解析） */
 		let declaredFromBox: string | undefined;
 		/** 加载期产生、等 `session_start` 才有的 UI 出口 */
@@ -456,9 +466,9 @@ export default async function instaboxExtension(
 		}
 
 		/** 注册某箱模板里的工具（同名替换由宿主保证），返回本次声明的条数。 */
-		function registerDesktopTools(remoteTools: readonly RemoteTool[], box: string): number {
+		function registerDesktopTools(template: CachedTemplate, box: string): number {
 			const definitions = buildToolDefinitions({
-				remoteTools,
+				remoteTools: template.tools,
 				pool,
 				resolve: resolveTarget,
 				listBoxes: () => boxLister.list(),
@@ -469,6 +479,12 @@ export default async function instaboxExtension(
 				registeredTools.set(definition.name, definition.exposure ?? "direct");
 			}
 			declaredFromBox = box;
+			// 发现提示跟着这次注册的模板走：远端改了 `instructions` 而下一次注册用的是新模板，
+			// 下一次 run 就写新文案；模板不变则文案不变。
+			discoveryHint = buildDiscoveryHint({
+				toolCount: template.tools.length,
+				serverInstructions: template.serverInstructions,
+			});
 			return definitions.length;
 		}
 
@@ -602,7 +618,7 @@ export default async function instaboxExtension(
 					return;
 				}
 				if (!fetched.ok) debug(`instabox: version check failed for "${cachedBox}", using cached tools: ${fetched.error}`);
-				registerDesktopTools(template.tools, cachedBox);
+				registerDesktopTools(template, cachedBox);
 				return;
 			}
 
@@ -623,7 +639,7 @@ export default async function instaboxExtension(
 				notifySyncFailure(box, fetched.error);
 				return;
 			}
-			registerDesktopTools(fetched.template.tools, box);
+			registerDesktopTools(fetched.template, box);
 		}
 
 		/**
@@ -645,7 +661,7 @@ export default async function instaboxExtension(
 				);
 				return;
 			}
-			const count = registerDesktopTools(template.tools, box);
+			const count = registerDesktopTools(template, box);
 			if (reason === undefined) {
 				ctx.ui.notify(`instabox: registered ${count} desktop tool(s) for box "${box}"`, "info");
 				return;
@@ -657,7 +673,7 @@ export default async function instaboxExtension(
 		const loadTarget = cachedTargetBox();
 		if (loadTarget !== undefined) {
 			const cached = templateStore.get(loadTarget);
-			if (cached !== undefined) registerDesktopTools(cached.tools, loadTarget);
+			if (cached !== undefined) registerDesktopTools(cached, loadTarget);
 		}
 		logEvent("load.assembled", {
 			cacheHit: declaredFromBox !== undefined,
@@ -993,6 +1009,21 @@ export default async function instaboxExtension(
 			}, 0);
 			(timer as unknown as { unref?: () => void }).unref?.();
 		}
+
+		// —— 事件：每次 run 之前补一段「怎么发现桌面工具」的提示 ——
+		/**
+		 * 桌面工具是 `deferred`：既不在工具列表里，也不进 codemode 描述，宿主也不会为非 MCP 的工具
+		 * 提示它们存在。所以由本扩展在**每次 run 之前**把发现提示写进 system prompt。
+		 *
+		 * - 只在确实注册过桌面工具时才写：还没注册就写等于空承诺；
+		 * - 文案在注册时由远端数据生成（`discoveryHint`），同一份模板内不变，因此不会产生
+		 *   mid-conversation 的 system 补丁；
+		 * - 只碰 `sections`：**不**改 `selectedTools`、**不**调 `setActiveTools`。
+		 */
+		pi.on("before_agent_start", (event) => {
+			if (registeredTools.size === 0 || discoveryHint === undefined) return;
+			event.systemPromptOptions.sections["instabox-desktop"] = discoveryHint;
+		});
 
 		// —— 事件：会话开始 ——
 		/**
