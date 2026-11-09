@@ -21,12 +21,15 @@ const REMOTE_PATH = "/opt/npm/bin:/usr/local/bin:/usr/bin:/bin";
 const AGENT_DIR = path.join(path.sep, "tmp", "agent");
 const PATHS = resolvePaths(AGENT_DIR);
 
-/** 拉起箱的那一行：先把箱弄运行，失败不阻断（让后面的检查/ssh 自然报错）。 */
-const WAKE_LINE = 'instabox wake "$box" >/dev/null 2>&1 || instabox start "$box" >/dev/null 2>&1 || true';
+/**
+ * 拉起箱的那一行：先把箱弄运行，失败不阻断（让后面的检查/ssh 自然报错）。
+ * `$TO` 是 `timeout` 包装（系统里有 `timeout` 就是 `timeout 60`，没有就是空）。
+ */
+const WAKE_LINE =
+	'$TO instabox wake "$box" >/dev/null 2>&1 || $TO instabox start "$box" >/dev/null 2>&1 || true';
 
-/** 唤醒的现实上界（秒，真机实测）：running 箱 2 秒，suspended 箱 ≥45 秒放弃后还得 `start` 约 10–60 秒。 */
-const WAKE_TIMEOUT_SECONDS = 45;
-const START_TIMEOUT_SECONDS = 60;
+/** 唤醒步骤的 shell 层封顶（秒）：与 `DEFAULT_CONFIG.timeouts.prepareMs` 对齐的 1 分钟。 */
+const PREPARE_TIMEOUT_SECONDS = 60;
 
 /** 记录全部调用的内存文件系统；`failOn` 指哪一步抛错（模拟无权限/磁盘满） */
 function fakeFileSystem(failOn?: "ensureDir" | "writeText" | "setMode") {
@@ -86,7 +89,7 @@ describe("buildHelperScript 骨架", () => {
 
 	it("先 wake（失败再 start）拉起箱，失败不阻断，且该行不写 stdout", () => {
 		expect(script).toContain(`\n${WAKE_LINE}\n`);
-		const wakeLine = linesOf(script).find((line) => line.startsWith("instabox wake"));
+		const wakeLine = linesOf(script).find((line) => line.includes('instabox wake "$box"'));
 		// stdout 纯净：唤醒的输出（包括 `start` 那一支）全部丢到 /dev/null，一个字节也不留
 		expect(wakeLine?.endsWith("|| true")).toBe(true);
 		expect(wakeLine).not.toContain(">&2");
@@ -94,9 +97,25 @@ describe("buildHelperScript 骨架", () => {
 		expect((wakeLine?.match(/>\/dev\/null 2>&1/g) ?? []).length).toBe(2);
 	});
 
+	it("唤醒与拉起各包一层 `timeout`（有就用，没有就不加），并在 stderr 注释里说明上界", () => {
+		const code = linesOf(script);
+		const toIndex = code.findIndex((line) => line.startsWith("if command -v timeout"));
+		const wakeIndex = code.findIndex((line) => line.startsWith("$TO instabox wake"));
+		expect(code[toIndex]).toBe(
+			`if command -v timeout >/dev/null 2>&1; then TO="timeout ${PREPARE_TIMEOUT_SECONDS}"; else TO=""; fi`,
+		);
+		// 先定 `TO` 再用：顺序反过来会在 `set -u` 下报未定义变量
+		expect(wakeIndex).toBeGreaterThan(toIndex);
+		// 两条命令各用一次 `$TO`（wake 失败才退到 start）
+		expect((code[wakeIndex]?.match(/\$TO /g) ?? []).length).toBe(2);
+		// 注释说明「准备阶段上限 60s，真实上界仍是 pi 的 MCP per-request timeout」
+		expect(script).toContain(`准备阶段上限 ${PREPARE_TIMEOUT_SECONDS}s`);
+		expect(script).toContain("真实上界仍是 pi 的 MCP per-request timeout");
+	});
+
 	it("唤醒/拉起在安装检查之前，紧跟在 PATH 定义之后且在 if 块之外", () => {
 		const code = linesOf(script);
-		const wakeIndex = code.findIndex((line) => line.startsWith("instabox wake"));
+		const wakeIndex = code.findIndex((line) => line.startsWith("$TO instabox wake"));
 		const checkIndex = code.findIndex((line) => line.startsWith("if ! instabox exec"));
 		const pathIndex = code.findIndex((line) => line.startsWith("remote_path="));
 		expect(pathIndex).toBeGreaterThan(-1);
@@ -165,16 +184,16 @@ describe("buildHelperScript 的 autoInstall 分支", () => {
 
 describe("脚本预算与 MCP per-request timeout", () => {
 	// pi 的 MCP 客户端对 `initialize` 也计时，而 helper 的唤醒/检查/安装都在 `initialize` 应答之前跑完，
-	// 所以三段之和必须小于注册配置的 `timeout`，否则冷箱唤醒或安装会被提前报死。
-	it("autoInstall=true 时 `--timeout` 之和 < 注册的 per-request timeout", () => {
+	// 所以四段之和必须小于注册配置的 `timeout`，否则冷箱唤醒或安装会被提前报死。
+	it("autoInstall=true 时「唤醒 ×2 + 检查 + 安装」< 注册的 per-request timeout", () => {
 		const script = buildHelperScript({ remotePath: REMOTE_PATH, autoInstall: true });
 		const budgets = [...script.matchAll(/--timeout (\d+) --/g)].map((match) => Number(match[1]));
 		// 两段：检查 + 安装（最后一段 `instabox ssh` 不设 `--timeout`）
 		expect(budgets).toEqual([10, 40]);
 		const checked = budgets.reduce((sum, seconds) => sum + seconds, 0);
-		// 唤醒/拉起没有 `--timeout` 可设，只能按实测上界算进 preamble
-		const preambleWorstCase = WAKE_TIMEOUT_SECONDS + START_TIMEOUT_SECONDS + checked;
-		expect(preambleWorstCase).toBe(155);
+		// 唤醒/拉起没有 `--timeout` 可设，上界由 shell 的 `timeout` 包装给出（wake + start 各一次）
+		const preambleWorstCase = PREPARE_TIMEOUT_SECONDS * 2 + checked;
+		expect(preambleWorstCase).toBe(170);
 		expect(preambleWorstCase).toBeLessThan(
 			buildMcpServerConfig({ ...DEFAULT_CONFIG, devToolsBox: "agent" }, PATHS).config.timeout,
 		);

@@ -4,7 +4,7 @@
  *
  * 全部走注入的假 `ExecFn`（记录 command/args/opts 并回放结果），不 spawn 真进程、不联网。
  * `wake`/`start`/`resume` 的默认预算不写数字，而是断言「实际透传的 `timeout` ===
- * `DEFAULT_CONFIG.timeouts` 对应字段」（方案 §4.4：wake 50s / start·resume 120s）。
+ * `DEFAULT_CONFIG.timeouts` 对应字段」（方案 §4.4：wake 20s / start·resume 30s，都是单步上限）。
  */
 
 import { describe, expect, it } from "vitest";
@@ -66,9 +66,11 @@ describe("超时预算常量", () => {
 		expect(STDERR_TAIL_LIMIT).toBe(500);
 	});
 
-	it("生命周期预算单点在 config.ts（wake 50s / start·resume 120s，不另存一份数字）", () => {
-		expect(DEFAULT_CONFIG.timeouts.wakeMs).toBe(50_000);
-		expect(DEFAULT_CONFIG.timeouts.startMs).toBe(120_000);
+	it("生命周期预算单点在 config.ts（wake 20s / start·resume 30s，不另存一份数字）", () => {
+		expect(DEFAULT_CONFIG.timeouts.wakeMs).toBe(20_000);
+		expect(DEFAULT_CONFIG.timeouts.startMs).toBe(30_000);
+		// 两者都是**单步上限**，整段准备阶段的上界是 prepareMs（见 config.test.ts）
+		expect(DEFAULT_CONFIG.timeouts.prepareMs).toBe(60_000);
 	});
 });
 
@@ -329,6 +331,12 @@ describe("wake / start / resume", () => {
 		expect(result.stderrTail?.endsWith("ROOT-CAUSE")).toBe(true);
 	});
 
+	it("覆盖后的 timeout 原样透传（准备阶段传的就是 clamp 后的值）", async () => {
+		const { exec, calls } = recordingExec(okResult());
+		await start(exec, "agent", { timeout: 41_000 });
+		expect(calls[0]?.opts?.timeout).toBe(41_000);
+	});
+
 	it("抛异常转 ok:false（reason=error），不外抛", async () => {
 		const { exec } = recordingExec(new Error("ssh: connect timed out"));
 		expect(await resume(exec, "agent")).toEqual({
@@ -446,5 +454,37 @@ describe("埋点（logEvent）", () => {
 		expect(probes[0]?.level).toBe("info");
 		expect(probes[0]?.fields).toMatchObject({ ok: true, version: "0.4.2" });
 		expect(typeof probes[0]?.fields?.["ms"]).toBe("number");
+	});
+
+	it("cli.lifecycle 带实际生效的 timeoutMs（成功与失败都记）", async () => {
+		const logger = createMemoryLogger();
+		setLogger(logger);
+		try {
+			await wake(recordingExec(okResult()).exec, "agent", { timeout: 12_000 });
+			await start(recordingExec(failResult(1, "boom")).exec, "agent", { timeout: 7_500 });
+		} finally {
+			setLogger(undefined);
+		}
+
+		const records = logger.records.filter((record) => record.event === "cli.lifecycle");
+		expect(records).toHaveLength(2);
+		expect(records[0]?.fields).toMatchObject({ command: "wake", ok: true, timeoutMs: 12_000 });
+		expect(records[1]?.fields).toMatchObject({ command: "start", ok: false, timeoutMs: 7_500 });
+	});
+
+	it("cli.ls 带实际生效的 timeoutMs（覆盖值与默认预算各一条）", async () => {
+		const logger = createMemoryLogger();
+		setLogger(logger);
+		try {
+			await listBoxesRaw(recordingExec(okResult("[]")).exec, { timeout: 9_000 });
+			await listBoxesRaw(recordingExec(failResult(1, "boom")).exec);
+		} finally {
+			setLogger(undefined);
+		}
+
+		const records = logger.records.filter((record) => record.event === "cli.ls");
+		expect(records).toHaveLength(2);
+		expect(records[0]?.fields).toMatchObject({ ok: true, timeoutMs: 9_000 });
+		expect(records[1]?.fields).toMatchObject({ ok: false, timeoutMs: LIST_BOXES_TIMEOUT_MS });
 	});
 });

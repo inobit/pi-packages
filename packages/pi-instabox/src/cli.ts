@@ -8,7 +8,8 @@
  *   内部实现超时并回 `killed: true`），因此整套逻辑可离线单测。探测/列表/`exec` 的预算在
  *   本文件顶部单点维护；`wake`/`start`/`resume` 的生命周期预算单点取自 `config.ts` 的
  *   `DEFAULT_CONFIG.timeouts`（`wakeMs` / `startMs`，方案 §4.4），本文件不另存数字。
- *   调用方一律可用 `opts.timeout` 覆盖。
+ *   调用方一律可用 `opts.timeout` 覆盖——准备阶段（`pool.ts`）传的就是**钳制后的**值
+ *   （单步上限与剩余预算取小），日志里的 `timeoutMs` 记的就是实际生效的那个数。
  * - 一参数一元素：所有子命令都用 argv 数组传给 `ExecFn`（不拼 shell 字符串），
  *   `exec` 的远端预算用 `--timeout <秒>` 显式传，上限 600 秒。
  * - 失败归一：任何非 0 退出 / `killed` / 抛异常都转成 `{ ok: false, error }`，**绝不 throw**
@@ -233,23 +234,23 @@ export async function listBoxesRaw(exec: ExecFn, opts: CliRunOptions = {}): Prom
 	const call = await runOnce(exec, label, ["ls", "--json"], { timeout, signal: opts.signal });
 	if (!call.ok) {
 		const reason = classifyFailure(call.error, false);
-		logEvent("cli.ls", { ok: false, count: 0, reason, ms: Date.now() - startedAt });
+		logEvent("cli.ls", { ok: false, count: 0, reason, ms: Date.now() - startedAt, timeoutMs: timeout });
 		return { ok: false, error: call.error, reason };
 	}
 	const { result } = call;
 	if (failed(result)) {
 		const error = describeFailure(label, result, timeout);
 		const reason = classifyFailure(error, result.killed === true);
-		logEvent("cli.ls", { ok: false, count: 0, reason, ms: Date.now() - startedAt });
+		logEvent("cli.ls", { ok: false, count: 0, reason, ms: Date.now() - startedAt, timeoutMs: timeout });
 		return { ok: false, error, reason };
 	}
 	try {
 		const json: unknown = JSON.parse(result.stdout);
 		// 顶层数组长度就是箱数；非数组（结构不对）记 0，解析容错仍由 `boxes.ts` 负责
-		logEvent("cli.ls", { ok: true, count: Array.isArray(json) ? json.length : 0, ms: Date.now() - startedAt });
+		logEvent("cli.ls", { ok: true, count: Array.isArray(json) ? json.length : 0, ms: Date.now() - startedAt, timeoutMs: timeout });
 		return { ok: true, json };
 	} catch {
-		logEvent("cli.ls", { ok: false, count: 0, reason: "error", ms: Date.now() - startedAt });
+		logEvent("cli.ls", { ok: false, count: 0, reason: "error", ms: Date.now() - startedAt, timeoutMs: timeout });
 		return {
 			ok: false,
 			error: `instabox ls --json returned invalid JSON: ${tail(result.stdout)}`,
@@ -260,7 +261,7 @@ export async function listBoxesRaw(exec: ExecFn, opts: CliRunOptions = {}): Prom
 
 /**
  * `instabox wake <box>`：只唤「自己暂停」的箱，默认预算 {@link DEFAULT_CONFIG.timeouts.wakeMs}
- * （50 秒，比 CLI 自带的 45 秒等待上限留 5 秒余量）。
+ * （20 秒，是**单步上限**；整段准备阶段的上界由 `prepareMs` 的截止时间管）。
  * 人工 `suspend`/`stop` 的箱必然失败 → 由 `pool.ts` 退到 `start`/`resume`。
  * 注意：这条失败是**退出码 0 + stderr 自报**（见 {@link reportedFailure}），所以不能只看退出码。
  */
@@ -321,7 +322,14 @@ async function runLifecycle(
 	const call = await runOnce(exec, label, [subcommand, box], { timeout, signal: opts.signal });
 	if (!call.ok) {
 		const reason = classifyLifecycleFailure(call.error, false);
-		logEvent("cli.lifecycle", { command: subcommand, box, ok: false, reason, ms: Date.now() - startedAt });
+		logEvent("cli.lifecycle", {
+			command: subcommand,
+			box,
+			ok: false,
+			reason,
+			ms: Date.now() - startedAt,
+			timeoutMs: timeout,
+		});
 		return { ok: false, error: call.error, reason };
 	}
 	const { result } = call;
@@ -332,10 +340,23 @@ async function runLifecycle(
 		const error =
 			reported === undefined ? describeFailure(label, result, timeout) : `${label} reported an error: ${tail(reported)}`;
 		const reason = classifyLifecycleFailure(error, result.killed === true);
-		logEvent("cli.lifecycle", { command: subcommand, box, ok: false, reason, ms: Date.now() - startedAt });
+		logEvent("cli.lifecycle", {
+			command: subcommand,
+			box,
+			ok: false,
+			reason,
+			ms: Date.now() - startedAt,
+			timeoutMs: timeout,
+		});
 		return { ok: false, error, reason, stderrTail };
 	}
-	logEvent("cli.lifecycle", { command: subcommand, box, ok: true, ms: Date.now() - startedAt });
+	logEvent("cli.lifecycle", {
+		command: subcommand,
+		box,
+		ok: true,
+		ms: Date.now() - startedAt,
+		timeoutMs: timeout,
+	});
 	return { ok: true, stderrTail };
 }
 

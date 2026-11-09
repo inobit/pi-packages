@@ -56,7 +56,7 @@ const GLOBAL_FILE = path.join(AGENT_DIR, "extensions", "pi-instabox", "config.js
 const PROJECT_FILE = path.join(CWD, ".pi", "extensions", "pi-instabox", "config.json");
 
 describe("DEFAULT_CONFIG", () => {
-	it("默认值：两个 box 留空、autoInstall 开、PATH 钉死、5 条 devToolsArgs、6 段超时", () => {
+	it("默认值：两个 box 留空、autoInstall 开、PATH 钉死、5 条 devToolsArgs、7 段超时", () => {
 		expect(DEFAULT_CONFIG.defaultBox).toBe("");
 		expect(DEFAULT_CONFIG.devToolsBox).toBe("");
 		expect(DEFAULT_CONFIG.autoInstallDevTools).toBe(true);
@@ -69,18 +69,25 @@ describe("DEFAULT_CONFIG", () => {
 			"--no-usage-statistics",
 		]);
 		expect(DEFAULT_CONFIG.timeouts).toEqual({
-			wakeMs: 50000,
-			startMs: 120000,
-			connectMs: 50000,
-			initializeMs: 20000,
-			listToolsMs: 20000,
+			prepareMs: 60000,
+			wakeMs: 20000,
+			startMs: 30000,
+			connectMs: 15000,
+			initializeMs: 15000,
+			listToolsMs: 15000,
 			callMs: 120000,
 		});
 	});
 
-	it("connectMs 覆盖自动唤醒的 45s 等待（官方文档：自动暂停的箱下次使用时自动唤醒，请求最多等 45s）", () => {
-		expect(DEFAULT_CONFIG.timeouts.connectMs).toBe(50000);
-		expect(DEFAULT_CONFIG.timeouts.connectMs).toBeGreaterThanOrEqual(45_000);
+	it("准备阶段 60s 总预算：各步字段只是单步上限（每个 ≤ 总预算，加起来可以超过它）", () => {
+		const { prepareMs, wakeMs, startMs, connectMs, initializeMs, listToolsMs } = DEFAULT_CONFIG.timeouts;
+		expect(prepareMs).toBe(60_000);
+		for (const stepCapMs of [wakeMs, startMs, connectMs, initializeMs, listToolsMs]) {
+			expect(stepCapMs).toBeLessThanOrEqual(prepareMs);
+		}
+		// 唤醒链三段（wake → start → resume）的上限之和已超过总预算：
+		// 所以「总时长」由截止时间截断，而不是把各步上限相加（那曾是最多 8 分钟的由来）
+		expect(wakeMs + startMs + startMs).toBeGreaterThan(prepareMs);
 	});
 });
 
@@ -131,7 +138,7 @@ describe("normalizeConfig（纯函数，不 throw）", () => {
 			autoInstallDevTools: false,
 			remotePath: "/usr/local/bin:/usr/bin",
 			devToolsArgs: ["--headless", "--viewport=1920x1080"],
-			timeouts: { wakeMs: 1234, callMs: 60000 },
+			timeouts: { prepareMs: 90000, wakeMs: 1234, callMs: 60000 },
 		});
 		expect(cfg).toEqual({
 			defaultBox: "agent",
@@ -139,7 +146,7 @@ describe("normalizeConfig（纯函数，不 throw）", () => {
 			autoInstallDevTools: false,
 			remotePath: "/usr/local/bin:/usr/bin",
 			devToolsArgs: ["--headless", "--viewport=1920x1080"],
-			timeouts: { ...DEFAULT_CONFIG.timeouts, wakeMs: 1234, callMs: 60000 },
+			timeouts: { ...DEFAULT_CONFIG.timeouts, prepareMs: 90000, wakeMs: 1234, callMs: 60000 },
 		});
 	});
 
@@ -150,7 +157,7 @@ describe("normalizeConfig（纯函数，不 throw）", () => {
 			autoInstallDevTools: "yes",
 			remotePath: "",
 			devToolsArgs: [1, null],
-			timeouts: { wakeMs: -1, connectMs: 1.5, callMs: "60000" },
+			timeouts: { prepareMs: 0, wakeMs: -1, connectMs: 1.5, callMs: "60000" },
 			unknownKey: "ignored",
 		});
 		expect(cfg).toEqual(DEFAULT_CONFIG);

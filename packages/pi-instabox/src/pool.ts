@@ -11,14 +11,23 @@
  * - **唤醒链 `wake` → `start` → `resume`**：`wake` 覆盖自动暂停（实测 6s 左右成功）；
  *   用户手动 suspend/stop 的箱 `wake` 会**退出码 0 但 stderr 自报**
  *   `machine_not_running` / `start it with …`（`cli.ts` 已按 stderr 判失败）→ 退 `start`，
- *   再失败退 `resume`。每步之前 `onProgress("正在唤醒 <box>…")`，预算取 `timeouts.wakeMs`
+ *   再失败退 `resume`。每步之前 `onProgress("正在唤醒 <box>…")`，单步上限取 `timeouts.wakeMs`
  *   （`wake`）/ `timeouts.startMs`（`start`、`resume`），失败都把该步 `stderr` 尾部带进错误文本。
+ * - **准备阶段共享一个截止时间**（{@link PrepareBudget}）：一次 `get` 从查状态开始就建立
+ *   `deadline = clock() + timeouts.prepareMs`，每一步（`wake`/`start`/`resume`、确认轮询、建连）
+ *   实际超时都是 `min(单步上限, 剩余预算)`，退避与轮询的等待也按剩余收窄。因此**卡住的一步
+ *   不会把总时长顶成各步上限之和**（那曾是最多 8 分钟的由来）；预算耗尽就回
+ *   `prepare timed out after <prepareMs>ms (box "…", step: wake|start|resume|confirm|connect)`，
+ *   并带上该步 `stderr` 尾部。两个固有限制（有意为之）：`listBoxes` 的预算由列表器自己把关
+ *   （`LIST_BOXES_TIMEOUT_MS`），本模块只能在它返回后按剩余预算决定是否继续；`initialize` 的
+ *   超时在建客户端时就固定了，所以这里用「进建连前先看剩余预算」的截止判定，而不是临时改它。
  * - **每步之后都确认 `running`**（方案 §4.4 / R4）：命令退 0 也可能只是「已提交」，服务端状态
  *   才是判据。因此以 {@link WAKE_POLL_INTERVAL_MS}（1s）间隔、带 `force: true` 重查 `ls`，直到
- *   `state === "running"`。**命令成功时**的确认预算沿用该步预算（`wakeMs` / `startMs`），超时就把
- *   当时的 `state` 带进失败记录并继续下一命令；**命令已报失败时只做一次即时采样**（不空等整步
- *   预算——用户手动暂停的箱 `wake` 会立刻报 `machine_not_running`，空等 `wakeMs` 只会拖慢退到
- *   `start`），采样到 `running` 仍算成功。确认通过后才建连。
+ *   `state === "running"`。**命令成功时**的确认预算取该步剩余的 `min(单步上限, 准备阶段剩余)`
+ *   （且不越过截止时间），超时就把当时的 `state` 带进失败记录并继续下一命令；**命令已报失败
+ *   时只做一次即时采样**（不空等整步预算——用户手动暂停的箱 `wake` 会立刻报
+ *   `machine_not_running`，空等 `wakeMs` 只会拖慢退到 `start`），采样到 `running` 仍算成功。
+ *   确认通过后才建连。
  * - **`allowWake === false`（`session_start` 的后台路径）**：非 `running` 时**不跑**
  *   `wake`/`start`/`resume`，直接回 `{ ok: false, error }`（内部带 `reason: "not-running"`，
  *   供 {@link Pool.get} 判断能否让后来允许唤醒的调用重跑），也不报唤醒进度。
@@ -44,6 +53,10 @@
  *   自己被抛弃，`close()` 后回 `{ ok: false, error: "… pool was disposed while connecting" }`。
  *   因此 `dispose` 之后的第一次 `get` 可能立刻拿到这个 doomed 结果，重试即成功。
  *   `size()` 只数已握手入池的连接（在飞的不计），`dispose` 后为 0。
+ * - **埋点**：`pool.prepare` 一次 `get` 一条（`{ box, ok, ms, step?, timeoutMs? }`，成功 info /
+ *   失败 warn）——`ms` 是准备阶段（查状态 ＋ 唤醒链）本身的耗时，`step`/`timeoutMs` 是报错的
+ *   那一步与它拿到的预算；`pool.wake` 每条命令一条并带该步实际的 `timeoutMs`，两者合起来就能
+ *   看出「每步用了多少预算、总共用了多久」。
  * - 绝不 throw 到会话层：所有失败都是 `{ ok: false, error }`。
  * - 注入面：`exec` / `listBoxes` / `clientFactory` / `clock` / `sleep` / `onProgress` 全部可替；
  *   单测不 spawn 真进程、不碰真实 CLI、不等真实时间。
@@ -68,8 +81,9 @@ const RUNNING_STATE = "running";
 export const WAKE_POLL_INTERVAL_MS = 1_000;
 
 /**
- * 网关唤醒中的重试间隔（毫秒）：5s / 10s / 15s，共 3 次，退避合计 30s（≤45s 的总预算）。
+ * 网关唤醒中的重试间隔（毫秒）：5s / 10s / 15s，共 3 次，退避合计 30s。
  * 每次重试都是一次完整的新连接（`initialize`），成功即入池；耗尽才报错。
+ * 退避也吃准备预算：剩余不足就不睡，直接按「准备阶段超时」报错。
  */
 export const WAKE_RETRY_DELAYS_MS: readonly number[] = [5_000, 10_000, 15_000];
 
@@ -102,16 +116,26 @@ const WAKE_COMMANDS = ["wake", "start", "resume"] as const;
 /** 唤醒链的一步。 */
 type WakeCommand = (typeof WAKE_COMMANDS)[number];
 
+/**
+ * 准备阶段的步骤名：唤醒链三条命令 ＋ 确认轮询 ＋ 建连。
+ * 错误文案与埋点共用这一种拼写（`prepare timed out … (step: <它>)`）。
+ */
+type PrepareStep = WakeCommand | "confirm" | "connect";
+
 /** `get` 的结果：失败分支必带可直接展示的 `error`（绝不 throw）。 */
 export type PoolGetResult = { ok: true; client: RemoteClient } | { ok: false; error: string };
 
+/** 准备阶段的失败面：`step`/`timeoutMs` 只在「预算耗尽」时出现（错误文案与埋点共用）。 */
+type PrepareFailure = { ok: false; error: string; step?: PrepareStep; timeoutMs?: number };
+
+/** 准备阶段（查状态 ＋ 唤醒链）的结果：`ok: true` 只表示「箱已在 running」。 */
+type PrepareResult = { ok: true } | PrepareFailure;
+
 /**
- * 内部结果：比 {@link PoolGetResult} 多一个 `reason`。
- * 只用于 `get` 区分「后台路径拒绝唤醒」与其它失败；对外返回类型仍是 `PoolGetResult`。
+ * 内部结果：比 {@link PoolGetResult} 多一个 `reason`（后台路径拒唤醒）与准备阶段的
+ * `step`/`timeoutMs`。只用于 `get` 内部流转；对外返回类型仍是 `PoolGetResult`。
  */
-type ConnectResult =
-	| { ok: true; client: RemoteClient }
-	| { ok: false; error: string; reason?: typeof NOT_RUNNING_REASON };
+type ConnectResult = { ok: true; client: RemoteClient } | (PrepareFailure & { reason?: typeof NOT_RUNNING_REASON });
 
 /** 单次 `get` 的选项。 */
 export interface PoolGetOptions {
@@ -146,7 +170,7 @@ export interface PoolDeps {
 	exec: ExecFn;
 	/** 注入的 box 列表（T15 传 `createBoxLister(...).list`）；失败即本模块失败，不降级 */
 	listBoxes: ListBoxesFn;
-	/** 唤醒链预算：`wakeMs` 给 `wake`，`startMs` 给 `start`/`resume`；确认轮询沿用同一步的预算 */
+	/** 准备阶段预算：`prepareMs` 是总截止时间，`wakeMs`/`startMs` 只是单步上限 */
 	timeouts: InstaboxTimeouts;
 	/** 注入的时钟（毫秒）：确认阶段的预算判定 + 错误文本里的耗时；默认 `Date.now` */
 	clock?: () => number;
@@ -173,9 +197,55 @@ function isAborted(opts: PoolGetOptions): boolean {
 	return opts.signal?.aborted === true;
 }
 
-/** 每一步命令的预算：`wake` 只等自动暂停，`start`/`resume` 是整箱冷启。 */
+/** 每一步命令的单步上限：`wake` 只等自动暂停，`start`/`resume` 是整箱冷启。 */
 function commandTimeoutMs(command: WakeCommand, timeouts: InstaboxTimeouts): number {
 	return command === "wake" ? timeouts.wakeMs : timeouts.startMs;
+}
+
+/**
+ * 一次 `get` 的准备阶段预算：所有步骤共享同一个截止时间。
+ * 每一步的实际超时取 {@link stepTimeout}（`min(单步上限, 剩余预算)`），所以某一步卡住
+ * 只会吃掉它自己那一段，总时长不会变成各步上限之和。
+ */
+interface PrepareBudget {
+	/** 总预算（毫秒）：错误文案与 `pool.prepare` 埋点用 */
+	prepareMs: number;
+	/** 起点（`clock()` 口径）：`pool.prepare` 的 `ms` 从这里算 */
+	startedAt: number;
+	/** 截止时间（`clock()` 口径）：唤醒、确认轮询、建连共用 */
+	deadline: number;
+	/** 剩余预算（0..prepareMs，不为负） */
+	remaining: () => number;
+	/** 准备阶段结束时刻（`clock()` 口径；`undefined` = 还没结束） */
+	endedAt?: number;
+}
+
+function createPrepareBudget(clock: () => number, prepareMs: number): PrepareBudget {
+	const startedAt = clock();
+	const deadline = startedAt + prepareMs;
+	return { prepareMs, startedAt, deadline, remaining: () => Math.max(0, deadline - clock()) };
+}
+
+/** 该步的实际超时 = `min(单步上限, 剩余准备预算)`。 */
+function stepTimeout(budget: PrepareBudget, stepCapMs: number): number {
+	return Math.min(stepCapMs, budget.remaining());
+}
+
+/** 预算耗尽时的统一结果：写明总预算、是哪一步、以及该步的 `stderr` 尾部。 */
+function prepareTimeout(
+	box: string,
+	step: PrepareStep,
+	budget: PrepareBudget,
+	timeoutMs: number,
+	stderrTail?: string,
+): PrepareFailure & { step: PrepareStep; timeoutMs: number } {
+	const detail = stderrTail === undefined ? "" : `; stderr: ${stderrTail}`;
+	return {
+		ok: false,
+		step,
+		timeoutMs,
+		error: `prepare timed out after ${budget.prepareMs}ms (box "${box}", step: ${step})${detail}`,
+	};
 }
 
 /** 唤醒链单步：转调 `cli.ts` 的同名薄封装（不在这里拼 argv）。 */
@@ -353,17 +423,21 @@ export function createPool(deps: PoolDeps): Pool {
 	 * 建连 + 「网关唤醒中」退避重试：`is waking up` / `try again in a few seconds` 是可重试错误
 	 * （网关只等 15s），按 {@link WAKE_RETRY_DELAYS_MS} 重连，最多 3 次。
 	 * 返回最后一次的原始失败文本与已重试次数；非「唤醒中」的失败**不重试**，立刻返回。
+	 * 退避也吃准备预算：剩余不足就不再睡（保留原始错误文本，由调用方按「准备阶段超时」报错）。
 	 */
 	async function connectWithWakeRetry(
 		box: string,
 		opts: PoolGetOptions,
+		budget: PrepareBudget,
 	): Promise<{ ok: true; client: RemoteClient } | { ok: false; error: string; retries: number }> {
 		let attempt = await attemptConnect(box, opts);
 		let retries = 0;
 		for (const delay of WAKE_RETRY_DELAYS_MS) {
 			if (attempt.ok || !WAKING_UP_RE.test(attempt.error)) break;
 			if (isAborted(opts)) return { ok: false, error: `box "${box}": connect cancelled by caller`, retries };
-			await sleep(delay);
+			const wait = Math.min(delay, budget.remaining());
+			if (wait <= 0) break;
+			await sleep(wait);
 			if (isAborted(opts)) return { ok: false, error: `box "${box}": connect cancelled by caller`, retries };
 			retries += 1;
 			attempt = await attemptConnect(box, opts);
@@ -374,14 +448,18 @@ export function createPool(deps: PoolDeps): Pool {
 
 	/**
 	 * 唤醒命令之后的确认（方案 §4.4 / R4）：`force: true` 每 1s 重查，直到 `running`。
-	 * 第一次采样不等 1s（命令刚返回，箱子可能已经好了）；预算 `budgetMs` 沿用该步命令的预算。
+	 * 第一次采样不等 1s（命令刚返回，箱子可能已经好了）；预算是该步的 `min(单步上限, 剩余
+	 * 准备预算)`，且绝不越过准备阶段的截止时间——最后一觉按剩余时间收窄，因此轮询不会把
+	 * 总时长顶出预算。`budgetMs === 0`（命令已报失败）时只做一次即时采样。
 	 */
 	async function confirmRunning(
 		box: string,
 		opts: PoolGetOptions,
+		budget: PrepareBudget,
 		budgetMs: number,
 	): Promise<{ ok: true } | { ok: false; error: string }> {
 		const startedAt = clock();
+		const until = Math.min(startedAt + budgetMs, budget.deadline);
 		for (;;) {
 			if (isAborted(opts)) return { ok: false, error: `box "${box}": wake cancelled by caller` };
 			const listed = await listBoxesOnce({ force: true, signal: opts.signal });
@@ -391,13 +469,14 @@ export function createPool(deps: PoolDeps): Pool {
 				return { ok: false, error: `unknown box "${box}"; ${availableBoxes(listed.boxes)}` };
 			}
 			if (info.state === RUNNING_STATE) return { ok: true };
-			if (clock() - startedAt >= budgetMs) {
+			const left = until - clock();
+			if (left <= 0) {
 				return {
 					ok: false,
-					error: `box "${box}" did not reach "${RUNNING_STATE}" within ${budgetMs}ms of the wake attempt (state ${stateLabel(info.state)})`,
+					error: `box "${box}" did not reach "${RUNNING_STATE}" within ${until - startedAt}ms of the wake attempt (state ${stateLabel(info.state)})`,
 				};
 			}
-			await sleep(WAKE_POLL_INTERVAL_MS);
+			await sleep(Math.min(WAKE_POLL_INTERVAL_MS, left));
 		}
 	}
 
@@ -412,35 +491,44 @@ export function createPool(deps: PoolDeps): Pool {
 
 	/**
 	 * 唤醒链：`wake` → `start` → `resume`，每步之后都确认 `running`（命令退 0 也可能只是提交成功）。
-	 * 成功 → 按该步预算轮询；失败 → 只做一次即时采样（不空等，见文件头契约）。
-	 * 命令失败、确认超时都记一笔并继续下一条命令；全失败才报错。冷却期直接终止（不可自愈）。
+	 * 每步超时取 `min(单步上限, 剩余准备预算)`：成功 → 按该步剩余的预算轮询；失败 → 只做一
+	 * 次即时采样（不空等，见文件头契约）。命令失败、确认超时都记一笔并继续下一条命令；全失败
+	 * 才报错。冷却期直接终止（不可自愈）；预算耗尽立即报 `prepare timed out` 并带上该步 stderr
+	 * 尾部（不再进下一条命令，否则总时长又会变成各步上限之和）。
 	 * 只在状态非 `running` 且 `allowWake !== false` 时调用。
 	 */
-	async function ensureRunning(box: string, opts: PoolGetOptions): Promise<{ ok: true } | { ok: false; error: string }> {
+	async function ensureRunning(box: string, opts: PoolGetOptions, budget: PrepareBudget): Promise<PrepareResult> {
 		const progress = opts.onProgress ?? deps.onProgress;
 		const failures: string[] = [];
 		for (const command of WAKE_COMMANDS) {
 			if (isAborted(opts)) return { ok: false, error: `box "${box}": wake cancelled by caller` };
-			const budget = commandTimeoutMs(command, timeouts);
+			const stepCapMs = commandTimeoutMs(command, timeouts);
+			const timeoutMs = stepTimeout(budget, stepCapMs);
+			if (timeoutMs <= 0) return prepareTimeout(box, command, budget, 0);
 			progress?.(`正在唤醒 ${box}…`);
 			const startedAt = clock();
-			const outcome = await runWakeCommand(exec, command, box, budget, opts.signal);
-			// 每一步都记：`wake` → `start` → `resume` 的退化路径靠这个时间线排查
+			const outcome = await runWakeCommand(exec, command, box, timeoutMs, opts.signal);
+			const ms = clock() - startedAt;
+			// 每一步都记：`wake` → `start` → `resume` 的退化路径靠这个时间线排查；
+			// `timeoutMs` 是该步实际拿到的预算（clamp 之后），与 `ms` 一起看就知道谁吃掉了预算
 			logEvent(
 				"pool.wake",
-				{ box, step: command, ok: outcome.ok, ms: clock() - startedAt },
+				{ box, step: command, ok: outcome.ok, ms, timeoutMs },
 				outcome.ok ? "info" : "warn",
 			);
 			if (!outcome.ok) {
 				// 冷却期不可自愈：不确认、不换下一条命令，直接透出原文时间
 				if (COOLDOWN_RE.test(outcome.error)) return { ok: false, error: cooldownError(box, outcome.error) };
-				failures.push(`${outcome.error} (after ${clock() - startedAt}ms)`);
+				failures.push(`${outcome.error} (after ${ms}ms)`);
 			}
 			// 成功才值得等；失败只即时采样一次，避免用户手动暂停的箱白等一整步预算
-			const confirmed = await confirmRunning(box, opts, outcome.ok ? budget : 0);
+			const confirmBudgetMs = outcome.ok ? stepTimeout(budget, stepCapMs) : 0;
+			const confirmed = await confirmRunning(box, opts, budget, confirmBudgetMs);
 			if (confirmed.ok) return { ok: true };
 			if (isAborted(opts)) return confirmed;
 			failures.push(confirmed.error);
+			// 预算耗尽：不再退到下一条命令，直接报准备阶段超时（带该步 stderr 尾部）
+			if (budget.remaining() <= 0) return prepareTimeout(box, command, budget, timeoutMs, outcome.stderrTail);
 		}
 		return { ok: false, error: `could not wake box "${box}": ${failures.join("; ")}` };
 	}
@@ -455,20 +543,36 @@ export function createPool(deps: PoolDeps): Pool {
 		return { ok: true, client };
 	}
 
-	async function connectBox(box: string, opts: PoolGetOptions): Promise<ConnectResult> {
+	/**
+	 * 准备阶段：查状态，非 `running` 才进唤醒链（`allowWake === false` 直接拒答）。
+	 * 整段共享 {@link PrepareBudget} 的截止时间；`ls` 自己的预算由列表器把关，这里只能在它
+	 * 返回后按剩余预算决定后续步骤。
+	 */
+	async function prepareBox(box: string, opts: PoolGetOptions, budget: PrepareBudget): Promise<PrepareResult> {
+		const state = await resolveState(box);
+		if (!state.ok) return state;
+		if (state.info.state === RUNNING_STATE) return { ok: true };
+		if (opts.allowWake === false) return notRunning(box, state.info);
+		return ensureRunning(box, opts, budget);
+	}
+
+	async function connectBox(box: string, opts: PoolGetOptions, budget: PrepareBudget): Promise<ConnectResult> {
 		const stamp = currentGeneration(box);
 		try {
 			// 先看状态：running 直接连；非 running 才进唤醒链（allowWake=false 直接拒答）
-			const state = await resolveState(box);
-			if (!state.ok) return state;
-			if (state.info.state !== RUNNING_STATE) {
-				if (opts.allowWake === false) return notRunning(box, state.info);
-				const woken = await ensureRunning(box, opts);
-				if (!woken.ok) return woken;
-			}
+			const prepared = await prepareBox(box, opts, budget);
+			// 准备阶段到此结束：`pool.prepare` 的 `ms` 只量这一段，不含建连握手
+			budget.endedAt = clock();
+			if (!prepared.ok) return prepared;
+			// 预算已耗尽就不再 spawn：`initialize` 的超时在建客户端时就固定了，这里只能拦住起点
+			const connectTimeoutMs = stepTimeout(budget, timeouts.connectMs);
+			if (connectTimeoutMs <= 0) return prepareTimeout(box, "connect", budget, 0);
 			// 确认 running 之后才建连；`is waking up` 是网关侧的兜底（理论上先 wake 后不会遇到）
-			const attempt = await connectWithWakeRetry(box, opts);
+			const attempt = await connectWithWakeRetry(box, opts, budget);
 			if (attempt.ok) return adopt(box, stamp, attempt.client);
+			if (budget.remaining() <= 0) {
+				return prepareTimeout(box, "connect", budget, connectTimeoutMs, attempt.error);
+			}
 			if (WAKING_UP_RE.test(attempt.error)) {
 				return { ok: false, error: stillWakingUp(box, attempt.error, attempt.retries) };
 			}
@@ -482,14 +586,29 @@ export function createPool(deps: PoolDeps): Pool {
 		}
 	}
 
-	/** 一次建连尝试的埋点包装：只量时长与成败，不动返回值/错误文案。 */
+	/**
+	 * 一次建连尝试的埋点包装：`pool.prepare`（准备阶段本身的 `ms` ＋ 失败时报错的那一步与它
+	 * 拿到的预算）与 `pool.connect`（整段建连）各一条，返回值与错误文案不动。
+	 */
 	async function connect(box: string, opts: PoolGetOptions): Promise<ConnectResult> {
-		const startedAt = clock();
-		const result = await connectBox(box, opts);
+		const budget = createPrepareBudget(clock, timeouts.prepareMs);
+		const result = await connectBox(box, opts, budget);
+		const endedAt = budget.endedAt ?? clock();
+		logEvent(
+			"pool.prepare",
+			{
+				box,
+				ok: result.ok,
+				ms: endedAt - budget.startedAt,
+				step: result.ok ? undefined : result.step,
+				timeoutMs: result.ok ? undefined : result.timeoutMs,
+			},
+			result.ok ? "info" : "warn",
+		);
 		logEvent("pool.connect", {
 			box,
 			ok: result.ok,
-			ms: clock() - startedAt,
+			ms: clock() - budget.startedAt,
 			error: result.ok ? undefined : result.error,
 		});
 		return result;

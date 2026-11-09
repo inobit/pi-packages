@@ -16,25 +16,40 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-/** 超时（毫秒）：唤醒链两段（D4）＋ 远端 MCP 客户端四段（D7 ⑤） */
+/**
+ * 超时（毫秒）：准备阶段总预算 ＋ 各步单步上限（D4 唤醒链、D7 ⑤ 远端 MCP 客户端）。
+ *
+ * 两层语义不同，别按「各步相加」理解：`prepareMs` 是**一次工具调用准备阶段的截止时间**，
+ * 下面每个字段只是**单步上限**——某一步卡住时实际超时取 `min(该步上限, 剩余预算)`，
+ * 所以准备阶段的上界是 `prepareMs`，不是各字段之和。
+ */
 export interface InstaboxTimeouts {
-	/** `instabox wake` 上界（本机实测 45s，留余量；只处理「自动暂停」） */
+	/**
+	 * 准备阶段总预算：查状态 → 唤醒链（`wake`/`start`/`resume`）→ 确认 `running` → 建连 共享
+	 * 这一个截止时间。用户要求「准备阶段总共约 1 分钟」，投一次桌面调用不该等 8 分钟。
+	 */
+	prepareMs: number;
+	/** `instabox wake` 单步上限（只处理「自动暂停」；吃满即截止到 `prepareMs`） */
 	wakeMs: number;
-	/** `instabox start` / `instabox resume` 上界（整箱冷启） */
+	/** `instabox start` / `instabox resume` 单步上限（整箱冷启） */
 	startMs: number;
 	/**
-	 * spawn 后等远端 MCP 传输建链的上界。
+	 * spawn 后等远端 MCP 传输建链的单步上限。
 	 *
-	 * 官方文档（instabox 箱生命周期）：自动暂停的箱在下次使用时自动唤醒，唤醒请求最多等 45s，
-	 * 故给 50s 覆盖「spawn → 自动唤醒 → 首个字节」整段。`remote.ts` 的 `DEFAULT_TIMEOUTS.connect`
-	 * （15s）只是该模块的兜底值，装配层（`pool.ts`）会用本字段覆盖它，改这里才生效。
+	 * 唤醒由准备阶段的唤醒链完成（`wake`/`start`/`resume`），这里不必再覆盖官方文档里
+	 * 「自动唤醒最多等 45s」那一段，只留「spawn → 首个字节」的余量。`remote.ts` 的
+	 * `DEFAULT_TIMEOUTS.connect`（15s）只是该模块的兜底值，装配层（`pool.ts`）会用本字段
+	 * 覆盖它，改这里才生效。
 	 */
 	connectMs: number;
 	/** `initialize` 请求上界 */
 	initializeMs: number;
 	/** `tools/list` 请求上界 */
 	listToolsMs: number;
-	/** `tools/call` 请求上界（桌面操作可能含截图，给得最宽） */
+	/**
+	 * `tools/call` 请求上界（桌面操作可能含截图，给得最宽）。
+	 * 它属于工具调用本身，**不**在准备阶段的 `prepareMs` 里。
+	 */
 	callMs: number;
 }
 
@@ -65,16 +80,25 @@ export const DEFAULT_CONFIG: InstaboxConfig = {
 		"--no-usage-statistics",
 	],
 	timeouts: {
-		wakeMs: 50_000,
-		startMs: 120_000,
-		connectMs: 50_000,
-		initializeMs: 20_000,
-		listToolsMs: 20_000,
+		prepareMs: 60_000,
+		wakeMs: 20_000,
+		startMs: 30_000,
+		connectMs: 15_000,
+		initializeMs: 15_000,
+		listToolsMs: 15_000,
 		callMs: 120_000,
 	},
 };
 
-const TIMEOUT_KEYS = ["wakeMs", "startMs", "connectMs", "initializeMs", "listToolsMs", "callMs"] as const;
+const TIMEOUT_KEYS = [
+	"prepareMs",
+	"wakeMs",
+	"startMs",
+	"connectMs",
+	"initializeMs",
+	"listToolsMs",
+	"callMs",
+] as const;
 
 /** agent 目录：`PI_CODING_AGENT_DIR` 优先，否则 `~/.pi/agent`（不可用 import.meta.url 推导：jiti 直载下不可靠） */
 export function getAgentDir(): string {

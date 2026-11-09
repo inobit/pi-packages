@@ -1,8 +1,9 @@
 /**
  * @inobit/pi-instabox — `src/pool.ts` 单测：先看状态（`ls --json`）、非 `running` 才 `wake` →
- * `start` → `resume` 且每步之后确认 `running`、`is cooling down until` 不可自愈、`is waking up`
- * 退避重连、`allowWake: false` 零唤醒、复用 / dead 重建 / 握手失败驱逐、in-flight 共享（含
- * 「不唤醒」结论不劫持唤醒调用）、`dispose`（含建连期间 dispose）。
+ * `start` → `resume` 且每步之后确认 `running`、**准备阶段共享 prepareMs 截止时间**（每步超时 =
+ * `min(单步上限, 剩余预算)`，卡住的一步不会跑满各步之和）、`is cooling down until` 不可自愈、
+ * `is waking up` 退避重连、`allowWake: false` 零唤醒、复用 / dead 重建 / 握手失败驱逐、
+ * in-flight 共享（含「不唤醒」结论不劫持唤醒调用）、`dispose`（含建连期间 dispose）。
  *
  * 全部走注入的假 `ExecFn` / 假 `listBoxes` / 假 `sleep` / 假客户端：不 spawn 真进程、
  * 不联网、不等真实时间、不碰真箱。
@@ -25,12 +26,27 @@ import type { CallToolResult, InitializeResult, RemoteClient, RemoteTool } from 
 
 /** 与 `DEFAULT_CONFIG.timeouts` 故意取不同值：断言预算来自注入的 `timeouts`，不是内置默认。 */
 const TIMEOUTS: InstaboxTimeouts = {
+	prepareMs: 40_000,
 	wakeMs: 5_000,
 	startMs: 9_000,
 	connectMs: 1_500,
 	initializeMs: 2_000,
 	listToolsMs: 2_500,
 	callMs: 12_000,
+};
+
+/**
+ * 一次真实形状的准备阶段预算（与 `DEFAULT_CONFIG.timeouts` 同构）：60s 总预算、
+ * wake 20s / start 30s / connect 15s 只是单步上限。
+ */
+const PREPARE_TIMEOUTS: InstaboxTimeouts = {
+	prepareMs: 60_000,
+	wakeMs: 20_000,
+	startMs: 30_000,
+	connectMs: 15_000,
+	initializeMs: 15_000,
+	listToolsMs: 15_000,
+	callMs: 120_000,
 };
 
 /** 假客户端的构造选项。 */
@@ -129,6 +145,11 @@ function execReported(stderr: string): ExecResultLike {
 	return { stdout: "", stderr, code: 0, killed: false, truncated: false };
 }
 
+/** 被宿主杀掉（超时）的真实形态：`killed: true`，stderr 只留进度文本。 */
+function execKilled(stderr: string): ExecResultLike {
+	return { stdout: "", stderr, code: 0, killed: true, truncated: false };
+}
+
 /** 用户手动暂停/停止的箱在 `wake` 上的真实 stderr（`machine_not_running` + `start it with`）。 */
 function wakeRefused(name: string): string {
 	return `instabox: error machine_not_running: machine is suspended; start it first [request id]\nhint: start it with \`instabox start ${name}\``;
@@ -180,6 +201,8 @@ interface SetupOptions {
 	staysAsleep?: boolean;
 	/** 每次 `sleep` 都挂起，直到测试调用 `releaseSleep()`（断言轮询中途的行为） */
 	deferSleep?: boolean;
+	/** 每次 CLI 调用吃掉多少毫秒（推进注入的时钟）：模拟「这一步卡住」而不真等 */
+	execDuration?: (args: readonly string[], timeoutMs: number | undefined) => number;
 	/** 覆盖任意注入项（如 `listBoxes`） */
 	deps?: Partial<PoolDeps>;
 }
@@ -199,6 +222,8 @@ interface Setup {
 	forcedListCalls(): number;
 	/** 放行一次挂起的 `sleep`（配合 `deferSleep`） */
 	releaseSleep(): void;
+	/** 注入的假时钟当前读数（断言准备阶段总耗时） */
+	now(): number;
 }
 
 /**
@@ -241,6 +266,9 @@ function setup(options: SetupOptions = {}): Setup {
 	const exec: ExecFn = async (command, args, opts) => {
 		execCalls.push({ command, args: [...args], timeout: opts?.timeout, signal: opts?.signal });
 		const result = reply(args);
+		// 「这一步卡住」：吃掉它自己的预算（推进假时钟，绝不真等）
+		const spent = options.execDuration?.(args, opts?.timeout) ?? 0;
+		if (spent > 0) nowMs += spent;
 		const subcommand = args[0] ?? "";
 		const target = args[1] ?? "";
 		const isLifecycle = subcommand === "wake" || subcommand === "start" || subcommand === "resume";
@@ -287,6 +315,7 @@ function setup(options: SetupOptions = {}): Setup {
 		listCalls: () => listCalls,
 		forcedListCalls: () => forcedListCalls,
 		releaseSleep: () => sleepReleases.shift()?.(),
+		now: () => nowMs,
 	};
 }
 
@@ -587,6 +616,113 @@ describe("createPool.get — 非 running：wake → start → resume，每步确
 	});
 });
 
+describe("createPool.get — 准备阶段共享 prepareMs 截止时间", () => {
+	it("wake/start/resume 全卡住：总耗时压在 60s，错误带 step 与该步 stderr 尾部", async () => {
+		const h = setup({
+			boxes: [suspended("agent")],
+			staysAsleep: true,
+			deps: { timeouts: PREPARE_TIMEOUTS },
+			// 每一步都吃满自己的预算才被杀（真实超时形态，但不真等）
+			execDuration: (_args, timeoutMs) => timeoutMs ?? 0,
+			reply: (args) => execKilled(`waking ${String(args[1])}…`),
+		});
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(false);
+		const error = errorOf(result);
+		expect(error).toContain('prepare timed out after 60000ms (box "agent", step: resume)');
+		// 该步 stderr 尾部一并透出
+		expect(error).toContain("waking agent…");
+		// 每步 = min(单步上限, 剩余)：20s → 30s → 剩下 10s（不是 20+30+30=80s）
+		expect(h.execCalls.map((call) => call.timeout)).toEqual([20_000, 30_000, 10_000]);
+		expect(h.now()).toBe(PREPARE_TIMEOUTS.prepareMs);
+		expect(h.created).toHaveLength(0);
+		expect(h.pool.size()).toBe(0);
+	});
+
+	it("wake 慢 19s：start 只能拿到剩余的 41s（单步上限更高时按剩余预算）", async () => {
+		const h = setup({
+			boxes: [suspended("agent")],
+			// startMs 抬到 120s，让「剩余预算」成为更小的那个
+			deps: { timeouts: { ...PREPARE_TIMEOUTS, startMs: 120_000 } },
+			execDuration: (args) => (args[0] === "wake" ? 19_000 : 0),
+			reply: (args) => (args[0] === "wake" ? execReported(wakeRefused("agent")) : execOk()),
+		});
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(true);
+		expect(h.execCalls[1]?.args).toEqual(["start", "agent"]);
+		expect(h.execCalls[1]?.timeout).toBe(60_000 - 19_000);
+		expect(h.now()).toBe(19_000);
+	});
+
+	it("总预算比单步上限还小时按剩余预算：prepareMs 12s → wake 只拿 12s", async () => {
+		const h = setup({
+			boxes: [suspended("agent")],
+			staysAsleep: true,
+			deps: { timeouts: { ...PREPARE_TIMEOUTS, prepareMs: 12_000 } },
+			execDuration: (_args, timeoutMs) => timeoutMs ?? 0,
+			reply: () => execKilled("waking agent…"),
+		});
+
+		const result = await h.pool.get("agent");
+
+		expect(h.execCalls.map((call) => call.args[0])).toEqual(["wake"]);
+		expect(h.execCalls[0]?.timeout).toBe(12_000);
+		expect(h.now()).toBe(12_000);
+		expect(errorOf(result)).toContain('prepare timed out after 12000ms (box "agent", step: wake)');
+	});
+
+	it("确认轮询也受截止时间约束：最后一觉按剩余收窄，不会越过 prepareMs", async () => {
+		const h = setup({
+			boxes: [suspended("agent")],
+			staysAsleep: true,
+			deps: { timeouts: { ...PREPARE_TIMEOUTS, prepareMs: 12_500, wakeMs: 12_500 } },
+		});
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(false);
+		// wake 立刻退 0，但箱永远没 running：整段预算都花在「wake + 确认」这一步上
+		expect(h.execCalls.map((call) => call.args[0])).toEqual(["wake"]);
+		expect(h.now()).toBe(12_500);
+		// 12 次整秒轮询 + 最后一次只剩 500ms
+		expect(h.sleeps.at(-1)).toBe(500);
+		expect(h.sleeps.reduce((sum, ms) => sum + ms, 0)).toBe(12_500);
+		expect(errorOf(result)).toContain('prepare timed out after 12500ms (box "agent", step: wake)');
+	});
+
+	it("网关退避重试也吃预算：退避耗尽即按 step: connect 报超时", async () => {
+		const h = setup({
+			boxes: [running("agent")],
+			connect: (name) => wakingUpError(name),
+			deps: { timeouts: { ...PREPARE_TIMEOUTS, prepareMs: 8_000 } },
+		});
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(false);
+		// 5s 退避 + 剩下 3s 退避，再下一次就没有预算了
+		expect(h.sleeps).toEqual([5_000, 3_000]);
+		expect(h.now()).toBe(8_000);
+		expect(errorOf(result)).toContain('prepare timed out after 8000ms (box "agent", step: connect)');
+		expect(h.created).toHaveLength(3);
+	});
+
+	it("正常快路径不受影响：单步预算仍取单步上限，不因总预算被削", async () => {
+		const h = setup({ boxes: [suspended("agent")], deps: { timeouts: PREPARE_TIMEOUTS } });
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(true);
+		expect(h.execCalls[0]?.timeout).toBe(PREPARE_TIMEOUTS.wakeMs);
+		expect(h.now()).toBe(0);
+		expect(h.pool.size()).toBe(1);
+	});
+});
+
 describe("createPool.get — allowWake=false（session_start 路径）", () => {
 	it("suspended：零 wake/start/resume，直接报错并给补救命令", async () => {
 		const h = setup({ boxes: [suspended("libretv")] });
@@ -853,7 +989,7 @@ describe("createPool — dispose", () => {
 });
 
 describe("埋点（logEvent）", () => {
-	it("唤醒链每一步记一条 pool.wake（box/step/ok/ms）", async () => {
+	it("唤醒链每一步记一条 pool.wake（box/step/ok/ms/timeoutMs）", async () => {
 		const logger = createMemoryLogger();
 		setLogger(logger);
 		try {
@@ -866,7 +1002,50 @@ describe("埋点（logEvent）", () => {
 		const wakes = logger.records.filter((record) => record.event === "pool.wake");
 		expect(wakes).toHaveLength(1);
 		expect(wakes[0]?.level).toBe("info");
-		expect(wakes[0]?.fields).toMatchObject({ box: "agent", step: "wake", ok: true });
+		expect(wakes[0]?.fields).toMatchObject({ box: "agent", step: "wake", ok: true, timeoutMs: TIMEOUTS.wakeMs });
 		expect(typeof wakes[0]?.fields?.["ms"]).toBe("number");
+	});
+
+	it("pool.prepare（info）：成功时只记总耗时，不记 step/timeoutMs", async () => {
+		const logger = createMemoryLogger();
+		setLogger(logger);
+		try {
+			const h = setup({ boxes: [suspended("agent")] });
+			await h.pool.get("agent");
+		} finally {
+			setLogger(undefined);
+		}
+
+		const prepares = logger.records.filter((record) => record.event === "pool.prepare");
+		expect(prepares).toHaveLength(1);
+		expect(prepares[0]?.level).toBe("info");
+		expect(prepares[0]?.fields).toEqual({ box: "agent", ok: true, ms: 0 });
+	});
+
+	it("pool.prepare（warn）：记下报错的那一步与它拿到的预算，每步预算都在 pool.wake 里", async () => {
+		const logger = createMemoryLogger();
+		setLogger(logger);
+		try {
+			const h = setup({
+				boxes: [suspended("agent")],
+				staysAsleep: true,
+				deps: { timeouts: PREPARE_TIMEOUTS },
+				execDuration: (_args, timeoutMs) => timeoutMs ?? 0,
+				reply: () => execKilled("waking agent…"),
+			});
+			await h.pool.get("agent");
+		} finally {
+			setLogger(undefined);
+		}
+
+		const prepares = logger.records.filter((record) => record.event === "pool.prepare");
+		expect(prepares).toHaveLength(1);
+		expect(prepares[0]?.level).toBe("warn");
+		// 「总共用了多久」+「哪一步耗尽 + 那一步的预算」一条就能看出来
+		expect(prepares[0]?.fields).toEqual({ box: "agent", ok: false, ms: 60_000, step: "resume", timeoutMs: 10_000 });
+		// 逐步骤预算：每步 clamp 后的实际值
+		const wakes = logger.records.filter((record) => record.event === "pool.wake");
+		expect(wakes.map((record) => record.fields?.["timeoutMs"])).toEqual([20_000, 30_000, 10_000]);
+		expect(wakes.every((record) => record.level === "warn")).toBe(true);
 	});
 });

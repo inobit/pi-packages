@@ -9,6 +9,7 @@
  *   任何写到 stdout 的诊断都会破坏 MCP 握手，所以诊断一律 stderr。
  * - 脚本自己把箱拉起来（`wake`，失败再 `start`）：MCP 客户端不会唤醒箱，pi 也不会重连
  *   失败的 server——箱暂停时若直接把检查/ssh 打过去，结果是 0 个工具且整场会话不再恢复。
+ *   两条命令都用 shell 的 `timeout`（有则用）封顶 {@link PREPARE_TIMEOUT_SECONDS} 秒。
  * - PATH 走 `instabox exec --env PATH=…`（CLI 原生能力，方案 C-c「比 `env PATH=… cmd` 包装更干净」）；
  *   最后一段 `instabox ssh` 没有 `--env`，只能用 `env PATH=…` 前缀。
  * - 内容全部来自参数（`remotePath` / `autoInstall`），本模块不读 `DEFAULT_CONFIG`；
@@ -35,10 +36,21 @@ const CHECK_TIMEOUT_SECONDS = 10;
 
 /**
  * 安装本身的 `--timeout`（秒）：`npm i -g` 要拉 tarball，但「检查 + 安装」（10 + 40 = 50 秒）
- * 仍须和前面的唤醒一起留在 per-request timeout（180 秒）以内——
- * 唤醒实测 `wake` 2 秒、suspended 箱最坏 45 秒，失败再 `start` 约 10–60 秒。
+ * 仍须和前面的唤醒一起留在 per-request timeout（180 秒）以内——唤醒段每条命令由
+ * `timeout` 封顶 {@link PREPARE_TIMEOUT_SECONDS} 秒（`wake` + `start` 最坏 2 × 60）。
  */
 const INSTALL_TIMEOUT_SECONDS = 40;
+
+/**
+ * helper 自己拉起箱时的准备阶段上限（秒）：`timeout` 命令包住每条 `instabox wake`/`start`，
+ * 让一条卡住的 CLI 不能把 MCP 握手拖到天荒地老（与 `DEFAULT_CONFIG.timeouts.prepareMs` 的
+ * 1 分钟对齐；本模块不读配置，故在这里单点维护）。
+ *
+ * 它**不是**真正的上界：真正的上界是 pi 的 MCP per-request timeout
+ * （{@link DEVTOOLS_REQUEST_TIMEOUT_SECONDS} 秒）——脚本整个前置段（唤醒 ×2 ＋ 检查 ＋ 安装）
+ * 都在 `initialize` 应答之前跑完。系统里没有 `timeout` 命令时就不包（退回旧行为）。
+ */
+const PREPARE_TIMEOUT_SECONDS = 60;
 
 /** helper 权限位：MCP 的 `command` 被直接 exec，可执行位是硬要求。 */
 const HELPER_MODE = 0o755;
@@ -48,9 +60,9 @@ const DEVTOOLS_SERVER_NAME = "instabox-devtools";
 
 /**
  * `registerMcpServer` 的每请求超时（秒）：默认 60 偏紧，桌面/浏览器操作给 180（方案 C-d）。
- * 它同时是 helper 脚本前置工作（唤醒箱 + 检查 {@link CHECK_TIMEOUT_SECONDS} + 安装
- * {@link INSTALL_TIMEOUT_SECONDS}）的总上界——三者之和必须留在它以内，
- * 改小这里必须同步压缩脚本预算。
+ * 它同时是 helper 脚本前置工作（唤醒 2 × {@link PREPARE_TIMEOUT_SECONDS} + 检查
+ * {@link CHECK_TIMEOUT_SECONDS} + 安装 {@link INSTALL_TIMEOUT_SECONDS}，最坏 170 秒）
+ * 的总上界——四者之和必须留在它以内，改小这里必须同步压缩脚本预算。
  */
 const DEVTOOLS_REQUEST_TIMEOUT_SECONDS = 180;
 
@@ -116,8 +128,11 @@ shift
 ${REMOTE_PATH_VAR}=${remotePath}
 
 # 0) 先确保箱在运行：MCP 客户端不会自己唤醒，pi 也不会重连失败的 server。
-#    失败不阻断，让后面的检查/ssh 自然报错。
-instabox wake "$box" >/dev/null 2>&1 || instabox start "$box" >/dev/null 2>&1 || true
+#    失败不阻断，让后面的检查/ssh 自然报错。每条唤醒命令包一层 \`timeout\`
+#    （有就用，没有就不加）：准备阶段上限 ${PREPARE_TIMEOUT_SECONDS}s，
+#    真实上界仍是 pi 的 MCP per-request timeout。
+if command -v timeout >/dev/null 2>&1; then TO="timeout ${PREPARE_TIMEOUT_SECONDS}"; else TO=""; fi
+$TO instabox wake "$box" >/dev/null 2>&1 || $TO instabox start "$box" >/dev/null 2>&1 || true
 
 # 远端缺 chrome-devtools-mcp 时最多处理一次；检查与安装失败都不阻断连接，
 # 让真正的 "command not found" 原样冒给 MCP 客户端。
