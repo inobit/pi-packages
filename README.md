@@ -16,6 +16,7 @@ A pnpm workspace monorepo of extensions for [Pi coding agent](https://pi.dev). T
 | [`@inobit/pi-themes`](packages/pi-themes) | Curated themes: Rosé Pine, Tokyonight, Catppuccin and Solarized families with light & dark variants supporting `theme: "light/dark"` paired auto-switching |
 | [`@inobit/pi-subagent-presets`](packages/pi-subagent-presets) | Batch-configure pi-subagents agent `model` + `thinking` per project, field-level merge of the global config, and export a reusable global profile template |
 | [`@inobit/pi-nvim`](packages/pi-nvim) | Reuse your Neovim LSP setup inside Pi sessions: `nvim_lsp` (read-only diagnostics) and `nvim_format` (write-back formatting) over a per-session headless nvim daemon |
+| [`@inobit/pi-instabox`](packages/pi-instabox) | Drive instabox sandboxes from Pi: `instabox_desktop_*` computer-use tools with per-call sandbox targeting (codemode-gated), plus a config-driven remote `chrome-devtools-mcp` server |
 
 See each package's README (links above) for installation, configuration, and usage.
 

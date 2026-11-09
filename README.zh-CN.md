@@ -14,6 +14,7 @@ Pi coding agent 扩展包的 monorepo（pnpm workspace）。面向 `@earendil-wo
 | [`@inobit/pi-undo`](packages/pi-undo) | 撤销扩展：`/undo` + `alt+u`，单次/轮、队列感知、原子 abort 再撤 |
 | [`@inobit/pi-themes`](packages/pi-themes) | 精选主题包：Rosé Pine / TokyoNight / Catppuccin / Solarized 四族亮暗主题，支持 `theme: "亮/暗"` 配对自动切换 |
 | [`@inobit/pi-subagent-presets`](packages/pi-subagent-presets) | 按项目批量配置 pi-subagents 各 agent 的 model 与 thinking，字段级合并全局配置，并导出可复用的全局 profile 模板 |
+| [`@inobit/pi-instabox`](packages/pi-instabox) | 驱动 instabox 沙箱：`instabox_desktop_*` 桌面工具（按调用指定 `box`，需 codemode 激活）+ 按配置注册的远端 `chrome-devtools-mcp` |
 
 各包安装、配置、使用详见其 README（上表链接）。
 
