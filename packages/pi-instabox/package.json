@@ -1,0 +1,67 @@
+{
+  "name": "@inobit/pi-instabox",
+  "version": "0.1.0",
+  "description": "Drive instabox sandboxes from Pi: `instabox_desktop_*` computer-use tools with per-call sandbox targeting, plus a config-driven remote `chrome-devtools-mcp` server.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "files": [
+    "src",
+    "README.md",
+    "README.zh-CN.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "pack:check": "pnpm pack --pack-destination /tmp"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "pi-coding-agent",
+    "instabox",
+    "sandbox",
+    "computer-use",
+    "mcp",
+    "chrome-devtools"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inobit/pi-packages.git",
+    "directory": "packages/pi-instabox"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@earendil-works/pi-tui": "1.5.0",
+    "@types/node": "catalog:",
+    "typebox": "1.3.27",
+    "typescript": "catalog:",
+    "vitest": "^4.1.8"
+  }
+}
