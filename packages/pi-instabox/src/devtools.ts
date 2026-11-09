@@ -7,6 +7,8 @@
  *   写盘失败只 `warn`，不 throw 到会话层。
  * - 脚本的 stdout **只承载 JSON-RPC**：pi 把 MCP 的 `command` 直接 exec（不经 shell），
  *   任何写到 stdout 的诊断都会破坏 MCP 握手，所以诊断一律 stderr。
+ * - 脚本自己把箱拉起来（`wake`，失败再 `start`）：MCP 客户端不会唤醒箱，pi 也不会重连
+ *   失败的 server——箱暂停时若直接把检查/ssh 打过去，结果是 0 个工具且整场会话不再恢复。
  * - PATH 走 `instabox exec --env PATH=…`（CLI 原生能力，方案 C-c「比 `env PATH=… cmd` 包装更干净」）；
  *   最后一段 `instabox ssh` 没有 `--env`，只能用 `env PATH=…` 前缀。
  * - 内容全部来自参数（`remotePath` / `autoInstall`），本模块不读 `DEFAULT_CONFIG`；
@@ -19,22 +21,24 @@ import fs from "node:fs";
 import path from "node:path";
 import type { McpServerConfig } from "@earendil-works/pi-coding-agent";
 import type { InstaboxConfig, InstaboxPaths } from "./config.ts";
+import { logEvent } from "./log.ts";
 
 /**
  * 远端安装检查的 `instabox exec --timeout`（秒）。
  *
  * 真正上界不是 CLI 的 600 秒上限，而是 pi 的 **per-request timeout**
  * （{@link DEVTOOLS_REQUEST_TIMEOUT_SECONDS} 秒，即注册配置的 `timeout`）：MCP 客户端对
- * `initialize` 也计时，而 helper 的检查/安装全都发生在 `initialize` 应答之前
+ * `initialize` 也计时，而 helper 的唤醒/检查/安装全都发生在 `initialize` 应答之前
  * （`chrome-devtools-mcp` 还没 exec 出来）。所以脚本预算必须小于那个 timeout。
  */
-const CHECK_TIMEOUT_SECONDS = 20;
+const CHECK_TIMEOUT_SECONDS = 10;
 
 /**
- * 安装本身的 `--timeout`（秒）：`npm i -g` 要拉 tarball，但「检查 + 安装」之和
- * 仍须留在 per-request timeout（120 秒）以内，冷箱最坏 100 秒，余量留给 ssh 与 `initialize` 应答。
+ * 安装本身的 `--timeout`（秒）：`npm i -g` 要拉 tarball，但「检查 + 安装」（10 + 40 = 50 秒）
+ * 仍须和前面的唤醒一起留在 per-request timeout（180 秒）以内——
+ * 唤醒实测 `wake` 2 秒、suspended 箱最坏 45 秒，失败再 `start` 约 10–60 秒。
  */
-const INSTALL_TIMEOUT_SECONDS = 80;
+const INSTALL_TIMEOUT_SECONDS = 40;
 
 /** helper 权限位：MCP 的 `command` 被直接 exec，可执行位是硬要求。 */
 const HELPER_MODE = 0o755;
@@ -43,11 +47,12 @@ const HELPER_MODE = 0o755;
 const DEVTOOLS_SERVER_NAME = "instabox-devtools";
 
 /**
- * `registerMcpServer` 的每请求超时（秒）：默认 60 偏紧，桌面/浏览器操作给 120（方案 C-d）。
- * 它同时是 helper 脚本前置工作（检查 {@link CHECK_TIMEOUT_SECONDS} + 安装
- * {@link INSTALL_TIMEOUT_SECONDS}）的总上界，改小这里必须同步压缩脚本预算。
+ * `registerMcpServer` 的每请求超时（秒）：默认 60 偏紧，桌面/浏览器操作给 180（方案 C-d）。
+ * 它同时是 helper 脚本前置工作（唤醒箱 + 检查 {@link CHECK_TIMEOUT_SECONDS} + 安装
+ * {@link INSTALL_TIMEOUT_SECONDS}）的总上界——三者之和必须留在它以内，
+ * 改小这里必须同步压缩脚本预算。
  */
-const DEVTOOLS_REQUEST_TIMEOUT_SECONDS = 120;
+const DEVTOOLS_REQUEST_TIMEOUT_SECONDS = 180;
 
 /** 脚本内的 PATH 变量名：`--env`/`env` 两处都引用它，改字面量只改这里。 */
 const REMOTE_PATH_VAR = "remote_path";
@@ -81,7 +86,8 @@ function buildInstallCommand(remotePath: string): string {
 /**
  * 生成 helper 脚本（纯函数，便于单测断言内容）。
  *
- * 脚本职责：`devtools-connect.sh <box> [chrome-devtools-mcp args...]` → 远端缺包时检查/可选安装 →
+ * 脚本职责：`devtools-connect.sh <box> [chrome-devtools-mcp args...]` → 先 `wake`（失败再 `start`）
+ * 拉起箱 → 远端缺包时检查/可选安装 →
  * `exec instabox ssh <box> -- env PATH=… chrome-devtools-mcp "$@"`，stdout 只留 JSON-RPC。
  */
 export function buildHelperScript(options: BuildHelperScriptOptions): string {
@@ -108,6 +114,10 @@ fi
 box="$1"
 shift
 ${REMOTE_PATH_VAR}=${remotePath}
+
+# 0) 先确保箱在运行：MCP 客户端不会自己唤醒，pi 也不会重连失败的 server。
+#    失败不阻断，让后面的检查/ssh 自然报错。
+instabox wake "$box" >/dev/null 2>&1 || instabox start "$box" >/dev/null 2>&1 || true
 
 # 远端缺 chrome-devtools-mcp 时最多处理一次；检查与安装失败都不阻断连接，
 # 让真正的 "command not found" 原样冒给 MCP 客户端。
@@ -216,9 +226,11 @@ export function ensureHelperScript(options: EnsureHelperScriptOptions): EnsureHe
 		io.ensureDir(path.dirname(file));
 		io.writeText(file, script);
 		io.setMode(file, HELPER_MODE);
+		logEvent("devtools.helper", { ok: true, path: file });
 		return { ok: true };
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
+		logEvent("devtools.helper", { ok: false, path: file, error: message });
 		options.warn?.(`无法写入 DevTools helper ${file}: ${message}`);
 		return { ok: false, error: message };
 	}

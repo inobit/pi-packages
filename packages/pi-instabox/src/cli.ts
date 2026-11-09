@@ -14,11 +14,14 @@
  * - 失败归一：任何非 0 退出 / `killed` / 抛异常都转成 `{ ok: false, error }`，**绝不 throw**
  *   到会话层；stderr 保留尾部最多 {@link STDERR_TAIL_LIMIT} 字符便于排障。`probeVersion` 与
  *   `listBoxesRaw` 的失败额外给出 {@link CliFailureReason}，让调用方把「超时」与「没装 CLI」分开处理。
+ * - 退出码 0 不算成功凭据：`wake`/`start`/`resume` 还要求 stderr 里没有 CLI 自报错误
+ *   （实测 `wake` 对人工暂停的箱退出码 0 + `instabox: error machine_not_running`）。
  * - 结果类型是可辨识联合（`ok: true` 与 `ok: false` 两个分支，失败分支必带 `error`），
  *   调用方靠 `if (!result.ok)` 收窄，不写 `error?: string` 之类的可选字段。
  */
 
 import { DEFAULT_CONFIG } from "./config.ts";
+import { logEvent } from "./log.ts";
 
 /**
  * 加载期 `version` 探测预算：不得拖慢会话启动（方案 R8）。
@@ -88,9 +91,12 @@ export type ExecFn = (command: string, args: string[], opts?: ExecOptionsLike) =
  * 一次性命令的失败分类——决定调用方能不能据此禁用/放弃重试：
  * - `missing`：命令不可用（ENOENT / not found），可直接判定「没装 CLI」；
  * - `timeout`：被宿主杀掉（`killed: true`，超时/abort）。**不等于**没装 CLI，通常值得重试一次；
+ * - `not-running`：生命周期命令确认箱根本没跑起来（实测 `wake` 对人工暂停的箱退出码 0，
+ *   只在 stderr 自报 `machine_not_running`）——只能靠 `start`/`resume` 补救，重试同一命令没用；
+ *   只有 `wake`/`start`/`resume` 会产出该值，探测与 `ls` 永远不返回它；
  * - `error`：CLI 在，但非 0 退出 / 输出不可用 / 注入实现抛了别的异常。
  */
-export type CliFailureReason = "missing" | "timeout" | "error";
+export type CliFailureReason = "missing" | "timeout" | "not-running" | "error";
 
 /** `probeVersion` 结果：成功必带版本串，失败必带原因文本与可分支处理的 {@link CliFailureReason}。 */
 export type ProbeVersionResult =
@@ -107,11 +113,12 @@ export type ListBoxesRawResult =
 
 /**
  * `wake` / `start` / `resume` 的统一结果（失败**不 throw**）。
- * `stderrTail` 两个分支都可能存在（成功时的进度信息不丢），最多 {@link STDERR_TAIL_LIMIT} 字符。
+ * `stderrTail` 两个分支都可能存在（成功时的进度信息不丢），最多 {@link STDERR_TAIL_LIMIT} 字符；
+ * 失败分支必带 {@link CliFailureReason}（其中 `not-running` 只可能来自这三个命令）。
  */
 export type CliOutcome =
 	| { ok: true; stderrTail?: string }
-	| { ok: false; error: string; stderrTail?: string };
+	| { ok: false; error: string; reason: CliFailureReason; stderrTail?: string };
 
 /** `execRemote` 结果：额外带回远端 stdout（失败时保留已产生的部分输出）。 */
 export type RemoteExecOutcome =
@@ -155,6 +162,20 @@ type CliCall = { ok: true; result: ExecResultLike } | { ok: false; error: string
 const MISSING_BIN_RE = /\bENOENT\b|command not found|spawn .* (ENOENT|EACCES)|errno -(2|13)\b/i;
 
 /**
+ * CLI 自己的错误信封：`instabox: error <code>: <message> [request …]`（本轮实测的 `wake` 输出）。
+ * 二进制里只有一个这样的格式化串（`instabox: error %s`），所以三个生命周期命令共用。
+ */
+const CLI_ERROR_LINE_RE = /^instabox: error /m;
+
+/**
+ * 「箱没在跑」的证据串。实测 `instabox wake <box>`（用户手动 suspend）：**退出码 0**，stderr 为
+ * `instabox: error machine_not_running: machine is suspended; start it first [request …]`
+ * + `hint: start it with \`instabox start <sandbox>\``，而沙箱状态不变。
+ * 两项任一命中即判失败（关键词兼做信封被包装/缩进时的兜底）。
+ */
+const NOT_RUNNING_RE = /machine_not_running|start it with/i;
+
+/**
  * `instabox exec` 的 `--timeout` 秒数：向上取整、下限 1 秒、上限 {@link EXEC_TIMEOUT_MAX_SECONDS}。
  * 非有限值（NaN/Infinity）按上限处理，绝不把非法秒数交给 CLI。
  */
@@ -174,18 +195,30 @@ export function remoteTimeoutSeconds(timeoutMs: number): number {
  * 整个扩展自禁用。
  */
 export async function probeVersion(exec: ExecFn, opts: CliRunOptions = {}): Promise<ProbeVersionResult> {
+	const startedAt = Date.now();
 	const timeout = opts.timeout ?? PROBE_VERSION_TIMEOUT_MS;
 	const label = "instabox version";
 	const call = await runOnce(exec, label, ["version"], { timeout, signal: opts.signal });
-	if (!call.ok) return { ok: false, error: call.error, reason: classifyFailure(call.error, false) };
+	if (!call.ok) {
+		const reason = classifyFailure(call.error, false);
+		logEvent("cli.probe", { ok: false, reason, ms: Date.now() - startedAt }, "warn");
+		return { ok: false, error: call.error, reason };
+	}
 	const { result } = call;
 	// 宿主对超时/abort 回 `killed: true`（`code` 可能仍是 0）→ 归为 timeout，不当作「CLI 有问题」
 	if (failed(result)) {
 		const error = describeFailure(label, result, timeout);
-		return { ok: false, error, reason: classifyFailure(error, result.killed === true) };
+		const reason = classifyFailure(error, result.killed === true);
+		logEvent("cli.probe", { ok: false, reason, ms: Date.now() - startedAt }, "warn");
+		return { ok: false, error, reason };
 	}
 	const version = firstLine(result.stdout);
-	return version ? { ok: true, version } : { ok: false, error: `${label} printed no version text`, reason: "error" };
+	if (!version) {
+		logEvent("cli.probe", { ok: false, reason: "error", ms: Date.now() - startedAt }, "warn");
+		return { ok: false, error: `${label} printed no version text`, reason: "error" };
+	}
+	logEvent("cli.probe", { ok: true, version, ms: Date.now() - startedAt });
+	return { ok: true, version };
 }
 
 /**
@@ -194,19 +227,29 @@ export async function probeVersion(exec: ExecFn, opts: CliRunOptions = {}): Prom
  * 失败按 {@link CliFailureReason} 分类：`timeout`（被 `killed`）应重试，不是箱列表坏了。
  */
 export async function listBoxesRaw(exec: ExecFn, opts: CliRunOptions = {}): Promise<ListBoxesRawResult> {
+	const startedAt = Date.now();
 	const timeout = opts.timeout ?? LIST_BOXES_TIMEOUT_MS;
 	const label = "instabox ls";
 	const call = await runOnce(exec, label, ["ls", "--json"], { timeout, signal: opts.signal });
-	if (!call.ok) return { ok: false, error: call.error, reason: classifyFailure(call.error, false) };
+	if (!call.ok) {
+		const reason = classifyFailure(call.error, false);
+		logEvent("cli.ls", { ok: false, count: 0, reason, ms: Date.now() - startedAt });
+		return { ok: false, error: call.error, reason };
+	}
 	const { result } = call;
 	if (failed(result)) {
 		const error = describeFailure(label, result, timeout);
-		return { ok: false, error, reason: classifyFailure(error, result.killed === true) };
+		const reason = classifyFailure(error, result.killed === true);
+		logEvent("cli.ls", { ok: false, count: 0, reason, ms: Date.now() - startedAt });
+		return { ok: false, error, reason };
 	}
 	try {
 		const json: unknown = JSON.parse(result.stdout);
+		// 顶层数组长度就是箱数；非数组（结构不对）记 0，解析容错仍由 `boxes.ts` 负责
+		logEvent("cli.ls", { ok: true, count: Array.isArray(json) ? json.length : 0, ms: Date.now() - startedAt });
 		return { ok: true, json };
 	} catch {
+		logEvent("cli.ls", { ok: false, count: 0, reason: "error", ms: Date.now() - startedAt });
 		return {
 			ok: false,
 			error: `instabox ls --json returned invalid JSON: ${tail(result.stdout)}`,
@@ -219,6 +262,7 @@ export async function listBoxesRaw(exec: ExecFn, opts: CliRunOptions = {}): Prom
  * `instabox wake <box>`：只唤「自己暂停」的箱，默认预算 {@link DEFAULT_CONFIG.timeouts.wakeMs}
  * （50 秒，比 CLI 自带的 45 秒等待上限留 5 秒余量）。
  * 人工 `suspend`/`stop` 的箱必然失败 → 由 `pool.ts` 退到 `start`/`resume`。
+ * 注意：这条失败是**退出码 0 + stderr 自报**（见 {@link reportedFailure}），所以不能只看退出码。
  */
 export function wake(exec: ExecFn, box: string, opts: CliRunOptions = {}): Promise<CliOutcome> {
 	return runLifecycle(exec, "wake", box, DEFAULT_CONFIG.timeouts.wakeMs, opts);
@@ -244,16 +288,22 @@ export async function execRemote(
 	argv: readonly string[],
 	opts: ExecRemoteOptions = {},
 ): Promise<RemoteExecOutcome> {
+	const startedAt = Date.now();
 	const seconds = remoteTimeoutSeconds(opts.timeoutMs ?? EXEC_REMOTE_TIMEOUT_MS);
 	const localTimeout = opts.execTimeoutMs ?? seconds * 1000 + EXEC_LOCAL_GRACE_MS;
 	const label = `instabox exec ${box}`;
 	const args = ["exec", box, "--timeout", String(seconds), "--", ...argv];
 	const call = await runOnce(exec, label, args, { timeout: localTimeout, signal: opts.signal });
-	if (!call.ok) return { ok: false, error: call.error };
+	if (!call.ok) {
+		logEvent("cli.exec", { box, timeoutSec: seconds, ok: false, ms: Date.now() - startedAt });
+		return { ok: false, error: call.error };
+	}
 	const stderrTail = tailOrUndefined(call.result.stderr);
 	if (failed(call.result)) {
+		logEvent("cli.exec", { box, timeoutSec: seconds, ok: false, ms: Date.now() - startedAt });
 		return { ok: false, error: describeFailure(label, call.result, localTimeout), stderrTail, stdout: call.result.stdout };
 	}
+	logEvent("cli.exec", { box, timeoutSec: seconds, ok: true, ms: Date.now() - startedAt });
 	return { ok: true, stdout: call.result.stdout, stderrTail };
 }
 
@@ -265,13 +315,47 @@ async function runLifecycle(
 	defaultTimeoutMs: number,
 	opts: CliRunOptions,
 ): Promise<CliOutcome> {
+	const startedAt = Date.now();
 	const timeout = opts.timeout ?? defaultTimeoutMs;
 	const label = `instabox ${subcommand} ${box}`;
 	const call = await runOnce(exec, label, [subcommand, box], { timeout, signal: opts.signal });
-	if (!call.ok) return { ok: false, error: call.error };
-	const stderrTail = tailOrUndefined(call.result.stderr);
-	if (failed(call.result)) return { ok: false, error: describeFailure(label, call.result, timeout), stderrTail };
+	if (!call.ok) {
+		const reason = classifyLifecycleFailure(call.error, false);
+		logEvent("cli.lifecycle", { command: subcommand, box, ok: false, reason, ms: Date.now() - startedAt });
+		return { ok: false, error: call.error, reason };
+	}
+	const { result } = call;
+	const stderrTail = tailOrUndefined(result.stderr);
+	// 退出码 0 不等于成功：CLI 会用 stderr 自报错误（实测 `wake` 对人工暂停的箱）
+	const reported = reportedFailure(result.stderr);
+	if (failed(result) || reported !== undefined) {
+		const error =
+			reported === undefined ? describeFailure(label, result, timeout) : `${label} reported an error: ${tail(reported)}`;
+		const reason = classifyLifecycleFailure(error, result.killed === true);
+		logEvent("cli.lifecycle", { command: subcommand, box, ok: false, reason, ms: Date.now() - startedAt });
+		return { ok: false, error, reason, stderrTail };
+	}
+	logEvent("cli.lifecycle", { command: subcommand, box, ok: true, ms: Date.now() - startedAt });
 	return { ok: true, stderrTail };
+}
+
+/**
+ * 退出码 0 时仍要判失败的形态：CLI 在 stderr 上自报错误（错误信封或「箱没在跑」证据串）。
+ * 成功路径的 stderr 只有进度文本（如 `waking …`），不会被误判。
+ * 三个生命周期命令共用同一份判定：错误信封是 CLI 全局唯一的格式化串（`instabox: error %s`），
+ * 不随子命令变化。
+ */
+function reportedFailure(stderr: string): string | undefined {
+	const text = stderr.trim();
+	if (!text) return undefined;
+	return CLI_ERROR_LINE_RE.test(text) || NOT_RUNNING_RE.test(text) ? text : undefined;
+}
+
+/** 生命周期命令的失败分类：被杀 → timeout；CLI 报「箱没在跑」→ not-running；其余走通用三分。 */
+function classifyLifecycleFailure(failureText: string, killed: boolean): CliFailureReason {
+	if (killed) return "timeout";
+	if (NOT_RUNNING_RE.test(failureText)) return "not-running";
+	return classifyFailure(failureText, false);
 }
 
 /** 唯一调用 `ExecFn` 的地方：异常统一收成 `ok: false`，绝不外抛。 */

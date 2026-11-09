@@ -26,6 +26,7 @@ import {
 	wake,
 } from "../src/cli.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
+import { createMemoryLogger, setLogger } from "../src/log.ts";
 
 /** 一次假调用的快照（逐字断言 command/args/opts）。 */
 interface RecordedCall {
@@ -249,18 +250,74 @@ describe("wake / start / resume", () => {
 		expect(calls[0]?.opts?.timeout).toBe(DEFAULT_CONFIG.timeouts.startMs);
 	});
 
-	it("wake 失败（人工暂停的箱）返回 ok:false，stderr 尾部保留", async () => {
+	it("wake 非 0 退出返回 ok:false（reason=error），stderr 尾部保留", async () => {
 		const { exec } = recordingExec(failResult(1, "sandbox is suspended; use resume or start\n"));
 		const result: CliOutcome = await wake(exec, "libretv");
 		if (result.ok) throw new Error(`expected wake to fail, got ${JSON.stringify(result)}`);
+		expect(result.reason).toBe("error");
 		expect(result.error).toContain("instabox wake libretv");
 		expect(result.error).toContain("code 1");
 		expect(result.stderrTail).toBe("sandbox is suspended; use resume or start");
 	});
 
-	it("成功时也保留非空 stderr 尾部（进度信息不丢）", async () => {
+	it("wake 退出码 0 但 stderr 报 machine_not_running → 失败 + reason=not-running（实测形态）", async () => {
+		// 实测：用户手动 suspend 的箱，`instabox wake libretv` 退出码 0，沙箱状态不变
+		const measured =
+			"instabox: error machine_not_running: machine is suspended; start it first [request 0193a4f2-7e11]\n" +
+			"hint: start it with `instabox start <sandbox>`\n";
+		const { exec } = recordingExec(okResult("", measured));
+		const result = await wake(exec, "libretv");
+		if (result.ok) throw new Error(`exit 0 with stderr error must fail, got ${JSON.stringify(result)}`);
+		expect(result.reason).toBe("not-running");
+		expect(result.error).toContain("instabox wake libretv reported an error");
+		expect(result.error).toContain("machine_not_running");
+		// stderr 尾部原样保留（含 request id 与 hint 行），便于排障
+		expect(result.stderrTail).toBe(measured.trim());
+	});
+
+	it("只命中 machine_not_running（无错误信封）也判 not-running", async () => {
+		const { exec } = recordingExec(okResult("", "machine_not_running: machine is suspended\n"));
+		const result = await wake(exec, "libretv");
+		if (result.ok) throw new Error(`expected not-running, got ${JSON.stringify(result)}`);
+		expect(result.reason).toBe("not-running");
+	});
+
+	it("只命中 hint 行（start it with）也判 not-running（单引号变体）", async () => {
+		const { exec } = recordingExec(okResult("", "hint: start it with 'instabox start <sandbox>'\n"));
+		const result = await wake(exec, "libretv");
+		if (result.ok) throw new Error(`expected not-running, got ${JSON.stringify(result)}`);
+		expect(result.reason).toBe("not-running");
+	});
+
+	it("start/resume 退出码 0 + 错误信封 → 同样判失败（信封是 CLI 全局唯一的）", async () => {
+		const { exec } = recordingExec(okResult("", "instabox: error machine_stopped: cannot resume now [request 12]\n"));
+		const started = await start(exec, "agent");
+		if (started.ok) throw new Error(`expected start to fail, got ${JSON.stringify(started)}`);
+		expect(started.reason).toBe("error");
+		expect(started.error).toContain("machine_stopped");
+
+		const { exec: exec2 } = recordingExec(okResult("", "instabox: error internal: boom [request 13]\n"));
+		const resumed = await resume(exec2, "agent");
+		if (resumed.ok) throw new Error(`expected resume to fail, got ${JSON.stringify(resumed)}`);
+		expect(resumed.reason).toBe("error");
+	});
+
+	it("wake 被宿主杀掉（超时）→ reason=timeout", async () => {
+		const { exec } = recordingExec({ stdout: "", stderr: "", code: 0, killed: true, truncated: false });
+		const result = await wake(exec, "agent");
+		if (result.ok) throw new Error(`expected killed wake to fail, got ${JSON.stringify(result)}`);
+		expect(result.reason).toBe("timeout");
+	});
+
+	it("成功时也保留非空 stderr 尾部（进度信息不丢，不会误判失败）", async () => {
 		const { exec } = recordingExec(okResult("", "waking libretv...\n"));
 		expect(await start(exec, "libretv")).toEqual({ ok: true, stderrTail: "waking libretv..." });
+	});
+
+	it("自动休眠的箱 exit 0、stderr 无错误串 → 成功", async () => {
+		// 实测：`instabox wake agent` 退出码 0，6s 后真的 running（stderr 只有进度行）
+		const { exec } = recordingExec(okResult("", "waking agent…\nstate: starting → running\n"));
+		expect(await wake(exec, "agent")).toEqual({ ok: true, stderrTail: "waking agent…\nstate: starting → running" });
 	});
 
 	it("stderr 尾部最多 500 字符且取的是尾部", async () => {
@@ -272,11 +329,12 @@ describe("wake / start / resume", () => {
 		expect(result.stderrTail?.endsWith("ROOT-CAUSE")).toBe(true);
 	});
 
-	it("抛异常转 ok:false，不外抛", async () => {
+	it("抛异常转 ok:false（reason=error），不外抛", async () => {
 		const { exec } = recordingExec(new Error("ssh: connect timed out"));
 		expect(await resume(exec, "agent")).toEqual({
 			ok: false,
 			error: "instabox resume agent failed: ssh: connect timed out",
+			reason: "error",
 		});
 	});
 });
@@ -369,5 +427,24 @@ describe("remoteTimeoutSeconds", () => {
 	it("非有限值按上限处理（不把 NaN/Infinity 交给 CLI）", () => {
 		expect(remoteTimeoutSeconds(Number.NaN)).toBe(600);
 		expect(remoteTimeoutSeconds(Number.POSITIVE_INFINITY)).toBe(600);
+	});
+});
+
+describe("埋点（logEvent）", () => {
+	it("probeVersion 成功记一条 cli.probe（ok/version/ms）", async () => {
+		const logger = createMemoryLogger();
+		setLogger(logger);
+		try {
+			const { exec } = recordingExec(okResult("0.4.2\n"));
+			await probeVersion(exec);
+		} finally {
+			setLogger(undefined);
+		}
+
+		const probes = logger.records.filter((record) => record.event === "cli.probe");
+		expect(probes).toHaveLength(1);
+		expect(probes[0]?.level).toBe("info");
+		expect(probes[0]?.fields).toMatchObject({ ok: true, version: "0.4.2" });
+		expect(typeof probes[0]?.fields?.["ms"]).toBe("number");
 	});
 });

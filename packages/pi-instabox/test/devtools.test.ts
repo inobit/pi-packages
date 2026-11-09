@@ -1,12 +1,14 @@
 /**
  * @inobit/pi-instabox — `src/devtools.ts` 单测：helper 脚本内容（`set -eu`、stdout 纯净、
- * `--env PATH=`、ssh 形式、autoInstall 两种分支、单引号转义、脚本预算 < per-request timeout）、
- * 写盘幂等/`chmod`/失败只 warn、`registerMcpServer` 参数（`exposure`/`timeout`/`description`）。全程内存文件系统，不落盘。
+ * 先 `wake`/`start` 再检查、`--env PATH=`、ssh 形式、autoInstall 两种分支、单引号转义、
+ * 脚本预算 < per-request timeout）、写盘幂等/`chmod`/失败只 warn、
+ * `registerMcpServer` 参数（`exposure`/`timeout`/`description`）。全程内存文件系统，不落盘。
  */
 
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG, resolvePaths } from "../src/config.ts";
+import { createMemoryLogger, setLogger } from "../src/log.ts";
 import {
 	buildHelperScript,
 	buildMcpServerConfig,
@@ -18,6 +20,13 @@ import {
 const REMOTE_PATH = "/opt/npm/bin:/usr/local/bin:/usr/bin:/bin";
 const AGENT_DIR = path.join(path.sep, "tmp", "agent");
 const PATHS = resolvePaths(AGENT_DIR);
+
+/** 拉起箱的那一行：先把箱弄运行，失败不阻断（让后面的检查/ssh 自然报错）。 */
+const WAKE_LINE = 'instabox wake "$box" >/dev/null 2>&1 || instabox start "$box" >/dev/null 2>&1 || true';
+
+/** 唤醒的现实上界（秒，真机实测）：running 箱 2 秒，suspended 箱 ≥45 秒放弃后还得 `start` 约 10–60 秒。 */
+const WAKE_TIMEOUT_SECONDS = 45;
+const START_TIMEOUT_SECONDS = 60;
 
 /** 记录全部调用的内存文件系统；`failOn` 指哪一步抛错（模拟无权限/磁盘满） */
 function fakeFileSystem(failOn?: "ensureDir" | "writeText" | "setMode") {
@@ -75,8 +84,30 @@ describe("buildHelperScript 骨架", () => {
 		for (const line of printfLines) expect(line.trimEnd().endsWith(">&2")).toBe(true);
 	});
 
+	it("先 wake（失败再 start）拉起箱，失败不阻断，且该行不写 stdout", () => {
+		expect(script).toContain(`\n${WAKE_LINE}\n`);
+		const wakeLine = linesOf(script).find((line) => line.startsWith("instabox wake"));
+		// stdout 纯净：唤醒的输出（包括 `start` 那一支）全部丢到 /dev/null，一个字节也不留
+		expect(wakeLine?.endsWith("|| true")).toBe(true);
+		expect(wakeLine).not.toContain(">&2");
+		expect(wakeLine).not.toContain("printf");
+		expect((wakeLine?.match(/>\/dev\/null 2>&1/g) ?? []).length).toBe(2);
+	});
+
+	it("唤醒/拉起在安装检查之前，紧跟在 PATH 定义之后且在 if 块之外", () => {
+		const code = linesOf(script);
+		const wakeIndex = code.findIndex((line) => line.startsWith("instabox wake"));
+		const checkIndex = code.findIndex((line) => line.startsWith("if ! instabox exec"));
+		const pathIndex = code.findIndex((line) => line.startsWith("remote_path="));
+		expect(pathIndex).toBeGreaterThan(-1);
+		expect(wakeIndex).toBeGreaterThan(pathIndex);
+		expect(checkIndex).toBeGreaterThan(wakeIndex);
+		// 顶层语句：唤醒行不能缩进（缩进意味着被包进了 if 块）
+		expect(code[wakeIndex]).toBe(WAKE_LINE);
+	});
+
 	it("安装检查用 `instabox exec --env PATH=…`，结果丢弃、不阻断", () => {
-		expect(script).toContain(`instabox exec "$box" --env "PATH=$remote_path" --timeout 20 --`);
+		expect(script).toContain(`instabox exec "$box" --env "PATH=$remote_path" --timeout 10 --`);
 		expect(script).toContain("sh -c 'command -v chrome-devtools-mcp >/dev/null 2>&1'");
 		expect(script).toContain("sh -c 'command -v chrome-devtools-mcp >/dev/null 2>&1' >/dev/null 2>&1; then");
 	});
@@ -104,10 +135,10 @@ describe("buildHelperScript 骨架", () => {
 });
 
 describe("buildHelperScript 的 autoInstall 分支", () => {
-	it("true：装一次 `sudo -n env PATH=… npm i -g chrome-devtools-mcp`，80 秒、失败不阻断", () => {
+	it("true：装一次 `sudo -n env PATH=… npm i -g chrome-devtools-mcp`，40 秒、失败不阻断", () => {
 		const script = buildHelperScript({ remotePath: REMOTE_PATH, autoInstall: true });
 		expect(script).toContain(`sudo -n env "PATH=${REMOTE_PATH}" npm i -g chrome-devtools-mcp`);
-		expect(script).toContain('--env "PATH=$remote_path" --timeout 80 --');
+		expect(script).toContain('--env "PATH=$remote_path" --timeout 40 --');
 		expect(script).toContain(
 			`sh -c 'sudo -n env "PATH=${REMOTE_PATH}" npm i -g chrome-devtools-mcp' >&2 2>&1 || true`,
 		);
@@ -115,13 +146,14 @@ describe("buildHelperScript 的 autoInstall 分支", () => {
 		expect(script).not.toContain("auto-install disabled");
 	});
 
-	it("false：不装、不超时 80，只在 stderr 说明原因", () => {
+	it("false：不装、不超时 40，只在 stderr 说明原因", () => {
 		const script = buildHelperScript({ remotePath: REMOTE_PATH, autoInstall: false });
 		expect(script).not.toContain("sudo");
-		expect(script).not.toContain("--timeout 80");
+		expect(script).not.toContain("--timeout 40");
 		expect(script).toContain("auto-install disabled (autoInstallDevTools=false)");
-		// 检查与 ssh 段不随开关变化
-		expect(script).toContain("--timeout 20 --");
+		// 唤醒、检查与 ssh 段不随开关变化
+		expect(script).toContain(WAKE_LINE);
+		expect(script).toContain("--timeout 10 --");
 		expect(script).toContain('exec instabox ssh "$box" -- env "PATH=$remote_path" chrome-devtools-mcp "$@"');
 	});
 
@@ -132,14 +164,18 @@ describe("buildHelperScript 的 autoInstall 分支", () => {
 });
 
 describe("脚本预算与 MCP per-request timeout", () => {
-	// pi 的 MCP 客户端对 `initialize` 也计时，而 helper 的检查/安装都在 `initialize` 应答之前跑完，
-	// 所以两段 `--timeout` 之和必须小于注册配置的 `timeout`，否则冷箱安装会被提前报死。
+	// pi 的 MCP 客户端对 `initialize` 也计时，而 helper 的唤醒/检查/安装都在 `initialize` 应答之前跑完，
+	// 所以三段之和必须小于注册配置的 `timeout`，否则冷箱唤醒或安装会被提前报死。
 	it("autoInstall=true 时 `--timeout` 之和 < 注册的 per-request timeout", () => {
 		const script = buildHelperScript({ remotePath: REMOTE_PATH, autoInstall: true });
 		const budgets = [...script.matchAll(/--timeout (\d+) --/g)].map((match) => Number(match[1]));
 		// 两段：检查 + 安装（最后一段 `instabox ssh` 不设 `--timeout`）
-		expect(budgets).toEqual([20, 80]);
-		expect(budgets.reduce((sum, seconds) => sum + seconds, 0)).toBeLessThan(
+		expect(budgets).toEqual([10, 40]);
+		const checked = budgets.reduce((sum, seconds) => sum + seconds, 0);
+		// 唤醒/拉起没有 `--timeout` 可设，只能按实测上界算进 preamble
+		const preambleWorstCase = WAKE_TIMEOUT_SECONDS + START_TIMEOUT_SECONDS + checked;
+		expect(preambleWorstCase).toBe(155);
+		expect(preambleWorstCase).toBeLessThan(
 			buildMcpServerConfig({ ...DEFAULT_CONFIG, devToolsBox: "agent" }, PATHS).config.timeout,
 		);
 	});
@@ -227,6 +263,24 @@ describe("ensureHelperScript", () => {
 			error: "writeText: EACCES",
 		});
 	});
+
+	it("埋点：写盘成功/失败各一条 devtools.helper，带 path 与 error", () => {
+		const logger = createMemoryLogger();
+		const okIo = fakeFileSystem();
+		const failingIo = fakeFileSystem("setMode");
+		setLogger(logger);
+		try {
+			ensureHelperScript({ paths: PATHS, remotePath: REMOTE_PATH, autoInstall: true, fs: okIo.io });
+			ensureHelperScript({ paths: PATHS, remotePath: REMOTE_PATH, autoInstall: true, fs: failingIo.io });
+		} finally {
+			setLogger(undefined);
+		}
+
+		const records = logger.records.filter((record) => record.event === "devtools.helper");
+		expect(records).toHaveLength(2);
+		expect(records[0]?.fields).toEqual({ ok: true, path: file });
+		expect(records[1]?.fields).toEqual({ ok: false, path: file, error: "setMode: EACCES" });
+	});
 });
 
 describe("buildMcpServerConfig", () => {
@@ -245,9 +299,9 @@ describe("buildMcpServerConfig", () => {
 		expect(registration.config.args.length).toBe(DEFAULT_CONFIG.devToolsArgs.length + 1);
 	});
 
-	it("exposure 钉 codemode、timeout 120（每请求秒数）", () => {
+	it("exposure 钉 codemode、timeout 180（每请求秒数，覆盖唤醒 + 检查 + 安装）", () => {
 		expect(registration.config.exposure).toBe("codemode");
-		expect(registration.config.timeout).toBe(120);
+		expect(registration.config.timeout).toBe(180);
 	});
 
 	it("description 自解释：带 box 名、fixed box 语义与 describeNamespace 发现路径", () => {

@@ -1,6 +1,6 @@
 /**
  * @inobit/pi-instabox — `src/config.ts` 单测：默认值、逐层叠加、非法回落、
- * 环境变量覆盖、VITEST 短路行为、V3 四路径。
+ * 环境变量覆盖、VITEST 短路行为、V3 路径布局（含日志目录）。
  */
 
 import os from "node:os";
@@ -71,29 +71,37 @@ describe("DEFAULT_CONFIG", () => {
 		expect(DEFAULT_CONFIG.timeouts).toEqual({
 			wakeMs: 50000,
 			startMs: 120000,
-			connectMs: 15000,
+			connectMs: 50000,
 			initializeMs: 20000,
 			listToolsMs: 20000,
 			callMs: 120000,
 		});
 	});
+
+	it("connectMs 覆盖自动唤醒的 45s 等待（官方文档：自动暂停的箱下次使用时自动唤醒，请求最多等 45s）", () => {
+		expect(DEFAULT_CONFIG.timeouts.connectMs).toBe(50000);
+		expect(DEFAULT_CONFIG.timeouts.connectMs).toBeGreaterThanOrEqual(45_000);
+	});
 });
 
-describe("resolvePaths / getAgentDir（V3 四路径）", () => {
-	it("四处路径按 agentDir 展开（配置进 extensions/，状态与 helper 进 pi-instabox/）", () => {
+describe("resolvePaths / getAgentDir（V3 四路径＋日志目录）", () => {
+	it("路径按 agentDir 展开（配置进 extensions/，状态与 helper 进 pi-instabox/，日志进 logs/pi-instabox/）", () => {
 		const paths = resolvePaths(AGENT_DIR);
 		expect(paths.configFile).toBe(path.join(AGENT_DIR, "extensions", "pi-instabox", "config.json"));
 		expect(paths.stateDir).toBe(path.join(AGENT_DIR, "pi-instabox"));
 		expect(paths.templateCacheFile).toBe(path.join(AGENT_DIR, "pi-instabox", "templates.json"));
 		expect(paths.helperScript).toBe(path.join(AGENT_DIR, "pi-instabox", "bin", "devtools-connect.sh"));
+		// 生态惯例（同 `logs/pi-permission`）：扩展目录只放配置，日志与 `pi-debug.log` 同级
+		expect(paths.logDir).toBe(path.join(AGENT_DIR, "logs", "pi-instabox"));
 	});
 
-	it("`PI_CODING_AGENT_DIR` 覆盖 agent 目录（helper/缓存随之移动）", () => {
+	it("`PI_CODING_AGENT_DIR` 覆盖 agent 目录（helper/缓存/日志目录随之移动）", () => {
 		withEnv({ PI_CODING_AGENT_DIR: "/tmp/x" }, () => {
 			expect(getAgentDir()).toBe("/tmp/x");
 			expect(resolvePaths(getAgentDir()).configFile).toBe("/tmp/x/extensions/pi-instabox/config.json");
 			expect(resolvePaths(getAgentDir()).templateCacheFile).toBe("/tmp/x/pi-instabox/templates.json");
 			expect(resolvePaths(getAgentDir()).helperScript).toBe("/tmp/x/pi-instabox/bin/devtools-connect.sh");
+			expect(resolvePaths(getAgentDir()).logDir).toBe("/tmp/x/logs/pi-instabox");
 		});
 	});
 

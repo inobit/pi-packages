@@ -7,7 +7,9 @@
  * 在 `VITEST` 下恒返回默认值＋环境变量层（测试确定性），所有外部访问都走注入面便于离线测试。
  *
  * 路径布局（裁决 V3）：配置进 `<agentDir>/extensions/pi-instabox/`，运行期状态与 helper 进
- * `<agentDir>/pi-instabox/`。四处路径单点在 `resolvePaths()`，其余模块只消费它的返回值。
+ * `<agentDir>/pi-instabox/`，事件日志进 `<agentDir>/logs/pi-instabox/`（与
+ * `logs/pi-permission/` 的生态惯例一致：扩展目录只放配置，日志与 `pi-debug.log` 同级）。
+ * 所有路径单点在 `resolvePaths()`，其余模块只消费它的返回值。
  */
 
 import fs from "node:fs";
@@ -20,7 +22,13 @@ export interface InstaboxTimeouts {
 	wakeMs: number;
 	/** `instabox start` / `instabox resume` 上界（整箱冷启） */
 	startMs: number;
-	/** spawn 后等远端 MCP 传输建链的上界 */
+	/**
+	 * spawn 后等远端 MCP 传输建链的上界。
+	 *
+	 * 官方文档（instabox 箱生命周期）：自动暂停的箱在下次使用时自动唤醒，唤醒请求最多等 45s，
+	 * 故给 50s 覆盖「spawn → 自动唤醒 → 首个字节」整段。`remote.ts` 的 `DEFAULT_TIMEOUTS.connect`
+	 * （15s）只是该模块的兜底值，装配层（`pool.ts`）会用本字段覆盖它，改这里才生效。
+	 */
 	connectMs: number;
 	/** `initialize` 请求上界 */
 	initializeMs: number;
@@ -59,7 +67,7 @@ export const DEFAULT_CONFIG: InstaboxConfig = {
 	timeouts: {
 		wakeMs: 50_000,
 		startMs: 120_000,
-		connectMs: 15_000,
+		connectMs: 50_000,
 		initializeMs: 20_000,
 		listToolsMs: 20_000,
 		callMs: 120_000,
@@ -82,7 +90,7 @@ export function getAgentDir(): string {
 /** 配置文件相对路径：全局层相对 `agentDir`，项目层相对 `<cwd>/.pi` */
 const CONFIG_RELATIVE_PATH = path.join("extensions", "pi-instabox", "config.json");
 
-/** 运行期状态目录名（`<agentDir>/pi-instabox`） */
+/** 运行期目录名：状态进 `<agentDir>/pi-instabox`，日志进 `<agentDir>/logs/pi-instabox` */
 const STATE_DIR_NAME = "pi-instabox";
 
 export interface InstaboxPaths {
@@ -94,6 +102,8 @@ export interface InstaboxPaths {
 	templateCacheFile: string;
 	/** DevTools helper 脚本（运行期产物，非配置） */
 	helperScript: string;
+	/** 事件日志目录（JSONL 由 `log.ts` 写入，按需创建） */
+	logDir: string;
 }
 
 export function resolvePaths(agentDir: string): InstaboxPaths {
@@ -103,6 +113,7 @@ export function resolvePaths(agentDir: string): InstaboxPaths {
 		stateDir,
 		templateCacheFile: path.join(stateDir, "templates.json"),
 		helperScript: path.join(stateDir, "bin", "devtools-connect.sh"),
+		logDir: path.join(agentDir, "logs", STATE_DIR_NAME),
 	};
 }
 

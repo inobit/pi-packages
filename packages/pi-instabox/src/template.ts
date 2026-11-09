@@ -12,6 +12,9 @@
  * - **绝不唤醒 box**：本模块不 import `cli.ts`，也不调用任何 `wake` / `start` / `resume`；
  *   只通过注入的 `clientFactory` 拿连接、`initialize()` + `listTools()`。`instabox ssh` 到
  *   暂停箱会直接失败，失败即返回 `ok: false` 并保留旧缓存——唤醒链归 `pool.ts`。
+ * - **唤醒策略不在本模块**：`ensure(box, { allowWake })` 只把 `allowWake` 原样交给
+ *   `clientFactory(box, { allowWake })`（没传就不传第二参，由工厂按自身默认策略处理）。
+ *   `allowWake: false` 时工厂不唤醒，握手失败仍返回 `{ ok: false, error, stale? }`（现状不变）。
  * - **每次 `ensure()` 先握手一次**（`initialize` → `serverInfo.version`），用这次握手的版本
  *   与缓存比对（方案 §5.4）：版本相同且未过期 → 直接返回缓存（不 `listTools`）；版本不同 /
  *   已过期 / 无缓存 → `listTools` 并写缓存。版本校验不依赖调用方传参，因此远端
@@ -22,11 +25,15 @@
  *   写盘失败只 `warn`，都不 throw 到会话层。
  * - 注入面：`fs`（读/写文本）、`clock`（epoch 毫秒）、`clientFactory` 全部可替；默认实现的
  *   `fs` 用 `node:fs`，原子写（同目录临时文件 + `rename`）只在默认实现里。
+ * - 埋点（经 `logEvent`，未配置 logger 时 no-op）：`template.hit`（版本与 TTL 双通过的命中，
+ *   debug）、`template.refetch`（重拉成功，带原因与耗时）、`template.fail`（握手/拉取失败或取消，
+ *   warn，`stale` 说明磁盘上还有没有旧缓存可降级）。
  */
 
 import fs from "node:fs";
 import path from "node:path";
 import type { InstaboxPaths } from "./config.ts";
+import { logEvent } from "./log.ts";
 import type { InitializeResult, RemoteClient, RemoteTool } from "./remote.ts";
 
 /** 缓存文件结构版本（结构不兼容时整份丢弃并重建）。 */
@@ -70,8 +77,19 @@ export interface TemplateFileSystem {
 /** 注入的时钟：返回 epoch 毫秒（默认 `Date.now`）。 */
 export type ClockFn = () => number;
 
-/** per-box 客户端工厂（装配处传 `pool.get(box)`）。 */
-export type TemplateClientFactory = (box: string) => RemoteClient;
+/**
+ * 传给 {@link TemplateClientFactory} 的选项：本模块**只透传**，不决定唤醒策略。
+ *
+ * `allowWake` 的语义由工厂（装配处是 `pool.get(box, { allowWake })`）定义：
+ * `false` = 不唤醒，箱不在 `running` 就失败；`true` 或省略 = 工厂按自身默认策略处理。
+ */
+export interface TemplateClientOptions {
+	/** 是否允许工厂在取连接时唤醒箱（`undefined` = 工厂自己定） */
+	allowWake?: boolean;
+}
+
+/** per-box 客户端工厂（装配处传 `pool.get(box, { allowWake })`）。 */
+export type TemplateClientFactory = (box: string, options?: TemplateClientOptions) => RemoteClient;
 
 /** 警告出口（写盘失败等非致命问题；默认丢弃）。 */
 export type WarnFn = (message: string) => void;
@@ -79,7 +97,7 @@ export type WarnFn = (message: string) => void;
 export interface TemplateStoreOptions {
 	/** `resolvePaths()` 的返回值；本模块只消费 `templateCacheFile` */
 	paths: Pick<InstaboxPaths, "templateCacheFile">;
-	/** 按 box 取一个**已连上但不唤醒**的远端客户端 */
+	/** 按 box 取一个远端客户端（`allowWake` 由 `ensure()` 透传，工厂决定唤醒策略） */
 	clientFactory: TemplateClientFactory;
 	/** 注入的文件系统，默认 {@link nodeTemplateFileSystem} */
 	fs?: TemplateFileSystem;
@@ -101,6 +119,11 @@ export interface TemplateEnsureOptions {
 	templateId?: string;
 	/** 诊断字段（来自 `ls` 的 `template.version`）：给定时覆盖旧缓存值，缺省继承 */
 	templateVersion?: string;
+	/**
+	 * 透传给 `clientFactory` 的唤醒许可：`true` / `false` 原样传出，
+	 * **省略时不传第二参**（让工厂按自身默认策略处理）。本模块自己不唤醒任何箱。
+	 */
+	allowWake?: boolean;
 	/** 取消信号（透传给 `tools/list`） */
 	signal?: AbortSignal;
 }
@@ -130,6 +153,7 @@ export interface TemplateStore {
 	 * 先握手一次拿远端版本（`serverInfo.version`），再决定：
 	 * 版本相同且未过期 → 返回缓存（`refetched: false`，不 `listTools`）；
 	 * 版本不同 / 已过期 / 无缓存 → `listTools` 并写缓存（`refetched: true`）。
+	 * `options.allowWake` 只透传给 `clientFactory`（本模块不决定唤醒策略）。
 	 * 任何失败都返回 `ok: false`（有旧缓存时一并给出 `stale`），不动内存与磁盘。
 	 */
 	ensure(box: string, options?: TemplateEnsureOptions): Promise<TemplateEnsureResult>;
@@ -307,7 +331,9 @@ function failure(error: string, stale: CachedTemplate | undefined): TemplateEnsu
 
 /** 拉取失败时的错误文本（带 box，便于 debug 日志与现状对照）。 */
 function fetchFailure(box: string, error: unknown, stale: CachedTemplate | undefined): TemplateEnsureFailure {
-	return failure(`failed to fetch remote template for ${box}: ${messageOf(error)}`, stale);
+	const message = `failed to fetch remote template for ${box}: ${messageOf(error)}`;
+	logEvent("template.fail", { box, error: messageOf(error), stale: stale !== undefined }, "warn");
+	return failure(message, stale);
 }
 
 /** 取消判定（包成函数：跨 `await` 后仍能重新读到 `aborted`，不被前一次检查收窄成 `false`）。 */
@@ -315,9 +341,14 @@ function isAborted(signal: AbortSignal | undefined): boolean {
 	return signal?.aborted === true;
 }
 
+/** `template.refetch.reason`：为何走了重拉（无缓存 / TTL 过期 / 握手版本变了）。 */
+type RefetchReason = "no-cache" | "ttl-expired" | "version-changed";
+
 /** 取消时的失败结果。 */
 function abortFailure(box: string, stale: CachedTemplate | undefined): TemplateEnsureFailure {
-	return failure(`template refetch for ${box} aborted by caller`, stale);
+	const message = `template refetch for ${box} aborted by caller`;
+	logEvent("template.fail", { box, error: message, stale: stale !== undefined }, "warn");
+	return failure(message, stale);
 }
 
 /**
@@ -357,7 +388,9 @@ class FileTemplateStore implements TemplateStore {
 		let client: RemoteClient;
 		let handshakeVersion: string;
 		try {
-			client = this.clientFactory(box);
+			// `allowWake` 只透传：没传第二参就交给工厂的默认策略
+			const allowWake = options.allowWake;
+			client = this.clientFactory(box, allowWake === undefined ? undefined : { allowWake });
 			const initialized = await client.initialize();
 			if (isAborted(options.signal)) return abortFailure(box, cached);
 			handshakeVersion = serverVersionOf(initialized);
@@ -368,9 +401,17 @@ class FileTemplateStore implements TemplateStore {
 		}
 		// 显式传入的版本优先于握手值（调用方已确定版本时以它为准）
 		const knownVersion = options.serverVersion ?? handshakeVersion;
-		if (cached !== undefined && !isStale(cached, this.clock(), this.ttlMs) && !needsRefetch(cached, knownVersion)) {
+		const now = this.clock();
+		const ttlExpired = cached !== undefined && isStale(cached, now, this.ttlMs);
+		if (cached !== undefined && !ttlExpired && !needsRefetch(cached, knownVersion)) {
+			// `stale` 在这里恒为 false（命中要求 TTL 与版本双通过）；沿用旧缓存的降级命中记在
+			// `template.fail` 的 `stale` 上。
+			logEvent("template.hit", { box, serverInfoVersion: cached.serverInfoVersion, stale: ttlExpired }, "debug");
 			return { ok: true, template: cached, refetched: false };
 		}
+		const reason: RefetchReason =
+			cached === undefined ? "no-cache" : ttlExpired ? "ttl-expired" : "version-changed";
+		const startedAt = this.clock();
 		let tools: RemoteTool[];
 		try {
 			tools = await client.listTools(options.signal);
@@ -378,6 +419,7 @@ class FileTemplateStore implements TemplateStore {
 			this.warn?.(`template ensure failed for ${box}: ${messageOf(error)}`);
 			return fetchFailure(box, error, cached);
 		}
+		logEvent("template.refetch", { box, reason, ms: this.clock() - startedAt, tools: tools.length });
 		const entry: CachedTemplate = {
 			// 缓存版本键只记握手得到的真实版本（显式 `serverVersion` 只参与上面的判定）
 			serverInfoVersion: handshakeVersion,

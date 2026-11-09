@@ -3,7 +3,7 @@
  *
  * 覆盖方案 §5.1 / T12 的验收点：per-box 命中、TTL 过期、**握手版本校验**（同版本命中不 `listTools`、
  * 版本变化重拉、显式 `serverVersion` 优先）、**两箱版本不同各自命中且互不失效**、
- * 写盘失败只 warn、`initialize` 失败保留旧缓存、
+ * 写盘失败只 warn、`initialize` 失败保留旧缓存、`allowWake` 原样透传给 clientFactory、
  * 拉取过程**只**走 `initialize` + `listTools`（不唤醒箱、不动唤醒链）；
  * 以及 review 补的：原型键（`constructor` / `__proto__`）不误命中、
  * `templateId` / `templateVersion` 入参优先、失败结果带出旧缓存（`stale`）。
@@ -13,6 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { createMemoryLogger, setLogger } from "../src/log.ts";
 import {
 	DEFAULT_TEMPLATE_TTL_MS,
 	createEmptyTemplateCache,
@@ -25,6 +26,7 @@ import {
 	type CachedTemplate,
 	type ReadTextFn,
 	type TemplateClientFactory,
+	type TemplateClientOptions,
 	type TemplateFileSystem,
 	type TemplateStore,
 	type WriteTextFn,
@@ -122,18 +124,22 @@ interface FactoryHarness {
 	factory: TemplateClientFactory;
 	boxes: string[];
 	clients: FakeRemoteClient[];
+	/** 每次工厂调用的第二参原样记录（`undefined` 即“没传”） */
+	options: (TemplateClientOptions | undefined)[];
 }
 
 function makeFactory(behaviour: FakeClientBehaviour | ((box: string) => FakeClientBehaviour) = {}): FactoryHarness {
 	const boxes: string[] = [];
 	const clients: FakeRemoteClient[] = [];
-	const factory: TemplateClientFactory = (box) => {
+	const options: (TemplateClientOptions | undefined)[] = [];
+	const factory: TemplateClientFactory = (box, clientOptions) => {
 		boxes.push(box);
+		options.push(clientOptions);
 		const client = new FakeRemoteClient(typeof behaviour === "function" ? behaviour(box) : behaviour);
 		clients.push(client);
 		return client;
 	};
-	return { factory, boxes, clients };
+	return { factory, boxes, clients, options };
 }
 
 function entry(overrides: Partial<CachedTemplate> = {}): CachedTemplate {
@@ -323,6 +329,10 @@ class StoreHarness {
 
 	get clients(): FakeRemoteClient[] {
 		return this.harness.clients;
+	}
+
+	get factoryOptions(): (TemplateClientOptions | undefined)[] {
+		return this.harness.options;
 	}
 
 	advance(ms: number): void {
@@ -574,6 +584,70 @@ describe("createTemplateStore — 版本校验来自握手", () => {
 	});
 });
 
+describe("createTemplateStore — allowWake 透传", () => {
+	it("allowWake: true → 工厂收到 { allowWake: true }", async () => {
+		const harness = new StoreHarness();
+		await harness.store.ensure("general", { allowWake: true });
+		expect(harness.factoryOptions).toEqual([{ allowWake: true }]);
+	});
+
+	it("allowWake: false → 工厂收到 { allowWake: false }", async () => {
+		const harness = new StoreHarness();
+		await harness.store.ensure("general", { allowWake: false });
+		expect(harness.factoryOptions).toEqual([{ allowWake: false }]);
+	});
+
+	it("不传 allowWake → 工厂第二参为 undefined（由工厂走默认策略）", async () => {
+		const harness = new StoreHarness();
+		await harness.store.ensure("general");
+		await harness.store.ensure("general", { allowWake: undefined });
+		expect(harness.factoryOptions).toEqual([undefined, undefined]);
+	});
+
+	it("命中路径同样透传：版本相同也把 allowWake 交给工厂", async () => {
+		const harness = new StoreHarness();
+		seedDisk(harness.fs, { general: entry() });
+		const result = await harness.store.ensure("general", { allowWake: false });
+		expect(result.ok && result.refetched).toBe(false);
+		expect(harness.factoryOptions).toEqual([{ allowWake: false }]);
+		expect(harness.clients[0]?.calls).toEqual(["initialize"]);
+	});
+
+	it("每箱每次 ensure 一次工厂调用（不缓存客户端，也不复用上次的 allowWake）", async () => {
+		const harness = new StoreHarness();
+		await harness.store.ensure("general", { allowWake: false });
+		await harness.store.ensure("general", { allowWake: true });
+		expect(harness.factoryOptions).toEqual([{ allowWake: false }, { allowWake: true }]);
+	});
+
+	it("旧实现（只接 box 一个参数）仍可赋值，且照常工作", async () => {
+		const legacy: TemplateClientFactory = (box) => {
+			expect(box).toBe("general");
+			return new FakeRemoteClient();
+		};
+		const store = createTemplateStore({
+			paths: { templateCacheFile: CACHE_FILE },
+			clientFactory: legacy,
+			fs: new MemoryFileSystem(),
+			clock: () => NOW,
+		});
+		const result = await store.ensure("general", { allowWake: true });
+		expect(result.ok && result.refetched).toBe(true);
+		expect(result.ok && result.template.tools).toEqual([LIST_APPS, SCREENSHOT]);
+	});
+
+	it("allowWake: false + 握手失败 → 仍返回 ok:false 与 stale（现状不变）", async () => {
+		const harness = new StoreHarness({ initializeError: new Error("box is not running") });
+		const cached = entry();
+		seedDisk(harness.fs, { general: cached });
+		const result = await harness.store.ensure("general", { allowWake: false });
+		expect(result.ok).toBe(false);
+		expect(result.ok === false && result.stale).toEqual(cached);
+		expect(harness.factoryOptions).toEqual([{ allowWake: false }]);
+		expect(harness.fs.writes).toEqual([]);
+	});
+});
+
 describe("createTemplateStore — 失败降级", () => {
 	it("initialize 失败：返回 ok:false，保留旧缓存且不写盘", async () => {
 		const harness = new StoreHarness({ initializeError: new Error("remote process closed (code=255)") });
@@ -674,5 +748,43 @@ describe("createTemplateStore — 不唤醒、可取消", () => {
 		expect(result.ok).toBe(false);
 		expect(result.ok === false && result.stale).toEqual(stale);
 		expect(harness.store.get("general")).toEqual(stale);
+	});
+});
+
+describe("埋点：template.hit / template.refetch / template.fail", () => {
+	it("命中、重拉、失败各落一条事件（级别与字段按契约）", async () => {
+		const logger = createMemoryLogger();
+		const hit = new StoreHarness();
+		seedDisk(hit.fs, { general: entry() });
+		const refetch = new StoreHarness();
+		const failing = new StoreHarness({ initializeError: new Error("remote process closed (code=255)") });
+		seedDisk(failing.fs, { general: entry() });
+
+		setLogger(logger);
+		try {
+			await hit.store.ensure("general");
+			await refetch.store.ensure("general");
+			await failing.store.ensure("general");
+		} finally {
+			setLogger(undefined);
+		}
+
+		const hits = logger.records.filter((record) => record.event === "template.hit");
+		expect(hits).toHaveLength(1);
+		expect(hits[0]?.level).toBe("debug");
+		expect(hits[0]?.fields).toEqual({ box: "general", serverInfoVersion: BOX_VERSION, stale: false });
+
+		const refetches = logger.records.filter((record) => record.event === "template.refetch");
+		expect(refetches).toHaveLength(1);
+		expect(refetches[0]?.level).toBe("info");
+		expect(refetches[0]?.fields).toMatchObject({ box: "general", reason: "no-cache", tools: 2 });
+		expect(typeof refetches[0]?.fields?.["ms"]).toBe("number");
+
+		// 握手失败：warn 级，`stale: true` 说明降级还有旧缓存可用（调用方仍拿到 stale）
+		const failures = logger.records.filter((record) => record.event === "template.fail");
+		expect(failures).toHaveLength(1);
+		expect(failures[0]?.level).toBe("warn");
+		expect(failures[0]?.fields).toMatchObject({ box: "general", stale: true });
+		expect(String(failures[0]?.fields?.["error"])).toContain("remote process closed");
 	});
 });

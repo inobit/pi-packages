@@ -1,22 +1,24 @@
 /**
- * @inobit/pi-instabox — `src/pool.ts` 单测：唤醒链 6 态矩阵、唤醒后的 `running` 确认轮询、
- * `session_start` 零唤醒、复用 / dead 重建 / 握手失败驱逐、in-flight 共享（含「不唤醒」结论
- * 不劫持唤醒调用）、`dispose`（含建连期间 dispose）。
+ * @inobit/pi-instabox — `src/pool.ts` 单测：先看状态（`ls --json`）、非 `running` 才 `wake` →
+ * `start` → `resume` 且每步之后确认 `running`、`is cooling down until` 不可自愈、`is waking up`
+ * 退避重连、`allowWake: false` 零唤醒、复用 / dead 重建 / 握手失败驱逐、in-flight 共享（含
+ * 「不唤醒」结论不劫持唤醒调用）、`dispose`（含建连期间 dispose）。
  *
  * 全部走注入的假 `ExecFn` / 假 `listBoxes` / 假 `sleep` / 假客户端：不 spawn 真进程、
- * 不联网、不等真实时间。
+ * 不联网、不等真实时间、不碰真箱。
  */
 
 import { describe, expect, it } from "vitest";
 import { type BoxInfo, type ListBoxesResult, createBoxLister } from "../src/boxes.ts";
 import type { ExecFn, ExecResultLike } from "../src/cli.ts";
 import type { InstaboxTimeouts } from "../src/config.ts";
+import { createMemoryLogger, setLogger } from "../src/log.ts";
 import {
 	type ListBoxesFn,
 	type Pool,
 	type PoolDeps,
-	WAKE_CONFIRM_TIMEOUT_MS,
 	WAKE_POLL_INTERVAL_MS,
+	WAKE_RETRY_DELAYS_MS,
 	createPool,
 } from "../src/pool.ts";
 import type { CallToolResult, InitializeResult, RemoteClient, RemoteTool } from "../src/remote.ts";
@@ -31,16 +33,17 @@ const TIMEOUTS: InstaboxTimeouts = {
 	callMs: 12_000,
 };
 
+/** 假客户端的构造选项。 */
 interface FakeClientOptions {
-	/** 预置的握手失败（按 `initialize` 调用顺序消费） */
-	handshakeErrors: Error[];
+	/** 握手时抛的错误（`undefined` = 握手成功） */
+	handshakeError?: Error;
 	/** `close()` 抛异常（断言 `dispose` 不抛） */
-	throwOnClose: boolean;
+	throwOnClose?: boolean;
 	/** 握手挂起，直到测试调用 `settleHandshake()`（建连期间 dispose 用） */
-	deferHandshake: boolean;
+	deferHandshake?: boolean;
 }
 
-/** 假客户端：记录 `initialize`/`close` 次数，可脚本化握手失败/挂起，`dead` 由测试手动翻转。 */
+/** 假客户端：记录 `initialize`/`close` 次数，握手结果在构造时固定，`dead` 由测试手动翻转。 */
 class FakeClient implements RemoteClient {
 	/** 该客户端服务的 box（工厂入参，仅用于排查） */
 	readonly name: string;
@@ -49,18 +52,18 @@ class FakeClient implements RemoteClient {
 	initializeCalls = 0;
 	/** `initialize` 收到的 signal（断言透传） */
 	readonly signals: (AbortSignal | undefined)[] = [];
-	private readonly handshakeErrors: Error[];
+	private readonly handshakeError: Error | undefined;
 	private readonly throwOnClose: boolean;
-	private readonly handshake: { promise: Promise<InitializeResult>; settle: () => void } | undefined;
+	private readonly handshake: { promise: Promise<void>; settle: () => void } | undefined;
 
 	constructor(name: string, options: FakeClientOptions) {
 		this.name = name;
-		this.handshakeErrors = options.handshakeErrors;
-		this.throwOnClose = options.throwOnClose;
-		if (options.deferHandshake) {
+		this.handshakeError = options.handshakeError;
+		this.throwOnClose = options.throwOnClose === true;
+		if (options.deferHandshake === true) {
 			let settle = (): void => {};
-			const promise = new Promise<InitializeResult>((resolve) => {
-				settle = () => resolve({ serverInfo: { name: "instabox-computer-use", version: "0.3.6-instabox.1" } });
+			const promise = new Promise<void>((resolve) => {
+				settle = () => resolve();
 			});
 			this.handshake = { promise, settle };
 		}
@@ -69,9 +72,10 @@ class FakeClient implements RemoteClient {
 	async initialize(signal?: AbortSignal): Promise<InitializeResult> {
 		this.initializeCalls += 1;
 		this.signals.push(signal);
-		const error = this.handshakeErrors.shift();
-		if (error) throw error;
-		if (this.handshake !== undefined) return this.handshake.promise;
+		// 与 `remote.ts` 一致：已 abort 的连接不会真去建链，立刻 reject
+		if (signal?.aborted === true) throw new Error("initialize aborted by caller");
+		if (this.handshake !== undefined) await this.handshake.promise;
+		if (this.handshakeError !== undefined) throw this.handshakeError;
 		return { serverInfo: { name: "instabox-computer-use", version: "0.3.6-instabox.1" } };
 	}
 
@@ -117,6 +121,19 @@ function execFail(stderr: string): ExecResultLike {
 	return { stdout: "", stderr, code: 1, killed: false, truncated: false };
 }
 
+/**
+ * CLI 自报失败的形态：**退出码 0** + stderr 带错误（实测 `instabox wake` 对用户手动暂停的箱）。
+ * `cli.ts` 会按 stderr 判失败，因此这里必须与 `execOk()` 区分开。
+ */
+function execReported(stderr: string): ExecResultLike {
+	return { stdout: "", stderr, code: 0, killed: false, truncated: false };
+}
+
+/** 用户手动暂停/停止的箱在 `wake` 上的真实 stderr（`machine_not_running` + `start it with`）。 */
+function wakeRefused(name: string): string {
+	return `instabox: error machine_not_running: machine is suspended; start it first [request id]\nhint: start it with \`instabox start ${name}\``;
+}
+
 /** `BoxInfo` 工厂：只填本模块消费的 4 个字段。 */
 function box(name: string, state: string, desiredState: string): BoxInfo {
 	return { name, state, desiredState, templateId: "agent-browser", templateVersion: "2026-10-25.23" };
@@ -124,6 +141,20 @@ function box(name: string, state: string, desiredState: string): BoxInfo {
 
 function running(name: string): BoxInfo {
 	return box(name, "running", "running");
+}
+
+function suspended(name: string): BoxInfo {
+	return box(name, "suspended", "suspended");
+}
+
+/** CLI `requireRunning` 对「非 running 且没有 autoSuspendAt」的真实文案（ssh/exec 同款）。 */
+function pausedError(name: string): Error {
+	return new Error(`sandbox ${name} is paused; run 'instabox start ${name}'`);
+}
+
+/** SSH 网关只等 15s 后的可重试错误（真实形态）。 */
+function wakingUpError(name: string): Error {
+	return new Error(`machine ${name} is waking up; try again in a few seconds`);
 }
 
 /** 改某台箱的 `state`（模拟唤醒后真的跑起来了）。 */
@@ -134,19 +165,22 @@ function withState(boxes: readonly BoxInfo[], name: string, state: string): BoxI
 /** 唤醒链的脚本：按子命令决定 CLI 结果（缺省成功）。 */
 type ExecReply = (args: readonly string[]) => ExecResultLike;
 
+/** 建连脚本：`attempt` 是该 box 的第几次 `initialize`（0 起）；返回错误即握手失败。 */
+type ConnectReply = (box: string, attempt: number) => Error | undefined;
+
 interface SetupOptions {
 	boxes?: BoxInfo[];
 	reply?: ExecReply;
-	handshakeErrors?: Error[];
+	connect?: ConnectReply;
 	throwOnClose?: boolean;
 	deferHandshake?: boolean;
-	/** 唤醒命令成功后，前 N 次**强制**查询仍报 `suspended`（模拟「命令返回了但箱子还在启动」） */
+	/** 唤醒命令成功后，前 N 次**强制**查询仍报旧状态（模拟「命令返回了但箱子还在启动」） */
 	awakeDelayPolls?: number;
-	/** 唤醒命令成功后箱状态永不变化（模拟「箱子起不来」） */
+	/** 唤醒命令成功后箱状态永不变化（模拟「怎么都起不来」） */
 	staysAsleep?: boolean;
 	/** 每次 `sleep` 都挂起，直到测试调用 `releaseSleep()`（断言轮询中途的行为） */
 	deferSleep?: boolean;
-	/** 覆盖任意注入项（如 `exec`、`listBoxes`） */
+	/** 覆盖任意注入项（如 `listBoxes`） */
 	deps?: Partial<PoolDeps>;
 }
 
@@ -158,22 +192,21 @@ interface Setup {
 	execCalls: ExecCall[];
 	/** 进度回调收到的消息 */
 	progress: string[];
-	/** 每次 `sleep` 的毫秒数（确认轮询的 1s 间隔） */
+	/** 每次 `sleep` 的毫秒数（确认轮询的 1s 间隔 / 网关退避） */
 	sleeps: number[];
-	setBoxes(boxes: BoxInfo[]): void;
 	listCalls(): number;
-	/** 带 `force: true` 的 `listBoxes` 次数（确认轮询） */
+	/** 带 `force: true` 的 `listBoxes` 次数（状态查询 + 确认轮询） */
 	forcedListCalls(): number;
 	/** 放行一次挂起的 `sleep`（配合 `deferSleep`） */
 	releaseSleep(): void;
 }
 
 /**
- * 组装一个全注入的池：默认一台 `running` 的 `agent` 箱、CLI 恒成功。
+ * 组装一个全注入的池：默认一台 `running` 的 `agent` 箱、CLI 恒成功、连接恒成功。
  *
- * 假 `ls` 会模拟真实的时延语义：唤醒命令**成功**后，箱状态要经过 `awakeDelayPolls` 次
- * **强制**查询才变成 `running`（默认 0 次，即命令返回时已经好了）；`staysAsleep` 则永不变化。
- * 假 `sleep` 只推进假时钟，绝不占用真实时间。
+ * 假 `ls` 会模拟真实的时延语义：**唤醒命令真正成功**（退出码 0 且 stderr 无错误）后，箱状态要经过
+ * `awakeDelayPolls` 次**强制**查询才变成 `running`（默认 0 次，即命令返回时已经好了）；
+ * `staysAsleep` 则永不变化。假 `sleep` 只推进假时钟，绝不占用真实时间。
  */
 function setup(options: SetupOptions = {}): Setup {
 	let boxes = options.boxes ?? [running("agent")];
@@ -186,8 +219,9 @@ function setup(options: SetupOptions = {}): Setup {
 	const progress: string[] = [];
 	const sleeps: number[] = [];
 	const sleepReleases: (() => void)[] = [];
-	const handshakeErrors = [...(options.handshakeErrors ?? [])];
+	const attempts = new Map<string, number>();
 	const reply = options.reply ?? (() => execOk());
+	const connect = options.connect ?? (() => undefined);
 
 	const listBoxes: ListBoxesFn = async (opts) => {
 		listCalls += 1;
@@ -210,7 +244,9 @@ function setup(options: SetupOptions = {}): Setup {
 		const subcommand = args[0] ?? "";
 		const target = args[1] ?? "";
 		const isLifecycle = subcommand === "wake" || subcommand === "start" || subcommand === "resume";
-		if (result.code === 0 && isLifecycle && target !== "" && options.staysAsleep !== true) {
+		// 「命令真的生效」= 退出码 0 且没有 CLI 自报错误（stderr 带错误即失败，见 `execReported`）
+		const effective = result.code === 0 && result.stderr.trim() === "";
+		if (effective && isLifecycle && target !== "" && options.staysAsleep !== true) {
 			pendingAwake = { box: target, pollsLeft: options.awakeDelayPolls ?? 0 };
 		}
 		return result;
@@ -221,8 +257,10 @@ function setup(options: SetupOptions = {}): Setup {
 		listBoxes,
 		timeouts: TIMEOUTS,
 		clientFactory: (name) => {
+			const attempt = attempts.get(name) ?? 0;
+			attempts.set(name, attempt + 1);
 			const client = new FakeClient(name, {
-				handshakeErrors,
+				handshakeError: connect(name, attempt),
 				throwOnClose: options.throwOnClose === true,
 				deferHandshake: options.deferHandshake === true,
 			});
@@ -246,9 +284,6 @@ function setup(options: SetupOptions = {}): Setup {
 		execCalls,
 		progress,
 		sleeps,
-		setBoxes: (next) => {
-			boxes = next;
-		},
 		listCalls: () => listCalls,
 		forcedListCalls: () => forcedListCalls,
 		releaseSleep: () => sleepReleases.shift()?.(),
@@ -262,7 +297,13 @@ function clientOf(result: Awaited<ReturnType<Pool["get"]>>): FakeClient {
 	return result.client as FakeClient;
 }
 
-/** 唤醒链里执行过的子命令序列（如 `["wake", "resume"]`）。 */
+/** 失败结果的 `error`（`ok: true` 时直接炸）。 */
+function errorOf(result: Awaited<ReturnType<Pool["get"]>>): string {
+	if (result.ok) throw new Error("expected a failed result");
+	return result.error;
+}
+
+/** 唤醒链里执行过的子命令序列（如 `["wake", "start"]`）。 */
 function commands(calls: readonly ExecCall[]): string[] {
 	return calls.map((call) => call.args[0] ?? "");
 }
@@ -272,8 +313,8 @@ function flush(): Promise<void> {
 	return new Promise((resolve) => setImmediate(resolve));
 }
 
-describe("createPool.get — 唤醒链分流（方案 §4.4 D4）", () => {
-	it("running 箱：直接建连，一条唤醒命令都不跑，也不做确认轮询", async () => {
+describe("createPool.get — 先看状态（`ls --json`）", () => {
+	it("running 箱：直接建连，零 CLI 调用", async () => {
 		const h = setup({ boxes: [running("agent")] });
 
 		const result = await h.pool.get("agent");
@@ -283,240 +324,12 @@ describe("createPool.get — 唤醒链分流（方案 §4.4 D4）", () => {
 		expect(h.execCalls).toHaveLength(0);
 		expect(h.progress).toHaveLength(0);
 		expect(h.listCalls()).toBe(1);
-		expect(h.forcedListCalls()).toBe(0);
-		expect(h.pool.size()).toBe(1);
-	});
-
-	it("suspended + desiredState=suspended（人工挂起）：先 start，预算 startMs", async () => {
-		const h = setup({ boxes: [box("libretv", "suspended", "suspended")] });
-
-		const result = await h.pool.get("libretv");
-
-		expect(result.ok).toBe(true);
-		expect(commands(h.execCalls)).toEqual(["start"]);
-		expect(h.execCalls[0]?.args).toEqual(["start", "libretv"]);
-		expect(h.execCalls[0]?.timeout).toBe(TIMEOUTS.startMs);
-		expect(h.progress).toEqual(["正在唤醒 libretv…"]);
-	});
-
-	it("paused + desiredState=running（自动暂停）：走 wake，预算 wakeMs", async () => {
-		const h = setup({ boxes: [box("agent", "paused", "running")] });
-
-		const result = await h.pool.get("agent");
-
-		expect(result.ok).toBe(true);
-		expect(commands(h.execCalls)).toEqual(["wake"]);
-		expect(h.execCalls[0]?.args).toEqual(["wake", "agent"]);
-		expect(h.execCalls[0]?.timeout).toBe(TIMEOUTS.wakeMs);
-	});
-
-	it("start 失败：退到 resume（预算 startMs）并报两次进度", async () => {
-		const h = setup({
-			boxes: [box("libretv", "suspended", "suspended")],
-			reply: (args) => (args[0] === "start" ? execFail("start refused") : execOk()),
-		});
-
-		const result = await h.pool.get("libretv");
-
-		expect(result.ok).toBe(true);
-		expect(commands(h.execCalls)).toEqual(["start", "resume"]);
-		expect(h.execCalls[1]?.timeout).toBe(TIMEOUTS.startMs);
-		expect(h.progress).toEqual(["正在唤醒 libretv…", "正在唤醒 libretv…"]);
-	});
-
-	it("wake 失败：退到 resume（方案 §4.4 / docs §5.3 的兜底）", async () => {
-		const h = setup({
-			boxes: [box("agent", "paused", "running")],
-			reply: (args) => (args[0] === "wake" ? execFail("wake refused") : execOk()),
-		});
-
-		const result = await h.pool.get("agent");
-
-		expect(result.ok).toBe(true);
-		expect(commands(h.execCalls)).toEqual(["wake", "resume"]);
-		expect(h.execCalls[1]?.timeout).toBe(TIMEOUTS.startMs);
-		expect(clientOf(result).initializeCalls).toBe(1);
-	});
-
-	it.each([
-		// state, desiredState, 期望的子命令序列
-		["running", "running", []],
-		["suspended", "suspended", ["start"]],
-		["suspended", "running", ["wake"]],
-		["paused", "running", ["wake"]],
-		["stopped", "suspended", ["start"]],
-		["", "running", ["wake"]],
-	])("6 态矩阵：state=%s desiredState=%s → %j", async (state, desiredState, expected) => {
-		const h = setup({ boxes: [box("matrix", state, desiredState)] });
-
-		const result = await h.pool.get("matrix");
-
-		expect(result.ok).toBe(true);
-		expect(commands(h.execCalls)).toEqual(expected);
-	});
-
-	it("唤醒命令全失败：错误带两侧 stderr 尾部，且不建客户端", async () => {
-		const h = setup({
-			boxes: [box("libretv", "suspended", "suspended")],
-			reply: (args) => execFail(args[0] === "start" ? "start: sandbox is locked" : "resume: quota exceeded"),
-			staysAsleep: true,
-		});
-
-		const result = await h.pool.get("libretv");
-
-		expect(result.ok).toBe(false);
-		if (result.ok) return;
-		expect(result.error).toContain('could not wake box "libretv"');
-		expect(result.error).toContain("start: sandbox is locked");
-		expect(result.error).toContain("resume: quota exceeded");
-		expect(h.created).toHaveLength(0);
-		expect(h.pool.size()).toBe(0);
-	});
-
-	it("`signal` 透传给唤醒命令，也透传给 initialize", async () => {
-		const controller = new AbortController();
-		const h = setup({ boxes: [box("libretv", "suspended", "suspended")] });
-
-		const result = await h.pool.get("libretv", { signal: controller.signal });
-
-		expect(h.execCalls[0]?.signal).toBe(controller.signal);
-		expect(clientOf(result).signals[0]).toBe(controller.signal);
-	});
-
-	it("已 abort：一个唤醒命令都不跑", async () => {
-		const controller = new AbortController();
-		controller.abort();
-		const h = setup({ boxes: [box("libretv", "suspended", "suspended")] });
-
-		const result = await h.pool.get("libretv", { signal: controller.signal });
-
-		expect(result.ok).toBe(false);
-		if (result.ok) return;
-		expect(result.error).toContain("cancelled by caller");
-		expect(h.execCalls).toHaveLength(0);
-		expect(h.created).toHaveLength(0);
-	});
-
-	it("单次 get 的 onProgress 覆盖池级回调", async () => {
-		const messages: string[] = [];
-		const h = setup({ boxes: [box("libretv", "suspended", "suspended")] });
-
-		await h.pool.get("libretv", { onProgress: (message) => messages.push(message) });
-
-		expect(messages).toEqual(["正在唤醒 libretv…"]);
-		expect(h.progress).toHaveLength(0);
-	});
-});
-
-describe("createPool.get — 唤醒成功后的 running 确认（方案 §4.4 / R4）", () => {
-	it("命令退出 0 但仍 suspended、下一轮才 running：等到 running 才建连", async () => {
-		const h = setup({ boxes: [box("libretv", "suspended", "suspended")], awakeDelayPolls: 1 });
-
-		const result = await h.pool.get("libretv");
-
-		expect(result.ok).toBe(true);
-		// 1 次状态查询 + 2 次强制确认（第一次仍 suspended、第二次 running）
-		expect(h.forcedListCalls()).toBe(2);
-		expect(h.sleeps).toEqual([WAKE_POLL_INTERVAL_MS]);
-		expect(clientOf(result).initializeCalls).toBe(1);
-	});
-
-	it("确认轮询带 force: true（绕开 5s TTL 缓存），成功后立刻建连", async () => {
-		const h = setup({ boxes: [box("agent", "paused", "running")] });
-
-		await h.pool.get("agent");
-
-		expect(h.listCalls()).toBe(2);
 		expect(h.forcedListCalls()).toBe(1);
 		expect(h.sleeps).toHaveLength(0);
-	});
-
-	it("始终不到 running：报错带当前 state，不建客户端，轮询 1s 间隔、20s 封顶", async () => {
-		const h = setup({ boxes: [box("libretv", "suspended", "suspended")], staysAsleep: true });
-
-		const result = await h.pool.get("libretv");
-
-		expect(result.ok).toBe(false);
-		if (result.ok) return;
-		expect(result.error).toContain(`did not reach "running" within ${WAKE_CONFIRM_TIMEOUT_MS}ms`);
-		expect(result.error).toContain('(state "suspended")');
-		expect(h.created).toHaveLength(0);
-		expect(h.pool.size()).toBe(0);
-		expect(h.sleeps).toHaveLength(WAKE_CONFIRM_TIMEOUT_MS / WAKE_POLL_INTERVAL_MS);
-		expect(h.sleeps.every((ms) => ms === WAKE_POLL_INTERVAL_MS)).toBe(true);
-	});
-
-	it("确认阶段被 abort：下一次轮询立刻报取消，不再等预算耗尽", async () => {
-		const controller = new AbortController();
-		const h = setup({ boxes: [box("libretv", "suspended", "suspended")], staysAsleep: true, deferSleep: true });
-
-		const pending = h.pool.get("libretv", { signal: controller.signal });
-		await flush();
-		expect(h.sleeps).toEqual([WAKE_POLL_INTERVAL_MS]);
-
-		controller.abort();
-		h.releaseSleep();
-		const result = await pending;
-
-		expect(result.ok).toBe(false);
-		if (result.ok) return;
-		expect(result.error).toContain("cancelled by caller");
-		expect(h.sleeps).toHaveLength(1);
-	});
-});
-
-describe("createPool.get — allowWake=false（session_start 路径）", () => {
-	it("非 running 箱：报错且零唤醒调用", async () => {
-		const h = setup({ boxes: [box("libretv", "suspended", "suspended")] });
-
-		const result = await h.pool.get("libretv", { allowWake: false });
-
-		expect(result.ok).toBe(false);
-		if (result.ok) return;
-		expect(result.error).toContain('is "suspended", not running');
-		expect(result.error).toContain("/instabox-use libretv");
-		expect(h.execCalls).toHaveLength(0);
-		expect(h.progress).toHaveLength(0);
-		expect(h.created).toHaveLength(0);
-	});
-
-	it("running 箱：照常建连", async () => {
-		const h = setup({ boxes: [running("agent")] });
-
-		const result = await h.pool.get("agent", { allowWake: false });
-
-		expect(result.ok).toBe(true);
-		expect(h.execCalls).toHaveLength(0);
-	});
-
-	it("未知态（state 为空串）：报错且零唤醒调用", async () => {
-		const h = setup({ boxes: [box("agent", "", "running")] });
-
-		const result = await h.pool.get("agent", { allowWake: false });
-
-		expect(result.ok).toBe(false);
-		if (result.ok) return;
-		expect(result.error).toContain("is unknown, not running");
-		expect(h.execCalls).toHaveLength(0);
-	});
-
-	it("后台路径的 in-flight「不唤醒」结论不劫持允许唤醒的调用（后者自己重跑）", async () => {
-		const h = setup({ boxes: [box("libretv", "suspended", "suspended")] });
-
-		const background = h.pool.get("libretv", { allowWake: false });
-		const tool = h.pool.get("libretv");
-		const [bgResult, toolResult] = await Promise.all([background, tool]);
-
-		expect(bgResult.ok).toBe(false);
-		expect(toolResult.ok).toBe(true);
-		expect(commands(h.execCalls)).toEqual(["start"]);
-		expect(h.created).toHaveLength(1);
 		expect(h.pool.size()).toBe(1);
 	});
-});
 
-describe("createPool.get — 状态查询失败/箱不存在", () => {
-	it("listBoxes 返回失败：不唤醒、不建客户端", async () => {
+	it("ls 返回失败：不唤醒、不建客户端", async () => {
 		const h = setup({
 			deps: {
 				listBoxes: async (): Promise<ListBoxesResult> => ({ ok: false, boxes: [], error: "instabox ls exited with code 127" }),
@@ -526,13 +339,12 @@ describe("createPool.get — 状态查询失败/箱不存在", () => {
 		const result = await h.pool.get("agent");
 
 		expect(result.ok).toBe(false);
-		if (result.ok) return;
-		expect(result.error).toContain("cannot list boxes: instabox ls exited with code 127");
+		expect(errorOf(result)).toContain("cannot list boxes: instabox ls exited with code 127");
 		expect(h.execCalls).toHaveLength(0);
 		expect(h.created).toHaveLength(0);
 	});
 
-	it("listBoxes 抛异常：收成 ok:false，不外抛", async () => {
+	it("ls 抛异常：收成 ok:false，不外抛", async () => {
 		const h = setup({
 			deps: {
 				listBoxes: async () => {
@@ -544,8 +356,7 @@ describe("createPool.get — 状态查询失败/箱不存在", () => {
 		const result = await h.pool.get("agent");
 
 		expect(result.ok).toBe(false);
-		if (result.ok) return;
-		expect(result.error).toContain("cannot list boxes: boom");
+		expect(errorOf(result)).toContain("cannot list boxes: boom");
 	});
 
 	it("ls 没有任何箱：错误里明确说明，且不唤醒", async () => {
@@ -554,22 +365,367 @@ describe("createPool.get — 状态查询失败/箱不存在", () => {
 		const result = await h.pool.get("agent");
 
 		expect(result.ok).toBe(false);
-		if (result.ok) return;
-		expect(result.error).toContain('unknown box "agent"');
-		expect(result.error).toContain("instabox ls returned no boxes");
+		expect(errorOf(result)).toContain('unknown box "agent"');
+		expect(errorOf(result)).toContain("instabox ls returned no boxes");
 		expect(h.execCalls).toHaveLength(0);
 	});
 
 	it("箱名不存在：错误里带候选名单", async () => {
 		const h = setup({ boxes: [running("agent"), running("libretv")] });
 
-		const result = await h.pool.get("nope", { allowWake: false });
+		const result = await h.pool.get("nope");
 
 		expect(result.ok).toBe(false);
-		if (result.ok) return;
-		expect(result.error).toContain('unknown box "nope"');
-		expect(result.error).toContain("available boxes: agent, libretv");
+		expect(errorOf(result)).toContain('unknown box "nope"');
+		expect(errorOf(result)).toContain("available boxes: agent, libretv");
 		expect(h.execCalls).toHaveLength(0);
+	});
+});
+
+describe("createPool.get — 非 running：wake → start → resume，每步确认 running", () => {
+	it("suspended（自动暂停）→ wake 成功 → 确认 running → 建连（预算 wakeMs）", async () => {
+		const h = setup({ boxes: [suspended("agent")] });
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(true);
+		expect(commands(h.execCalls)).toEqual(["wake"]);
+		expect(h.execCalls[0]?.args).toEqual(["wake", "agent"]);
+		expect(h.execCalls[0]?.timeout).toBe(TIMEOUTS.wakeMs);
+		expect(h.progress).toEqual(["正在唤醒 agent…"]);
+		// 一次状态查询 + 一次确认（命令返回时已经 running，不睡）
+		expect(h.forcedListCalls()).toBe(2);
+		expect(h.sleeps).toHaveLength(0);
+		expect(clientOf(result).initializeCalls).toBe(1);
+		expect(h.pool.size()).toBe(1);
+	});
+
+	it("wake 报 machine_not_running（退出码 0 + stderr）→ start 成功（预算 startMs）", async () => {
+		const h = setup({
+			boxes: [suspended("agent")],
+			reply: (args) => (args[0] === "wake" ? execReported(wakeRefused("agent")) : execOk()),
+		});
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(true);
+		expect(commands(h.execCalls)).toEqual(["wake", "start"]);
+		expect(h.execCalls[1]?.args).toEqual(["start", "agent"]);
+		expect(h.execCalls[1]?.timeout).toBe(TIMEOUTS.startMs);
+		expect(h.progress).toEqual(["正在唤醒 agent…", "正在唤醒 agent…"]);
+		// 状态查询 + wake 失败后的即时采样 + start 成功后的一次确认（已经 running）
+		expect(h.sleeps).toHaveLength(0);
+		expect(h.forcedListCalls()).toBe(3);
+		expect(h.created).toHaveLength(1);
+		expect(h.pool.size()).toBe(1);
+	});
+
+	it("start 也失败 → resume（预算 startMs）", async () => {
+		const h = setup({
+			boxes: [suspended("agent")],
+			reply: (args) =>
+				args[0] === "wake"
+					? execReported(wakeRefused("agent"))
+					: args[0] === "start"
+						? execFail("instabox: error machine_not_running: machine is suspended; start it first")
+						: execOk(),
+		});
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(true);
+		expect(commands(h.execCalls)).toEqual(["wake", "start", "resume"]);
+		expect(h.execCalls[2]?.timeout).toBe(TIMEOUTS.startMs);
+		expect(h.created).toHaveLength(1);
+	});
+
+	it("命令退出 0 但还没 running：1s 轮询到 running 才建连", async () => {
+		const h = setup({ boxes: [suspended("agent")], awakeDelayPolls: 1 });
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(true);
+		// 状态查询 1 次 + 确认 2 次（第一次仍 suspended、第二次 running）
+		expect(h.forcedListCalls()).toBe(3);
+		expect(h.sleeps).toEqual([WAKE_POLL_INTERVAL_MS]);
+		expect(clientOf(result).initializeCalls).toBe(1);
+	});
+
+	it("三步全失败（stderr 自报 + 确认超时）：错误聚合，不建客户端", async () => {
+		const h = setup({
+			boxes: [suspended("agent")],
+			staysAsleep: true,
+			reply: (args) =>
+				args[0] === "wake"
+					? execReported(wakeRefused("agent"))
+					: execFail(`instabox ${String(args[0])} ${String(args[1])} exited with code 1: refused`),
+		});
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(false);
+		const error = errorOf(result);
+		expect(error).toContain('could not wake box "agent"');
+		expect(error).toContain("machine_not_running");
+		expect(error).toContain("instabox start agent exited with code 1: refused");
+		expect(error).toContain("instabox resume agent exited with code 1: refused");
+		// 三条命令都失败 → 各自的确认只是一次即时采样，不空等整步预算
+		expect(h.sleeps).toHaveLength(0);
+		expect(h.created).toHaveLength(0);
+		expect(h.pool.size()).toBe(0);
+	});
+
+	it("冷却期（`is cooling down until <RFC3339>`）：不换命令、不重试，保留原文时间", async () => {
+		const h = setup({
+			boxes: [suspended("agent")],
+			reply: () =>
+				execReported(
+					"instabox: error machine_cooldown: sandbox agent is cooling down until 2026-11-09T16:00:00Z; try again after cooldown",
+				),
+		});
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(false);
+		const error = errorOf(result);
+		expect(error).toContain("is cooling down");
+		expect(error).toContain("sandbox agent is cooling down until 2026-11-09T16:00:00Z; try again after cooldown");
+		expect(commands(h.execCalls)).toEqual(["wake"]);
+		expect(h.sleeps).toHaveLength(0);
+		expect(h.created).toHaveLength(0);
+		expect(h.pool.size()).toBe(0);
+	});
+
+	it("冷却期错误里另带 retryAfterSeconds：原样透出", async () => {
+		const h = setup({
+			boxes: [suspended("agent")],
+			reply: () =>
+				execReported(
+					'instabox: error machine_cooldown: sandbox agent is cooling down until 2026-11-09T16:00:00Z; try again after cooldown; stderr: {"retryAfterSeconds":42}',
+				),
+		});
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(false);
+		expect(errorOf(result)).toContain("retryAfterSeconds=42");
+		expect(commands(h.execCalls)).toEqual(["wake"]);
+		expect(h.created).toHaveLength(0);
+	});
+
+	it("`signal` 透传给唤醒命令，也透传给 initialize", async () => {
+		const controller = new AbortController();
+		const h = setup({ boxes: [suspended("agent")] });
+
+		const result = await h.pool.get("agent", { signal: controller.signal });
+
+		expect(result.ok).toBe(true);
+		expect(h.execCalls[0]?.signal).toBe(controller.signal);
+		expect(clientOf(result).signals[0]).toBe(controller.signal);
+	});
+
+	it("已 abort：一个唤醒命令都不跑、也不建客户端", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		const h = setup({ boxes: [suspended("agent")] });
+
+		const result = await h.pool.get("agent", { signal: controller.signal });
+
+		expect(result.ok).toBe(false);
+		expect(errorOf(result)).toContain("cancelled by caller");
+		expect(h.execCalls).toHaveLength(0);
+		expect(h.created).toHaveLength(0);
+	});
+
+	it("单次 get 的 onProgress 覆盖池级回调", async () => {
+		const messages: string[] = [];
+		const h = setup({ boxes: [suspended("agent")] });
+
+		await h.pool.get("agent", { onProgress: (message) => messages.push(message) });
+
+		expect(messages).toEqual(["正在唤醒 agent…"]);
+		expect(h.progress).toHaveLength(0);
+	});
+
+	it("确认阶段 ls 失败：把失败带进错误文本，不静默成功", async () => {
+		let listCalls = 0;
+		const h = setup({
+			boxes: [suspended("agent")],
+			reply: (args) => (args[0] === "wake" ? execOk() : execFail("refused")),
+			deps: {
+				listBoxes: async (): Promise<ListBoxesResult> => {
+					listCalls += 1;
+					// 第一次（状态查询）正常，之后（确认阶段）失败
+					if (listCalls === 1) return { ok: true, boxes: [suspended("agent")] };
+					return { ok: false, boxes: [], error: "instabox ls exited with code 127" };
+				},
+			},
+		});
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(false);
+		expect(errorOf(result)).toContain("cannot list boxes: instabox ls exited with code 127");
+		expect(h.created).toHaveLength(0);
+	});
+
+	it("确认阶段被 abort：下一次轮询立刻报取消，不再等预算耗尽", async () => {
+		const controller = new AbortController();
+		const h = setup({ boxes: [suspended("agent")], staysAsleep: true, deferSleep: true });
+
+		const pending = h.pool.get("agent", { signal: controller.signal });
+		await flush();
+		expect(h.sleeps).toEqual([WAKE_POLL_INTERVAL_MS]);
+
+		controller.abort();
+		h.releaseSleep();
+		const result = await pending;
+
+		expect(result.ok).toBe(false);
+		expect(errorOf(result)).toContain("cancelled by caller");
+		expect(h.sleeps).toHaveLength(1);
+	});
+});
+
+describe("createPool.get — allowWake=false（session_start 路径）", () => {
+	it("suspended：零 wake/start/resume，直接报错并给补救命令", async () => {
+		const h = setup({ boxes: [suspended("libretv")] });
+
+		const result = await h.pool.get("libretv", { allowWake: false });
+
+		expect(result.ok).toBe(false);
+		const error = errorOf(result);
+		expect(error).toContain('is "suspended", not running');
+		expect(error).toContain("/instabox-use libretv");
+		expect(h.execCalls).toHaveLength(0);
+		expect(h.progress).toHaveLength(0);
+		expect(h.created).toHaveLength(0);
+		expect(h.pool.size()).toBe(0);
+	});
+
+	it("未知态（state 为空串）：同样零唤醒并报错", async () => {
+		const h = setup({ boxes: [box("agent", "", "running")] });
+
+		const result = await h.pool.get("agent", { allowWake: false });
+
+		expect(result.ok).toBe(false);
+		expect(errorOf(result)).toContain("is unknown, not running");
+		expect(h.execCalls).toHaveLength(0);
+	});
+
+	it("running 箱：照常建连，零唤醒", async () => {
+		const h = setup({ boxes: [running("agent")] });
+
+		const result = await h.pool.get("agent", { allowWake: false });
+
+		expect(result.ok).toBe(true);
+		expect(h.execCalls).toHaveLength(0);
+		expect(h.pool.size()).toBe(1);
+	});
+
+	it("后台路径的 in-flight「不唤醒」结论不劫持允许唤醒的调用（后者自己重跑）", async () => {
+		const h = setup({ boxes: [suspended("agent")] });
+
+		const background = h.pool.get("agent", { allowWake: false });
+		const tool = h.pool.get("agent");
+		const [bgResult, toolResult] = await Promise.all([background, tool]);
+
+		expect(bgResult.ok).toBe(false);
+		expect(toolResult.ok).toBe(true);
+		expect(commands(h.execCalls)).toEqual(["wake"]);
+		expect(h.created).toHaveLength(1);
+		expect(h.pool.size()).toBe(1);
+	});
+});
+
+describe("createPool.get — 建连层的兜底分类", () => {
+	it("状态 running 但网关报 is waking up：退避重试后成功（不 start）", async () => {
+		const h = setup({
+			boxes: [running("agent")],
+			connect: (name, attempt) => (attempt < 2 ? wakingUpError(name) : undefined),
+		});
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(true);
+		expect(h.sleeps).toEqual([WAKE_RETRY_DELAYS_MS[0], WAKE_RETRY_DELAYS_MS[1]]);
+		expect(h.created).toHaveLength(3);
+		expect(h.execCalls).toHaveLength(0);
+		expect(h.progress).toHaveLength(0);
+		expect(h.pool.size()).toBe(1);
+	});
+
+	it("is waking up 耗尽：报错且未 start", async () => {
+		const h = setup({ boxes: [running("agent")], connect: (name) => wakingUpError(name) });
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(false);
+		const error = errorOf(result);
+		expect(error).toContain("did not finish waking up after 3 connection retries");
+		expect(error).toContain("is waking up; try again in a few seconds");
+		expect(h.sleeps).toEqual([...WAKE_RETRY_DELAYS_MS]);
+		expect(h.created).toHaveLength(WAKE_RETRY_DELAYS_MS.length + 1);
+		expect(h.execCalls).toHaveLength(0);
+		expect(h.pool.size()).toBe(0);
+	});
+
+	it("建连报 cooldown：不重试、不 start，原样透出", async () => {
+		const h = setup({
+			boxes: [running("agent")],
+			connect: () => new Error("sandbox agent is cooling down until 2026-11-09T16:00:00Z; try again after cooldown"),
+		});
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(false);
+		const error = errorOf(result);
+		expect(error).toContain("is cooling down");
+		expect(error).toContain("2026-11-09T16:00:00Z");
+		expect(h.sleeps).toHaveLength(0);
+		expect(h.execCalls).toHaveLength(0);
+		expect(h.created).toHaveLength(1);
+	});
+
+	it("状态 running 但建连报 paused（状态与网关不同步）：不 start，原样报握手失败", async () => {
+		const h = setup({ boxes: [running("agent")], connect: (name) => pausedError(name) });
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(false);
+		expect(errorOf(result)).toContain("remote MCP handshake failed: sandbox agent is paused");
+		expect(h.execCalls).toHaveLength(0);
+		expect(h.sleeps).toHaveLength(0);
+		expect(h.created).toHaveLength(1);
+	});
+
+	it("认证失败：报握手失败，不 start，也不退避", async () => {
+		const h = setup({ boxes: [running("agent")], connect: () => new Error("ssh: authentication failed") });
+
+		const result = await h.pool.get("agent");
+
+		expect(result.ok).toBe(false);
+		expect(errorOf(result)).toContain("remote MCP handshake failed: ssh: authentication failed");
+		expect(h.execCalls).toHaveLength(0);
+		expect(h.sleeps).toHaveLength(0);
+		expect(h.created).toHaveLength(1);
+		expect(h.created[0]?.closed).toBe(1);
+		expect(h.pool.size()).toBe(0);
+	});
+});
+
+describe("createPool — 状态来源的装配面（T15 传入的 `createBoxLister(...).list`）", () => {
+	it("`createBoxLister(...).list` 可直接作为 `listBoxes` 注入，`force` 也招之即来", async () => {
+		const lister = createBoxLister({
+			exec: async () => ({ stdout: "[]", stderr: "", code: 0, killed: false, truncated: false }),
+		});
+		// 类型层面的契约：`createBoxLister(...).list` 可赋值给 `ListBoxesFn`（否则 T15 装配会报错）
+		const listBoxes: ListBoxesFn = lister.list;
+
+		const result = await listBoxes({ force: true });
+
+		expect(result.ok).toBe(true);
+		expect(result.boxes).toEqual([]);
 	});
 });
 
@@ -600,13 +756,15 @@ describe("createPool.get — 复用与重建", () => {
 	});
 
 	it("握手失败：驱逐并报错，下一次 get 重建", async () => {
-		const h = setup({ boxes: [running("agent")], handshakeErrors: [new Error("initialize timed out after 2000ms")] });
+		const h = setup({
+			boxes: [running("agent")],
+			connect: (_name, attempt) => (attempt === 0 ? new Error("initialize timed out after 2000ms") : undefined),
+		});
 
 		const failed = await h.pool.get("agent");
 
 		expect(failed.ok).toBe(false);
-		if (failed.ok) return;
-		expect(failed.error).toContain("remote MCP handshake failed: initialize timed out after 2000ms");
+		expect(errorOf(failed)).toContain("remote MCP handshake failed: initialize timed out after 2000ms");
 		expect(h.created[0]?.closed).toBe(1);
 		expect(h.pool.size()).toBe(0);
 
@@ -626,21 +784,6 @@ describe("createPool.get — 复用与重建", () => {
 		expect(h.created).toHaveLength(1);
 		expect(h.created[0]?.initializeCalls).toBe(1);
 		expect(h.listCalls()).toBe(1);
-	});
-});
-
-describe("createPool — 状态来源的装配面（T15 传入的 `createBoxLister(...).list`）", () => {
-	it("`createBoxLister(...).list` 可直接作为 `listBoxes` 注入，`force` 也招之即来", async () => {
-		const lister = createBoxLister({
-			exec: async () => ({ stdout: "[]", stderr: "", code: 0, killed: false, truncated: false }),
-		});
-		// 类型层面的契约：`createBoxLister(...).list` 可赋值给 `ListBoxesFn`（否则 T15 装配会报错）
-		const listBoxes: ListBoxesFn = lister.list;
-
-		const result = await listBoxes({ force: true });
-
-		expect(result.ok).toBe(true);
-		expect(result.boxes).toEqual([]);
 	});
 });
 
@@ -703,9 +846,27 @@ describe("createPool — dispose", () => {
 		const result = await pending;
 
 		expect(result.ok).toBe(false);
-		if (result.ok) return;
-		expect(result.error).toContain("pool was disposed while connecting");
+		expect(errorOf(result)).toContain("pool was disposed while connecting");
 		expect(client.closed).toBe(1);
 		expect(h.pool.size()).toBe(0);
+	});
+});
+
+describe("埋点（logEvent）", () => {
+	it("唤醒链每一步记一条 pool.wake（box/step/ok/ms）", async () => {
+		const logger = createMemoryLogger();
+		setLogger(logger);
+		try {
+			const h = setup({ boxes: [suspended("agent")] });
+			await h.pool.get("agent");
+		} finally {
+			setLogger(undefined);
+		}
+
+		const wakes = logger.records.filter((record) => record.event === "pool.wake");
+		expect(wakes).toHaveLength(1);
+		expect(wakes[0]?.level).toBe("info");
+		expect(wakes[0]?.fields).toMatchObject({ box: "agent", step: "wake", ok: true });
+		expect(typeof wakes[0]?.fields?.["ms"]).toBe("number");
 	});
 });
