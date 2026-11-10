@@ -29,7 +29,7 @@
 | `pool.ts` | 按箱复用远端连接，并把唤醒收进连接过程 |
 | `template.ts` | 按箱缓存远端工具清单与 `initialize` 的 `instructions`，让会话启动不必每次重新握手 |
 | `tools.ts` | 工具定义与文案（`deferred` 暴露 + 命名空间）、发现提示文本，以及每次调用的转发与结果透传 |
-| `devtools.ts` | 生成并落盘 helper 脚本，构造 `chrome-devtools-mcp` 的注册参数 |
+| `devtools.ts` | 注册远端 `chrome-devtools-mcp`：注册前准备（唤醒箱 + 确保远端可执行）与 `registerMcpServer` 参数（一条普通的 `instabox ssh …` 配置，不生成脚本） |
 | `log.ts` | 运行期事件日志：轮转写盘、字段脱敏与级别过滤 |
 
 依赖方向：`index` 是唯一的装配层，向下接其余模块；`tools → {schema, resolve, pool, remote}`；`pool → {cli, boxes, remote}`；`resolve` / `session-target` / `schema` / `entry-render` 是不碰宿主运行时的纯逻辑层，注入依赖后单测直接驱动。
@@ -39,11 +39,11 @@
 - **依赖版本不走 catalog**：本包用到 pi 的新 API，故 pi 与 typebox 显式钉版本；`peerDependencies` 三项一律写 `"*"`，真实下限只写在 README，不写进 peer 范围
 - **从不调用 `setActiveTools`、不写用户设置**：桌面工具一律以 `deferred` 形式暴露（不进 codemode 描述，靠命名空间搜索发现），启用与否是用户的决定
 - **发现提示的描述来自远端，不写死**：`instabox-desktop` 段那行描述由远端 `initialize` 的 `instructions` 生成（首行、截断 250 字符），缺失才回退到命名空间描述；跟随每次注册重算，远端升版后自动更新，不要把它换回常量
-- **路径职责分离**：配置进 `extensions/pi-instabox/`，运行期状态与 helper 进 `pi-instabox/`，事件日志进 `logs/pi-instabox/`，三处互不混用
+- **路径职责分离**：配置进 `extensions/pi-instabox/`，运行期状态（模板缓存）进 `pi-instabox/`，事件日志进 `logs/pi-instabox/`，三处互不混用（`resolvePaths()` 只有这四条）
 - **永不 throw 到会话层**：CLI、远端握手、读写盘的任何失败都归一成 `isError` 工具结果、结构化失败或一条 `notify`
 - **所有远端操作只经 `instabox` CLI**：不自建 ssh/远程协议，也不绕过 CLI 直接碰沙箱
-- **唤醒属于连接的一部分**：任何一条连接路径都应能自己把箱拉起来，失败只报给调用方，不假设外部已启动
-- **DevTools 默认关闭，只能显式开启**：箱名优先级固定为会话绑定 > flag > 配置，缺箱或缺开关都不注册
+- **「准备一个可用 box」只有一套实现**：`pool.ensureReady(box, opts)`（查状态 → `wake`/`start`/`resume` → 确认 `running`，共享 `prepareMs` 截止时间）是唯一入口；`pool.get` 先 `await` 它再建连，DevTools 注册前的准备也从装配层注入同一个方法——不要在别处再写一遍唤醒链
+- **DevTools 默认关闭，只能显式开启**：箱名优先级固定为会话绑定 > flag > 配置，缺箱或缺开关都不注册；开启时先 `prepareDevTools`（`ensureReady` 准备箱 + 检查/安装 `chrome-devtools-mcp`）再 `registerMcpServer({ command: "instabox", args: ["ssh", …] })`，不生成 helper、不额外包进程
 - **测试必须离线**：exec / spawn / 文件系统 / 时钟全部走注入面，单测不连远端、不读真实配置；真机行为靠冒烟
 
 ## 常用命令

@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.2] - 2026-11-10
+
+- fix: register the devtools MCP directly with instabox ssh instead of a generated helper script
+
 ## [0.1.1] - 2026-11-09
 
 - feat: expose desktop tools as deferred so they stay out of the codemode description
