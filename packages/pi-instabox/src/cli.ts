@@ -142,6 +142,12 @@ export interface ExecRemoteOptions {
 	execTimeoutMs?: number;
 	/** 透传给 `ExecFn` 的取消信号 */
 	signal?: AbortSignal;
+	/**
+	 * 远端 PATH：给了就加 `--env PATH=<值>`（CLI 原生能力）。
+	 * 不同模板的 npm prefix 不同（`/opt/npm/bin` 与 `/usr/local/bin` 都出现过），钉死它才找得到
+	 * `chrome-devtools-mcp` 这类全局装出来的可执行文件。
+	 */
+	envPath?: string;
 }
 
 /** 单次 `ExecFn` 调用：抛异常在这里被收成 `ok: false`。 */
@@ -280,7 +286,7 @@ export function resume(exec: ExecFn, box: string, opts: CliRunOptions = {}): Pro
 }
 
 /**
- * `instabox exec <box> --timeout <秒> -- <argv...>`：在目标箱里跑一条命令。
+ * `instabox exec <box> [--env PATH=<值>] --timeout <秒> -- <argv...>`：在目标箱里跑一条命令。
  * argv 逐元素透传（不经 shell 拼接），时间和 `signal` 见 {@link ExecRemoteOptions}。
  */
 export async function execRemote(
@@ -293,7 +299,8 @@ export async function execRemote(
 	const seconds = remoteTimeoutSeconds(opts.timeoutMs ?? EXEC_REMOTE_TIMEOUT_MS);
 	const localTimeout = opts.execTimeoutMs ?? seconds * 1000 + EXEC_LOCAL_GRACE_MS;
 	const label = `instabox exec ${box}`;
-	const args = ["exec", box, "--timeout", String(seconds), "--", ...argv];
+	const env = opts.envPath === undefined ? [] : ["--env", `PATH=${opts.envPath}`];
+	const args = ["exec", box, ...env, "--timeout", String(seconds), "--", ...argv];
 	const call = await runOnce(exec, label, args, { timeout: localTimeout, signal: opts.signal });
 	if (!call.ok) {
 		logEvent("cli.exec", { box, timeoutSec: seconds, ok: false, ms: Date.now() - startedAt });

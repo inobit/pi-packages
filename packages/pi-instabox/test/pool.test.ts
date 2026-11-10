@@ -1,9 +1,9 @@
 /**
- * @inobit/pi-instabox — `src/pool.ts` 单测：先看状态（`ls --json`）、非 `running` 才 `wake` →
- * `start` → `resume` 且每步之后确认 `running`、**准备阶段共享 prepareMs 截止时间**（每步超时 =
- * `min(单步上限, 剩余预算)`，卡住的一步不会跑满各步之和）、`is cooling down until` 不可自愈、
- * `is waking up` 退避重连、`allowWake: false` 零唤醒、复用 / dead 重建 / 握手失败驱逐、
- * in-flight 共享（含「不唤醒」结论不劫持唤醒调用）、`dispose`（含建连期间 dispose）。
+ * @inobit/pi-instabox — `src/pool.ts` 单测：`ensureReady`（**「准备一个可用 box」的唯一实现**：
+ * box 不存在（带候选）/ running / `wake` → `start` → `resume` 且每步之后确认 `running` /
+ * `allowWake: false` 零唤醒 / 预算耗尽）与 `get` 复用它之后的建连面——`is cooling down until`
+ * 不可自愈、`is waking up` 退避重连、复用 / dead 重建 / 握手失败驱逐、in-flight 共享
+ * （含「不唤醒」结论不劫持唤醒调用）、`dispose`（含建连期间 dispose）。
  *
  * 全部走注入的假 `ExecFn` / 假 `listBoxes` / 假 `sleep` / 假客户端：不 spawn 真进程、
  * 不联网、不等真实时间、不碰真箱。
@@ -328,6 +328,12 @@ function clientOf(result: Awaited<ReturnType<Pool["get"]>>): FakeClient {
 
 /** 失败结果的 `error`（`ok: true` 时直接炸）。 */
 function errorOf(result: Awaited<ReturnType<Pool["get"]>>): string {
+	if (result.ok) throw new Error("expected a failed result");
+	return result.error;
+}
+
+/** `ensureReady` 失败结果的 `error`（`ok: true` 时直接炸）。 */
+function readyErrorOf(result: Awaited<ReturnType<Pool["ensureReady"]>>): string {
 	if (result.ok) throw new Error("expected a failed result");
 	return result.error;
 }
@@ -771,6 +777,143 @@ describe("createPool.get — allowWake=false（session_start 路径）", () => {
 		expect(commands(h.execCalls)).toEqual(["wake"]);
 		expect(h.created).toHaveLength(1);
 		expect(h.pool.size()).toBe(1);
+	});
+});
+
+describe("createPool.ensureReady — 「准备一个可用 box」的唯一实现", () => {
+	it("箱不存在：直接失败，错误里带候选，零 CLI 调用、零建连", async () => {
+		const h = setup({ boxes: [running("agent"), running("libretv")] });
+
+		const result = await h.pool.ensureReady("nope");
+
+		expect(result.ok).toBe(false);
+		expect(readyErrorOf(result)).toContain('unknown box "nope"');
+		expect(readyErrorOf(result)).toContain("available boxes: agent, libretv");
+		expect(h.execCalls).toHaveLength(0);
+		expect(h.created).toHaveLength(0);
+	});
+
+	it("running：直接成功，零 CLI 调用，且**不建连**（准备不是连接）", async () => {
+		const h = setup({ boxes: [running("agent")] });
+
+		expect(await h.pool.ensureReady("agent")).toEqual({ ok: true });
+		expect(h.execCalls).toHaveLength(0);
+		expect(h.created).toHaveLength(0);
+		expect(h.pool.size()).toBe(0);
+		// 状态查询必须带 force（否则 5s TTL 会看到陈旧状态）
+		expect(h.forcedListCalls()).toBe(1);
+	});
+
+	it("suspended → wake 成功并确认 running（单步预算 = wakeMs）", async () => {
+		const h = setup({ boxes: [suspended("agent")] });
+
+		expect(await h.pool.ensureReady("agent")).toEqual({ ok: true });
+		expect(commands(h.execCalls)).toEqual(["wake"]);
+		expect(h.execCalls[0]?.timeout).toBe(TIMEOUTS.wakeMs);
+		expect(h.created).toHaveLength(0);
+	});
+
+	it("wake 失败 → start（单步预算 = startMs）", async () => {
+		const h = setup({
+			boxes: [suspended("agent")],
+			reply: (args) => (args[0] === "wake" ? execReported(wakeRefused("agent")) : execOk()),
+		});
+
+		expect(await h.pool.ensureReady("agent")).toEqual({ ok: true });
+		expect(commands(h.execCalls)).toEqual(["wake", "start"]);
+		expect(h.execCalls[1]?.timeout).toBe(TIMEOUTS.startMs);
+	});
+
+	it("wake / start 全失败 → resume", async () => {
+		const h = setup({
+			boxes: [suspended("agent")],
+			reply: (args) => (args[0] === "resume" ? execOk() : execReported(wakeRefused("agent"))),
+			awakeDelayPolls: 1,
+		});
+
+		expect(await h.pool.ensureReady("agent")).toEqual({ ok: true });
+		expect(commands(h.execCalls)).toEqual(["wake", "start", "resume"]);
+		expect(h.execCalls[2]?.timeout).toBe(TIMEOUTS.startMs);
+	});
+
+	it("三条命令都失败 → ok:false，错误里带每步原因", async () => {
+		const h = setup({
+			boxes: [suspended("agent")],
+			reply: () => execReported(wakeRefused("agent")),
+		});
+
+		const result = await h.pool.ensureReady("agent");
+
+		expect(result.ok).toBe(false);
+		expect(readyErrorOf(result)).toContain('could not wake box "agent"');
+		expect(commands(h.execCalls)).toEqual(["wake", "start", "resume"]);
+		expect(h.created).toHaveLength(0);
+	});
+
+	it("预算耗尽：每步 min(单步上限, 剩余)，报 prepare timed out 带 step", async () => {
+		const h = setup({
+			boxes: [suspended("agent")],
+			staysAsleep: true,
+			deps: { timeouts: PREPARE_TIMEOUTS },
+			execDuration: (_args, timeoutMs) => timeoutMs ?? 0,
+			reply: (args) => execKilled(`waking ${String(args[1])}…`),
+		});
+
+		const result = await h.pool.ensureReady("agent");
+
+		expect(result.ok).toBe(false);
+		expect(readyErrorOf(result)).toContain('prepare timed out after 60000ms (box "agent", step: resume)');
+		expect(readyErrorOf(result)).toContain("waking agent…");
+		// 20s → 30s → 剩下 10s（不是 20+30+30=80s）
+		expect(h.execCalls.map((call) => call.timeout)).toEqual([20_000, 30_000, 10_000]);
+		expect(h.now()).toBe(PREPARE_TIMEOUTS.prepareMs);
+	});
+
+	it("allowWake:false + suspended → 不唤醒、直接失败并给补救命令", async () => {
+		const h = setup({ boxes: [suspended("libretv")] });
+
+		const result = await h.pool.ensureReady("libretv", { allowWake: false });
+
+		expect(result.ok).toBe(false);
+		expect(readyErrorOf(result)).toContain('is "suspended", not running');
+		expect(readyErrorOf(result)).toContain("/instabox-use libretv");
+		expect(h.execCalls).toHaveLength(0);
+		expect(h.created).toHaveLength(0);
+	});
+
+	it("`get` 用的就是这一套：同一个箱、同一句错误文案，只是它之后还会建连", async () => {
+		const failing = (): Setup => setup({ boxes: [suspended("agent")], reply: () => execReported(wakeRefused("agent")) });
+		const ready = failing();
+		const connected = failing();
+
+		const readyResult = await ready.pool.ensureReady("agent");
+		const getResult = await connected.pool.get("agent");
+
+		expect(readyResult.ok).toBe(false);
+		expect(getResult.ok).toBe(false);
+		expect(errorOf(getResult)).toBe(readyErrorOf(readyResult));
+		// 唤醒链的命令序列完全一致（不是两套实现）
+		expect(commands(connected.execCalls)).toEqual(commands(ready.execCalls));
+	});
+
+	it("埋点：一次准备一条 pool.prepare（成功 info / 失败 warn），ensureReady 不额外记 pool.connect", async () => {
+		const logger = createMemoryLogger();
+		setLogger(logger);
+		try {
+			const ok = setup({ boxes: [running("agent")] });
+			await ok.pool.ensureReady("agent");
+			const bad = setup({ boxes: [suspended("agent")], reply: () => execReported(wakeRefused("agent")) });
+			await bad.pool.ensureReady("agent");
+		} finally {
+			setLogger(undefined);
+		}
+
+		const prepare = logger.records.filter((record) => record.event === "pool.prepare");
+		expect(prepare).toHaveLength(2);
+		expect(prepare[0]?.fields).toMatchObject({ box: "agent", ok: true });
+		expect(prepare[1]?.level).toBe("warn");
+		expect(prepare[1]?.fields).toMatchObject({ box: "agent", ok: false });
+		expect(logger.records.some((record) => record.event === "pool.connect")).toBe(false);
 	});
 });
 

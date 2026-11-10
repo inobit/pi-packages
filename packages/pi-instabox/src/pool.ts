@@ -6,8 +6,7 @@
  *   才新建。复用不查 `ls`：状态只在确实要建连时读一次（否则每次工具调用都多一轮 CLI）。
  *   `remote.ts` 的客户端是「单次连接一实例、终态不自动重连」，重建责任在本模块。
  * - **先看状态，再唤醒，最后建连**（用户裁决的取舍：不依赖服务端在请求里唤醒）：
- *   `get` 先 `listBoxes({ force: true })` 查一次状态，`state === "running"` 直接建连；
- *   其余（`suspended` / `suspending` / `resuming` / 未知态）才进唤醒链。
+ *   `get` 先经 {@link Pool.ensureReady} 把箱准备到 `running`，再建连。
  * - **唤醒链 `wake` → `start` → `resume`**：`wake` 覆盖自动暂停（实测 6s 左右成功）；
  *   用户手动 suspend/stop 的箱 `wake` 会**退出码 0 但 stderr 自报**
  *   `machine_not_running` / `start it with …`（`cli.ts` 已按 stderr 判失败）→ 退 `start`，
@@ -53,10 +52,13 @@
  *   自己被抛弃，`close()` 后回 `{ ok: false, error: "… pool was disposed while connecting" }`。
  *   因此 `dispose` 之后的第一次 `get` 可能立刻拿到这个 doomed 结果，重试即成功。
  *   `size()` 只数已握手入池的连接（在飞的不计），`dispose` 后为 0。
- * - **埋点**：`pool.prepare` 一次 `get` 一条（`{ box, ok, ms, step?, timeoutMs? }`，成功 info /
- *   失败 warn）——`ms` 是准备阶段（查状态 ＋ 唤醒链）本身的耗时，`step`/`timeoutMs` 是报错的
- *   那一步与它拿到的预算；`pool.wake` 每条命令一条并带该步实际的 `timeoutMs`，两者合起来就能
- *   看出「每步用了多少预算、总共用了多久」。
+ * - **「准备一个可用的 box」只有一套实现**（{@link Pool.ensureReady}）：查状态 → 必要时
+ *   `wake`/`start`/`resume` → 确认 `running`，共享 `prepareMs` 截止时间。`get` 先 await 它再建连，
+ *   DevTools 注册前的准备也从装配层注入同一个方法——不要在别处再写一遍唤醒链。
+ * - **埋点**：`pool.prepare` 一次准备一条（`get` 与 `ensureReady` 各一条，字段
+ *   `{ box, ok, ms, step?, timeoutMs? }`，成功 info / 失败 warn）——`ms` 是准备阶段（查状态 ＋
+ *   唤醒链）本身的耗时，`step`/`timeoutMs` 是报错的那一步与它拿到的预算；`pool.wake` 每条命令
+ *   一条并带该步实际的 `timeoutMs`，两者合起来就能看出「每步用了多少预算、总共用了多久」。
  * - 绝不 throw 到会话层：所有失败都是 `{ ok: false, error }`。
  * - 注入面：`exec` / `listBoxes` / `clientFactory` / `clock` / `sleep` / `onProgress` 全部可替；
  *   单测不 spawn 真进程、不碰真实 CLI、不等真实时间。
@@ -180,10 +182,22 @@ export interface PoolDeps {
 	onProgress?: (message: string) => void;
 }
 
+/** `ensureReady` 的结果：成功只表示「箱已在 `running`」；失败必带可直接展示的 `error`。 */
+export type EnsureReadyResult = { ok: true } | { ok: false; error: string };
+
 /** per-box 客户端池。 */
 export interface Pool {
-	/** 取某 box 的可用客户端：复用 / 查状态唤醒 / 建连三选一，失败回 `{ ok: false, error }` */
+	/** 取某 box 的可用客户端：复用 / 准备（{@link Pool.ensureReady}）/ 建连三选一，失败回 `{ ok: false, error }` */
 	get(box: string, opts?: PoolGetOptions): Promise<PoolGetResult>;
+	/**
+	 * 准备一个可用的 box：`listBoxes({ force: true })` → 不在列表里直接失败（带候选）→
+	 * `state === "running"` 直接成功 → 否则 `wake` → `start` → `resume`，每步之后确认 `running`。
+	 * 整段共享 `timeouts.prepareMs` 截止时间（每步 `min(单步上限, 剩余预算)`），预算耗尽报
+	 * `prepare timed out after …ms (box …, step: …)`。`allowWake: false` 时非 `running` 直接失败。
+	 *
+	 * **这是「准备一个可用 box」的唯一实现**：`get` 与 DevTools 注册前的准备都复用它。
+	 */
+	ensureReady(box: string, opts?: PoolGetOptions): Promise<EnsureReadyResult>;
 	/** 关停并移除某 box 的连接（不给参数时等于 {@link Pool.disposeAll}） */
 	dispose(box?: string): void;
 	/** 关停并移除所有连接 */
@@ -556,13 +570,42 @@ export function createPool(deps: PoolDeps): Pool {
 		return ensureRunning(box, opts, budget);
 	}
 
+	/**
+	 * 准备阶段的埋点包装：跑一次 {@link prepareBox} 并落一条 `pool.prepare`（`ms` 只量这一段，
+	 * 不含建连握手）。`get` 与 {@link ensureReady} 共用它，所以两条入口的埋点口径一致。
+	 */
+	async function runPrepareStage(box: string, opts: PoolGetOptions, budget: PrepareBudget): Promise<PrepareResult> {
+		const result = await prepareBox(box, opts, budget);
+		budget.endedAt = clock();
+		logEvent(
+			"pool.prepare",
+			{
+				box,
+				ok: result.ok,
+				ms: budget.endedAt - budget.startedAt,
+				step: result.ok ? undefined : result.step,
+				timeoutMs: result.ok ? undefined : result.timeoutMs,
+			},
+			result.ok ? "info" : "warn",
+		);
+		return result;
+	}
+
+	/**
+	 * 公共入口（{@link Pool.ensureReady}）：自建准备预算，跑一遍准备阶段，只把「能不能用」报给
+	 * 调用方。**不与 in-flight 的 `get` 合并**：它不建连，也就没有可共享的连接可言。
+	 */
+	async function ensureReady(box: string, opts: PoolGetOptions = {}): Promise<EnsureReadyResult> {
+		const budget = createPrepareBudget(clock, timeouts.prepareMs);
+		const result = await runPrepareStage(box, opts, budget);
+		return result.ok ? { ok: true } : { ok: false, error: result.error };
+	}
+
 	async function connectBox(box: string, opts: PoolGetOptions, budget: PrepareBudget): Promise<ConnectResult> {
 		const stamp = currentGeneration(box);
 		try {
 			// 先看状态：running 直接连；非 running 才进唤醒链（allowWake=false 直接拒答）
-			const prepared = await prepareBox(box, opts, budget);
-			// 准备阶段到此结束：`pool.prepare` 的 `ms` 只量这一段，不含建连握手
-			budget.endedAt = clock();
+			const prepared = await runPrepareStage(box, opts, budget);
 			if (!prepared.ok) return prepared;
 			// 预算已耗尽就不再 spawn：`initialize` 的超时在建客户端时就固定了，这里只能拦住起点
 			const connectTimeoutMs = stepTimeout(budget, timeouts.connectMs);
@@ -587,24 +630,12 @@ export function createPool(deps: PoolDeps): Pool {
 	}
 
 	/**
-	 * 一次建连尝试的埋点包装：`pool.prepare`（准备阶段本身的 `ms` ＋ 失败时报错的那一步与它
-	 * 拿到的预算）与 `pool.connect`（整段建连）各一条，返回值与错误文案不动。
+	 * 一次建连尝试的埋点包装：准备阶段与建连共用一个预算（`pool.prepare` 由
+	 * {@link runPrepareStage} 单独记，`pool.connect` 记整段），返回值与错误文案不动。
 	 */
 	async function connect(box: string, opts: PoolGetOptions): Promise<ConnectResult> {
 		const budget = createPrepareBudget(clock, timeouts.prepareMs);
 		const result = await connectBox(box, opts, budget);
-		const endedAt = budget.endedAt ?? clock();
-		logEvent(
-			"pool.prepare",
-			{
-				box,
-				ok: result.ok,
-				ms: endedAt - budget.startedAt,
-				step: result.ok ? undefined : result.step,
-				timeoutMs: result.ok ? undefined : result.timeoutMs,
-			},
-			result.ok ? "info" : "warn",
-		);
 		logEvent("pool.connect", {
 			box,
 			ok: result.ok,
@@ -644,6 +675,7 @@ export function createPool(deps: PoolDeps): Pool {
 
 	return {
 		get,
+		ensureReady,
 		dispose,
 		disposeAll: () => dispose(),
 		size: () => clients.size,

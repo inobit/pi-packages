@@ -117,6 +117,8 @@ function fakePool(options: FakePoolOptions = {}) {
 			const client = options.client ?? new FakeClient(async () => ({ content: [] }));
 			return { ok: true, client };
 		},
+		// 工具层不准备 box（`get` 内部自己做）；这里只满足接口
+		ensureReady: async () => ({ ok: true }),
 		dispose: () => {},
 		disposeAll: () => {},
 		size: () => 0,
@@ -445,6 +447,7 @@ describe("execute：转发与回显", () => {
 				opts?.onProgress?.("正在唤醒 agent…");
 				return { ok: true, client };
 			},
+			ensureReady: async () => ({ ok: true }),
 			dispose: () => {},
 			disposeAll: () => {},
 			size: () => 0,

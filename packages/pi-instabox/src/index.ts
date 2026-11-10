@@ -8,7 +8,7 @@
  *    「扩展为什么自禁用」的第一手证据。
  * 1. 之后**加载期**只做一件事：`probeVersion`（`cli.ts` 默认 3000ms 预算），失败按原因分两种：
  *    - **明确没有 CLI**（`reason: "missing"` / 非 0 退出 / 无版本串）→ 只挂一条 `session_start`
- *      warning，不注册任何工具/命令/MCP、不写缓存与 helper、不 throw，也不重试。
+ *      warning，不注册任何工具/命令/MCP、不写运行期文件、不 throw，也不重试。
  *      （这条「零注册」是方案 §7 验收 1 的硬要求；§6 的 T18 冒烟行只验证「无工具 / 无 MCP /
  *      一条 warning / 无残留文件」，它不以 `/instabox-status` 为前提。）
  *    - **被超时击杀**（`reason: "timeout"`，实测 `instabox version` 803–1178ms，pi 加载期并发下
@@ -19,7 +19,7 @@
  *    **模板缓存命中就立刻注册工具**（加载期绝不跑 `ls`、
  *    绝不连远端），未命中等到 `session_start` 的**后台**拉取。整段装配在 `assemble()` 里，
  *    加载期与「超时后重试成功」共用同一份逻辑。日志已在第 0 步接上，因此装配全程的埋点都落盘；
- *    装配失败 / 无 CLI 时**只**写日志，不建 `templates.json`、`bin/` 等运行期目录。
+ *    装配失败 / 无 CLI 时**只**写日志，不建 `templates.json` 等运行期目录。
  * 3. 命令 `/instabox-use`（含冷启动唯一重试入口）、`/instabox-status`（诊断）与
  *    `/instabox-devtools`（`status` / `on [box]` / `off` / `reset`，动态开关远端 MCP）、目标 entry
  *    renderer、两个 CLI flag（`--instabox-devtools` / `--instabox-devtools-box`，必须在工厂最前面登记，
@@ -28,6 +28,10 @@
  *    box 的优先级是**会话绑定 > `--instabox-devtools-box` > `config.devToolsBox`**，会话绑定由
  *    `/instabox-devtools on <box>` 写成一条 entry（`reset` 写清除标记，不改开关、不注销）。
  *    加载期读不到命令行 flag 值，所以判定一律在 `session_start` 之后。
+ *    **普通注册，没有中间层**：DevTools MCP 就是一条 `instabox ssh <box> -- env PATH=…
+ *    chrome-devtools-mcp …` 的 stdio 配置（效果等同于手写 `mcp.json`），不生成脚本、不落盘。
+ *    前置工作因此在注册**之前**用普通函数做完（`prepareDevTools`：唤醒箱 + 确保远端可执行）；
+ *    加载期顺带为 0.1.1 及更早版本写下的 `bin/` 目录做一次 best-effort 清理。
  * 4. `session_start`：**同步段只做内存赋值与通知 drain**（`sessionCtx` 赋值、清一次性提示键、
  *    drain 队列），随后把后台任务丢到一个宏任务之后再跑。后台先按 flag 处理 DevTools、再拉模板声明
  *    「成功即静默」，来源按
@@ -56,6 +60,8 @@
  * 时只说清补救命令。所有异常吞掉转 `notify` / 工具 `isError`，绝不 throw 到会话层。
  */
 
+import fs from "node:fs";
+import path from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -67,7 +73,7 @@ import type {
 import { type BoxInfo, createBoxLister } from "./boxes.ts";
 import { type ExecFn, type ProbeVersionResult, probeVersion } from "./cli.ts";
 import { getAgentDir, loadConfig, resolvePaths } from "./config.ts";
-import { buildMcpServerConfig, ensureHelperScript } from "./devtools.ts";
+import { buildMcpServerConfig, prepareDevTools } from "./devtools.ts";
 import { createTargetRendererWithHostText } from "./entry-render.ts";
 import { type LogLevel, type Logger, createFileLogger, logEvent, setLogger } from "./log.ts";
 import { type Pool, createPool } from "./pool.ts";
@@ -155,7 +161,7 @@ type DevtoolsRegistrationSource = DevtoolsBoxSource | "command";
  * `notified`，否则「已通知」会提前标记、把提示吞掉（加载期 `warn`、工具执行期的 `skippedConfig`）。
  */
 interface PendingNotification {
-	/** `notifyOnce` 的去重键；加载期固定提示（helper 写盘失败等）没有键 */
+	/** `notifyOnce` 的去重键；加载期固定提示（配置/缓存读不到之类的告警）没有键 */
 	key?: string;
 	message: string;
 	type: "info" | "warning" | "error";
@@ -205,6 +211,21 @@ function debug(message: string): void {
 /** `unknown` → message 文本（错误文本里不出现 `[object Object]`）。 */
 function messageOf(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * 删除 0.1.1 及更早版本的运行期产物：DevTools helper 曾由扩展生成在 `<stateDir>/bin/` 下。
+ *
+ * 现在注册的就是一条 `instabox ssh …` 的 stdio 配置，脚本不再需要，也没有「每次加载重写一遍」
+ * 的理由。`bin/` 只装过那个一次性脚本，所以整目录删掉（`recursive` + `force`：不存在、非空、
+ * 只读都属于正常的 best-effort 失败）。删不掉只意味着留一个无用目录，绝不影响装配。
+ */
+function removeLegacyDevToolsBin(stateDir: string): void {
+	try {
+		fs.rmSync(path.join(stateDir, "bin"), { recursive: true, force: true });
+	} catch (error) {
+		debug(`instabox: cannot remove the legacy bin/ directory: ${messageOf(error)}`);
+	}
 }
 
 /** 分支里**最后一条 user 消息**的纯文本（解析链第 2 级；只取 text 段，图片忽略）。 */
@@ -347,6 +368,7 @@ export default async function instaboxExtension(
 	 * 返回的 `startSession` 供重试路径在当前会话补跑后台任务。
 	 */
 	function assemble(): { startSession: (ctx: ExtensionContext, source?: SessionStartEvent["reason"]) => void } {
+		removeLegacyDevToolsBin(paths.stateDir);
 		const boxLister = createBoxLister({ exec });
 		const pool = createPool({
 			exec,
@@ -814,27 +836,34 @@ export default async function instaboxExtension(
 		}
 
 		/**
-		 * 写 helper + 注册（替换）MCP server：启动路径与 `/instabox-devtools on` 共用。
+		 * 准备 + 注册（替换）MCP server：启动路径与 `/instabox-devtools on` 共用。
 		 *
 		 * `source` 记录本次注册的 box 是从哪来的：启动路径取实际生效的来源（session / flag / config），
 		 * 命令路径一律 `command`（即使最终 box 由 flag/config 提供）。
-		 * helper 写盘失败只 warn（远端可能早就装好了 `chrome-devtools-mcp`，不该连带放弃注册）；
-		 * 已注册时先 `unregister` 再注册，换 box 不会留下旧连接。
+		 * 注册前先 `prepareDevTools`（唤醒箱 → 确认 `running` → 确保远端可执行）：MCP 客户端自己
+		 * 不会唤醒箱，pi 也不会重连失败的 server，所以箱没起来就不该注册——准备失败只 notify。
+		 * 注册本身是一条普通的 `instabox ssh …` stdio 配置（不生成脚本、不落盘）；已注册时先
+		 * `unregister` 再注册，换 box 不会留下旧连接。
 		 * 返回是否注册成功（失败已经提示过，调用方不必再报一次）。
 		 */
-		function registerDevTools(box: string, source: DevtoolsRegistrationSource): boolean {
-			const helper = ensureHelperScript({
-				remotePath: cfg.remotePath,
-				autoInstall: cfg.autoInstallDevTools,
-				paths,
+		async function registerDevTools(box: string, source: DevtoolsRegistrationSource): Promise<boolean> {
+			const prepared = await prepareDevTools({
+				exec,
+				// 「准备一个可用的 box」只有一套实现：桌面工具走 `pool.get`（内部同一个 ensureReady）
+				ensureReady: pool.ensureReady,
+				box,
+				cfg,
+				signal: sessionCtx?.signal,
+				warn: (message) => notifyOnce(`devtools-install:${box}`, message),
 			});
-			if (!helper.ok) {
+			if (!prepared.ok) {
 				notifyOnce(
-					`devtools-helper:${box}`,
-					`instabox: 无法写入 DevTools helper（${helper.error ?? "unknown error"}）；远端 DevTools MCP 可能起不来。`,
+					`devtools-prepare:${box}`,
+					`instabox: 远端 DevTools MCP 未注册（${prepared.error ?? "unknown error"}）；桌面工具不受影响。`,
 				);
+				return false;
 			}
-			const registration = buildMcpServerConfig(cfg, paths, box);
+			const registration = buildMcpServerConfig(cfg, box);
 			let ok = true;
 			try {
 				if (registeredDevTools !== undefined) pi.unregisterMcpServer(registeredDevTools.name);
@@ -866,7 +895,7 @@ export default async function instaboxExtension(
 				if (devToolsFlagBox() !== "") notifyOnce("devtools-switch-missing", DEVTOOLS_SWITCH_MISSING_MESSAGE);
 				return;
 			}
-			// 本会话已注册（命令开过、或更早一次 session_start）：不重复写盘，也不打扰用户
+			// 本会话已注册（命令开过、或更早一次 session_start）：不重复准备，也不打扰用户
 			if (registeredDevTools !== undefined) return;
 			const choice = devToolsBoxChoice(ctx);
 			if (choice === undefined) {
@@ -890,7 +919,7 @@ export default async function instaboxExtension(
 				);
 				return;
 			}
-			registerDevTools(box, choice.source);
+			await registerDevTools(box, choice.source);
 		}
 
 		/**
@@ -964,7 +993,7 @@ export default async function instaboxExtension(
 					return;
 				}
 				if (requested !== "") pi.appendEntry(DEVTOOLS_TARGET_ENTRY, devtoolsTargetEntryData(box));
-				if (!registerDevTools(box, "command")) return; // 失败原因已提示
+				if (!(await registerDevTools(box, "command"))) return; // 失败原因已提示
 				ctx.ui.notify(`instabox: DevTools MCP registered for box "${box}"`, "info");
 				return;
 			}

@@ -4,7 +4,7 @@
  * 用手写假 `pi`（记录 `registerTool`/`registerCommand`/`registerEntryRenderer`/`registerMcpServer`/
  * `unregisterMcpServer`/`registerFlag`/`getFlag`/`on`/`appendEntry`/`setActiveTools`/`getAllTools`/
  * `getActiveTools`/`getMcpServers`/`exec`）验证：
- * - 无 CLI：零工具/零命令/零 MCP、无运行期目录（`templates.json` / `bin/`），只落一条
+ * - 无 CLI：零工具/零命令/零 MCP、无运行期目录（`templates.json`），只落一条
  *   `cli.probe`（`ok:false`）日志，`session_start` 恰一条 warning；
  * - 有 CLI + 缓存命中：加载期即注册（且**不跑 `ls`**）、3 个命令、1 个 renderer、2 个事件；
  * - **`setActiveTools` 从未被调用**（裁决 V2；每个用例的 teardown 都断言一次）；
@@ -111,11 +111,14 @@ interface FakeExecOptions {
 	wakeFails?: boolean;
 	/** `instabox ls` 直接失败（非 0 退出）：用来验证「没有可用沙箱」提示 */
 	lsFails?: boolean;
+	/** `instabox exec`（DevTools 准备阶段的远端检查/安装）失败（默认成功） */
+	remoteExecFails?: boolean;
 }
 
 /**
- * 假 `pi.exec`：`version` / `ls` / `wake` / `start` 可脚本化，`resume`/其它子命令一律失败。
- * 记录每次调用的 argv，供「只跑过 version」「先 wake 再 start」「零唤醒」这类断言用。
+ * 假 `pi.exec`：`version` / `ls` / `wake` / `start` / `exec` 可脚本化，`resume`/其它子命令一律失败。
+ * 记录每次调用的 argv，供「只跑过 version」「先 wake 再 start」「零唤醒」「注册前先准备」
+ * 这类断言用。
  */
 function createFakeExec(options: FakeExecOptions = {}) {
 	const calls: string[][] = [];
@@ -180,6 +183,13 @@ function createFakeExec(options: FakeExecOptions = {}) {
 		}
 		if ((subcommand === "wake" || subcommand === "start") && options.trackStart === true) {
 			started.add(box);
+			return { stdout: "", stderr: "", code: 0, killed: false, truncated: false };
+		}
+		if (subcommand === "exec") {
+			// DevTools 准备阶段的远端检查/安装：默认成功（失败面由 `devtools.test.ts` 覆盖）
+			if (options.remoteExecFails === true) {
+				return { stdout: "", stderr: "instabox exec: boom", code: 1, killed: false, truncated: false };
+			}
 			return { stdout: "", stderr: "", code: 0, killed: false, truncated: false };
 		}
 		return { stdout: "", stderr: `instabox ${subcommand}: unsupported in this test`, code: 1, killed: false, truncated: false };
@@ -565,9 +575,9 @@ function messagesOf(notifications: readonly Notification[]): string[] {
 	return notifications.map((notification) => notification.message);
 }
 
-/** MCP server 配置实际连的 box（stdio 配置的 `args[0]`）。 */
+/** MCP server 配置实际连的 box（stdio 配置是 `["ssh", <box>, "--", "env", …]`，所以取 `args[1]`）。 */
 function devtoolsBoxOf(config: McpServerConfig | undefined): string | undefined {
-	return config !== undefined && "command" in config ? config.args?.[0] : undefined;
+	return config !== undefined && "command" in config ? config.args?.[1] : undefined;
 }
 
 /** 假 `pi` 记下的最后一条 entry 的 `data`（`/instabox-devtools reset` 的清除标记断言用）。 */
@@ -654,7 +664,7 @@ describe("@inobit/pi-instabox 装配", () => {
 			expect(pi.eventNames()).toEqual(["session_start"]);
 			// flag 在工厂最前面登记（无 CLI 也一样）：否则 pi 会把它们当未知选项直接 exit(1)
 			expect([...pi.flags.keys()]).toEqual(["instabox-devtools", "instabox-devtools-box"]);
-			// 运行期目录一律不建：没有 templates.json、没有 bin/，连状态目录都不出现
+			// 运行期目录一律不建：没有 templates.json，连状态目录都不出现
 			expect(fs.existsSync(path.join(agentDir, "pi-instabox"))).toBe(false);
 
 			const { ctx, notifications } = createFakeContext([]);
@@ -1103,6 +1113,23 @@ describe("@inobit/pi-instabox 装配", () => {
 		});
 	});
 
+	describe("旧版本残留清理", () => {
+		it("装配时删掉 0.1.1 生成的 bin/ 目录（DevTools 不再需要 helper 脚本）", async () => {
+			const binDir = path.join(agentDir, "pi-instabox", "bin");
+			fs.mkdirSync(binDir, { recursive: true });
+			fs.writeFileSync(path.join(binDir, "legacy-helper.sh"), "#!/bin/sh\n", "utf8");
+			writeTemplateCache(agentDir, { general: TEMPLATE_TOOL_NAMES });
+			const { exec } = createFakeExec({ boxes: [{ name: "general" }] });
+			const pi = new FakePi(exec);
+
+			await assembleExtension(pi);
+
+			expect(fs.existsSync(binDir)).toBe(false);
+			// 同目录下的模板缓存不受影响（清理只针对 bin/）
+			expect(fs.existsSync(path.join(agentDir, "pi-instabox", "templates.json"))).toBe(true);
+		});
+	});
+
 	describe("session_start 的后台任务", () => {
 		it("不 await 拉取：处理器先返回，后台完成后才注册", async () => {
 			noDefaultBox();
@@ -1294,12 +1321,17 @@ describe("@inobit/pi-instabox 装配", () => {
 				configBox?: string;
 				/** 会话恢复后的分支（预置 `instabox-devtools-target` entry 即「恢复前 `on` 过」） */
 				branch?: SessionEntry[];
+				/** `wake` 报「箱没在跑」（配合 `start`/`resume` 也不受支持 → 唤醒链全失败） */
+				wakeFails?: boolean;
 			} = {},
 		) {
 			noDefaultBox();
 			vi.stubEnv("INSTABOX_MCP_DEVTOOLS_BOX", options.configBox ?? "");
 			writeTemplateCache(agentDir, { general: TEMPLATE_TOOL_NAMES });
-			const { exec, calls } = createFakeExec({ boxes: options.boxes ?? [{ name: "general" }] });
+			const { exec, calls } = createFakeExec({
+				boxes: options.boxes ?? [{ name: "general" }],
+				...(options.wakeFails === true ? { wakeFails: true } : {}),
+			});
 			const pi = new FakePi(exec);
 			// codemode 已激活：本组只关心 DevTools 注册，不让 codemode 提示掺进 `notifications`
 			pi.activeTools = ["codemode"];
@@ -1313,25 +1345,32 @@ describe("@inobit/pi-instabox 装配", () => {
 			return { pi, calls, ...fake };
 		}
 
-		it("flag 默认关：config 有 box 也不注册 MCP、不写 helper", async () => {
-			const { pi, notifications } = await startSession({ configBox: "agent", boxes: [{ name: "agent" }] });
+		it("flag 默认关：config 有 box 也不注册 MCP、不做任何准备", async () => {
+			const { pi, calls, notifications } = await startSession({ configBox: "agent", boxes: [{ name: "agent" }] });
 
 			// 两个 flag 都在加载期登记（否则 pi 会把它们当未知选项），默认值：false / 空串
 			expect(pi.flags.get("instabox-devtools")).toMatchObject({ type: "boolean", default: false });
 			expect(pi.flags.get("instabox-devtools-box")).toMatchObject({ type: "string", default: "" });
 			expect(pi.registeredServers).toEqual([]);
-			expect(fs.existsSync(path.join(agentDir, "pi-instabox", "bin"))).toBe(false);
+			// 开关关着就不该有唤醒/远端检查这类准备动作
+			expect(calls.filter((call) => ["wake", "start", "resume"].includes(call[1] ?? ""))).toEqual([]);
+			expect(calls.some((call) => call[1] === "exec")).toBe(false);
 			// 只配了 config（没给 flag box）：开关关着就是静默的，不提示
 			expect(messagesOf(notifications)).toEqual([]);
 		});
 
-		it("flag + config box → 写 helper 并注册 instabox-devtools", async () => {
-			const { pi } = await startSession({ configBox: "agent", flag: true, boxes: [{ name: "agent" }] });
+		it("flag + config box → 先准备（查状态 + 远端检查）再注册 instabox-devtools", async () => {
+			const { pi, calls } = await startSession({ configBox: "agent", flag: true, boxes: [{ name: "agent" }] });
 			await waitFor(() => pi.registeredServers.length > 0, "devtools registration from flags");
 
-			const helper = path.join(agentDir, "pi-instabox", "bin", "devtools-connect.sh");
-			expect(fs.readFileSync(helper, "utf8")).toContain("set -eu");
-			expect(fs.statSync(helper).mode & 0o777).toBe(0o755);
+			// 注册前准备好：远端检查（`instabox exec … command -v chrome-devtools-mcp`）先于注册
+			const check = calls.find((call) => call[1] === "exec");
+			expect(check?.slice(0, 3)).toEqual(["instabox", "exec", "agent"]);
+			expect(check?.[3]).toBe("--env");
+			expect(check?.[4]).toMatch(/^PATH=/);
+			expect(check?.slice(5)).toEqual(["--timeout", "20", "--", "sh", "-c", "command -v chrome-devtools-mcp"]);
+			// 没有 helper 脚本、没有多出来的进程包装：注册的就是一条 `instabox ssh …` 配置
+			expect(fs.existsSync(path.join(agentDir, "pi-instabox", "bin"))).toBe(false);
 
 			expect(pi.registeredServers).toHaveLength(1);
 			const server = pi.registeredServers[0];
@@ -1339,12 +1378,30 @@ describe("@inobit/pi-instabox 装配", () => {
 			expect(server?.config.exposure).toBe("codemode");
 			expect(server?.config.timeout).toBe(180);
 			const config = server?.config;
-			expect(config).toMatchObject({ command: helper });
-			// stdio 配置的 `args` = [box, ...DEFAULT_CONFIG.devToolsArgs]
-			expect(config !== undefined && "command" in config ? config.args?.slice(0, 2) : undefined).toEqual([
+			expect(config).toMatchObject({ command: "instabox" });
+			expect(config !== undefined && "command" in config ? config.args?.slice(0, 4) : undefined).toEqual([
+				"ssh",
 				"agent",
-				"--headless",
+				"--",
+				"env",
 			]);
+			expect(config !== undefined && "command" in config ? config.args?.[4] : undefined).toMatch(/^PATH=/);
+			expect(config !== undefined && "command" in config ? config.args?.[5] : undefined).toBe("chrome-devtools-mcp");
+		});
+
+		it("flag 开但准备失败（箱起不来）→ 只 notify，不注册", async () => {
+			const { pi, notifications } = await startSession({
+				configBox: "agent",
+				flag: true,
+				boxes: [{ name: "agent", state: "suspended", desiredState: "suspended" }],
+				wakeFails: true,
+			});
+			await waitFor(() => notifications.length > 0, "devtools prepare failure notice");
+
+			expect(pi.registeredServers).toEqual([]);
+			expect(messagesOf(notifications)).toHaveLength(1);
+			expect(messagesOf(notifications)[0]).toContain("远端 DevTools MCP 未注册");
+			expect(messagesOf(notifications)[0]).toContain("could not wake box");
 		});
 
 		it("flag box 优先于 config.devToolsBox", async () => {
@@ -1438,7 +1495,6 @@ describe("@inobit/pi-instabox 装配", () => {
 			]);
 			expect(notifications[0]?.type).toBe("warning");
 			expect(pi.registeredServers).toEqual([]);
-			expect(fs.existsSync(path.join(agentDir, "pi-instabox", "bin"))).toBe(false);
 		});
 
 		it("box 不在 ls 里 → warning + 不注册（不静默换机）", async () => {
@@ -1450,7 +1506,6 @@ describe("@inobit/pi-instabox 装配", () => {
 			expect(messagesOf(notifications)[0]).toContain("不在 instabox ls 里");
 			expect(messagesOf(notifications)[0]).toContain("general");
 			expect(pi.registeredServers).toEqual([]);
-			expect(fs.existsSync(path.join(agentDir, "pi-instabox", "bin"))).toBe(false);
 		});
 
 		it("只给 box flag 不给开关 → 一条 warning，不注册", async () => {
@@ -1459,7 +1514,6 @@ describe("@inobit/pi-instabox 装配", () => {
 
 			expect(messagesOf(notifications)).toEqual(["instabox: 已指定 box 但未开启 devtools，请加 --instabox-devtools"]);
 			expect(pi.registeredServers).toEqual([]);
-			expect(fs.existsSync(path.join(agentDir, "pi-instabox", "bin"))).toBe(false);
 		});
 
 		it("后台同步：暂停箱的模板缓存也会被唤醒并取到连接（allowWake 不再是 false）", async () => {
@@ -1533,16 +1587,43 @@ describe("@inobit/pi-instabox 装配", () => {
 			return (await statusLines(pi, commandCtx, notifications)).slice(0, 4);
 		}
 
-		it("`on agent` → 写 helper 并注册（args[0] = 指定 box）", async () => {
-			const { pi, commandCtx, notifications } = await assemble();
+		it("`on agent` → 先准备再注册（`instabox ssh agent …` 一条普通配置）", async () => {
+			const { pi, calls, commandCtx, notifications } = await assemble();
 			await invokeCommand(pi, "instabox-devtools", "on agent", commandCtx);
 
+			// 准备阶段：查状态 + 远端检查（`instabox exec … command -v chrome-devtools-mcp`）
+			expect(calls.some((call) => call[1] === "exec")).toBe(true);
 			expect(pi.registeredServers).toHaveLength(1);
 			expect(pi.registeredServers[0]?.name).toBe("instabox-devtools");
 			expect(devtoolsBoxOf(pi.registeredServers[0]?.config)).toBe("agent");
 			expect(pi.registeredServers[0]?.config.exposure).toBe("codemode");
-			expect(fs.existsSync(path.join(agentDir, "pi-instabox", "bin", "devtools-connect.sh"))).toBe(true);
+			expect(pi.registeredServers[0]?.config).toMatchObject({ command: "instabox" });
+			// 不再生成任何 helper 文件
+			expect(fs.existsSync(path.join(agentDir, "pi-instabox", "bin"))).toBe(false);
 			expect(messagesOf(notifications).at(-1)).toContain('DevTools MCP registered for box "agent"');
+		});
+
+		it("`on agent` 准备失败（箱起不来）→ 一条 warning，不注册", async () => {
+			// 箱是 suspended 且 wake 报 machine_not_running、start/resume 也不受支持 → 唤醒链全失败
+			const { exec } = createFakeExec({
+				boxes: [{ name: "general" }, { name: "agent", state: "suspended", desiredState: "suspended" }],
+				wakeFails: true,
+			});
+			noDefaultBox();
+			vi.stubEnv("INSTABOX_MCP_DEVTOOLS_BOX", "");
+			writeTemplateCache(agentDir, { general: TEMPLATE_TOOL_NAMES });
+			const pi = new FakePi(exec);
+			pi.activeTools = ["codemode"];
+			pi.allTools = ["codemode"];
+			await assembleExtension(pi);
+			const { commandCtx, notifications } = createFakeContext([]);
+
+			await invokeCommand(pi, "instabox-devtools", "on agent", commandCtx);
+
+			expect(pi.registeredServers).toEqual([]);
+			expect(messagesOf(notifications)).toHaveLength(1);
+			expect(messagesOf(notifications)[0]).toContain("远端 DevTools MCP 未注册");
+			expect(messagesOf(notifications)[0]).toContain("could not wake box");
 		});
 
 		it("`on agent` → 写一条会话绑定 entry（下次启动优先用它）", async () => {
@@ -2105,8 +2186,9 @@ describe("@inobit/pi-instabox 装配", () => {
 			expect(assembled).toHaveLength(1);
 			expect(assembled[0]?.fields).toEqual({ cacheHit: true, box: "general", tools: 1 });
 
-			// 假设层不记 helper 内容（那是 devtools.helper），只记注册结果
-			expect(find("devtools.helper")[0]?.fields).toMatchObject({ ok: true });
+			// 注册前的准备与注册各一条：`devtools.prepare` 先于 `devtools.register`
+			expect(find("devtools.prepare")[0]?.fields).toMatchObject({ box: "agent", ok: true });
+			expect(eventNames.indexOf("devtools.prepare")).toBeLessThan(eventNames.indexOf("devtools.register"));
 			expect(find("devtools.register")[0]?.fields).toEqual({ box: "agent", ok: true });
 			// 新事件：enabled 带 box 与来源（本用例的 box 来自 config.devToolsBox，无会话绑定、无 flag box）
 			expect(find("devtools.enabled")).toHaveLength(1);

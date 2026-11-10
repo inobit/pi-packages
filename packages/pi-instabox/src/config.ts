@@ -6,7 +6,7 @@
  * 照 pi-todo / pi-nvim `src/config.ts` 范式：单测走纯函数 `normalizeConfig`，`loadConfig`
  * 在 `VITEST` 下恒返回默认值＋环境变量层（测试确定性），所有外部访问都走注入面便于离线测试。
  *
- * 路径布局（裁决 V3）：配置进 `<agentDir>/extensions/pi-instabox/`，运行期状态与 helper 进
+ * 路径布局（裁决 V3）：配置进 `<agentDir>/extensions/pi-instabox/`，运行期状态进
  * `<agentDir>/pi-instabox/`，事件日志进 `<agentDir>/logs/pi-instabox/`（与
  * `logs/pi-permission/` 的生态惯例一致：扩展目录只放配置，日志与 `pi-debug.log` 同级）。
  * 所有路径单点在 `resolvePaths()`，其余模块只消费它的返回值。
@@ -56,7 +56,7 @@ export interface InstaboxTimeouts {
 export interface InstaboxConfig {
 	/** 解析链靠后的兜底目标；空串＝未配置（退到「`instabox ls` 第一台」） */
 	defaultBox: string;
-	/** DevTools 唯一对应的 box；空串＝该能力整体不存在（不建目录、不写 helper、不提示） */
+	/** DevTools 唯一对应的 box；空串＝该能力整体不存在（不注册 MCP、不提示） */
 	devToolsBox: string;
 	/** 指定了 devToolsBox 但远端没装 `chrome-devtools-mcp` 时，连接前尝试自动安装 */
 	autoInstallDevTools: boolean;
@@ -120,12 +120,10 @@ const STATE_DIR_NAME = "pi-instabox";
 export interface InstaboxPaths {
 	/** 配置文件（全局层；项目层在 `<cwd>/.pi/` 下同名） */
 	configFile: string;
-	/** 运行期状态目录（缓存与 helper 的父目录，按需创建） */
+	/** 运行期状态目录（模板缓存的父目录，按需创建） */
 	stateDir: string;
 	/** per-box 模板缓存 */
 	templateCacheFile: string;
-	/** DevTools helper 脚本（运行期产物，非配置） */
-	helperScript: string;
 	/** 事件日志目录（JSONL 由 `log.ts` 写入，按需创建） */
 	logDir: string;
 }
@@ -136,7 +134,6 @@ export function resolvePaths(agentDir: string): InstaboxPaths {
 		configFile: path.join(agentDir, CONFIG_RELATIVE_PATH),
 		stateDir,
 		templateCacheFile: path.join(stateDir, "templates.json"),
-		helperScript: path.join(stateDir, "bin", "devtools-connect.sh"),
 		logDir: path.join(agentDir, "logs", STATE_DIR_NAME),
 	};
 }
@@ -224,7 +221,7 @@ export function normalizeConfig(raw: unknown): InstaboxConfig {
 	return applyOverlay(DEFAULT_CONFIG, normalizeConfigOverlay(raw));
 }
 
-/** 环境变量名（`INSTABOX_MCP_AUTO_INSTALL` 取值 `0|1`，`INSTABOX_MCP_PATH` 只喂 helper 的 PATH） */
+/** 环境变量名（`INSTABOX_MCP_AUTO_INSTALL` 取值 `0|1`，`INSTABOX_MCP_PATH` 喂远端命令的 PATH） */
 const ENV_KEYS = {
 	defaultBox: "INSTABOX_MCP_DEFAULT_BOX",
 	devToolsBox: "INSTABOX_MCP_DEVTOOLS_BOX",

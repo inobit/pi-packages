@@ -1,324 +1,88 @@
 /**
- * @inobit/pi-instabox — `src/devtools.ts` 单测：helper 脚本内容（`set -eu`、stdout 纯净、
- * 先 `wake`/`start` 再检查、`--env PATH=`、ssh 形式、autoInstall 两种分支、单引号转义、
- * 脚本预算 < per-request timeout）、写盘幂等/`chmod`/失败只 warn、
- * `registerMcpServer` 参数（`exposure`/`timeout`/`description`/显式 box 覆盖）。全程内存文件系统，不落盘。
+ * @inobit/pi-instabox — `src/devtools.ts` 单测。
+ *
+ * 两段契约：
+ * - `buildMcpServerConfig`：注册参数**逐字**（`command: "instabox"`、
+ *   `args: ["ssh", <box>, "--", "env", "PATH=…", "chrome-devtools-mcp", ...]`）＋ `exposure` /
+ *   `timeout` / 自解释的 `description`。没有脚本、没有中间层，等价于手写 `mcp.json`。
+ * - `prepareDevTools`（注册前的普通函数调用）：前半步委托注入的 `ensureReady`（唤醒链的唯一
+ *   实现，见 `pool.test.ts`），本模块只做后半步——远端 `chrome-devtools-mcp` 的检查/安装。
+ *   这里用假 `ensureReady` 断言「只负责 install 部分」：箱没准备好就整体失败、不再发远端命令；
+ *   缺包且 `autoInstallDevTools` 时装一次，装失败只 warn、不阻断。
+ *
+ * 全程离线：`exec` 与 `ensureReady` 都是假实现，不 spawn 真进程、不等真实时间。
  */
 
-import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_CONFIG, resolvePaths } from "../src/config.ts";
+import type { ExecResultLike } from "../src/cli.ts";
+import { DEFAULT_CONFIG, type InstaboxConfig } from "../src/config.ts";
+import { buildMcpServerConfig, prepareDevTools } from "../src/devtools.ts";
 import { createMemoryLogger, setLogger } from "../src/log.ts";
-import {
-	buildHelperScript,
-	buildMcpServerConfig,
-	ensureHelperScript,
-	type EnsureHelperScriptResult,
-	type HelperScriptFileSystem,
-} from "../src/devtools.ts";
+import type { EnsureReadyResult, Pool, PoolGetOptions } from "../src/pool.ts";
 
 const REMOTE_PATH = "/opt/npm/bin:/usr/local/bin:/usr/bin:/bin";
-const AGENT_DIR = path.join(path.sep, "tmp", "agent");
-const PATHS = resolvePaths(AGENT_DIR);
+const DEVTOOLS_BIN = "chrome-devtools-mcp";
+
+/** 成功的 `pi.exec` 结果。 */
+const OK_RESULT: ExecResultLike = { stdout: "", stderr: "", code: 0, killed: false, truncated: false };
+
+/** 远端命令失败（非 0 退出）。 */
+const FAILED_RESULT: ExecResultLike = { stdout: "", stderr: "boom", code: 1, killed: false, truncated: false };
+
+/** 被测配置：`remotePath` 钉死成好断言的字面量，`devToolsBox` 给一台默认箱。 */
+function config(overrides: Partial<InstaboxConfig> = {}): InstaboxConfig {
+	return { ...DEFAULT_CONFIG, remotePath: REMOTE_PATH, devToolsBox: "agent", ...overrides };
+}
+
+interface FakeExecOptions {
+	/** 远端有没有 `chrome-devtools-mcp`（`command -v` 的结果），默认有 */
+	hasBinary?: boolean;
+	/** 安装命令是否成功（默认成功） */
+	installOk?: boolean;
+}
 
 /**
- * 拉起箱的那一行：先把箱弄运行，失败不阻断（让后面的检查/ssh 自然报错）。
- * `$TO` 是 `timeout` 包装（系统里有 `timeout` 就是 `timeout 60`，没有就是空）。
+ * 假 `instabox`：DevTools 准备阶段只发 `instabox exec …`，按 argv 分辨「检查」与「安装」。
+ * 记录每次调用的 argv 与超时预算供逐字断言（唤醒链不在这里——那是 `pool.ensureReady` 的事）。
  */
-const WAKE_LINE =
-	'$TO instabox wake "$box" >/dev/null 2>&1 || $TO instabox start "$box" >/dev/null 2>&1 || true';
-
-/** 唤醒步骤的 shell 层封顶（秒）：与 `DEFAULT_CONFIG.timeouts.prepareMs` 对齐的 1 分钟。 */
-const PREPARE_TIMEOUT_SECONDS = 60;
-
-/** 记录全部调用的内存文件系统；`failOn` 指哪一步抛错（模拟无权限/磁盘满） */
-function fakeFileSystem(failOn?: "ensureDir" | "writeText" | "setMode") {
-	const calls: string[] = [];
-	const dirs: string[] = [];
-	const files = new Map<string, string>();
-	const modes = new Map<string, number>();
-	const fail = (step: string): void => {
-		if (failOn === step) throw new Error(`${step}: EACCES`);
+function createFakeExec(options: FakeExecOptions = {}) {
+	const calls: string[][] = [];
+	const timeouts: (number | undefined)[] = [];
+	const exec = async (command: string, args: string[], opts?: { timeout?: number }): Promise<ExecResultLike> => {
+		calls.push([command, ...args]);
+		timeouts.push(opts?.timeout);
+		if (command !== "instabox" || args[0] !== "exec") return FAILED_RESULT;
+		const remote = args.slice(args.indexOf("--") + 1);
+		if (remote.includes("npm")) return options.installOk === false ? FAILED_RESULT : OK_RESULT;
+		return options.hasBinary === false ? FAILED_RESULT : OK_RESULT;
 	};
-	const io: HelperScriptFileSystem = {
-		ensureDir: (dir) => {
-			calls.push("ensureDir");
-			fail("ensureDir");
-			dirs.push(dir);
-		},
-		writeText: (file, text) => {
-			calls.push("writeText");
-			fail("writeText");
-			files.set(file, text);
-		},
-		setMode: (file, mode) => {
-			calls.push("setMode");
-			fail("setMode");
-			modes.set(file, mode);
-		},
-	};
-	return { io, calls, dirs, files, modes };
+	return { exec, calls, timeouts };
 }
-
-function linesOf(script: string): string[] {
-	return script.split("\n");
-}
-
-describe("buildHelperScript 骨架", () => {
-	const script = buildHelperScript({ remotePath: REMOTE_PATH, autoInstall: true });
-
-	it("首行 `#!/bin/sh`、`set -eu`、用法注释、末尾换行", () => {
-		expect(linesOf(script)[0]).toBe("#!/bin/sh");
-		expect(script).toContain("\nset -eu\n");
-		expect(script).toContain("# 用法: devtools-connect.sh <box> [chrome-devtools-mcp args...]");
-		expect(script.endsWith("\n")).toBe(true);
-	});
-
-	it("box 与 args：取 $1、shift、缺参时 stderr 报用法并退出 2", () => {
-		expect(script).toContain('if [ "$#" -lt 1 ]; then');
-		expect(script).toContain('box="$1"');
-		expect(script).toContain("\nshift\n");
-		expect(script).toContain("exit 2");
-	});
-
-	it("stdout 纯净：每条 printf 都重定向到 stderr", () => {
-		const printfLines = linesOf(script).filter((line) => line.includes("printf"));
-		expect(printfLines.length).toBe(3);
-		for (const line of printfLines) expect(line.trimEnd().endsWith(">&2")).toBe(true);
-	});
-
-	it("先 wake（失败再 start）拉起箱，失败不阻断，且该行不写 stdout", () => {
-		expect(script).toContain(`\n${WAKE_LINE}\n`);
-		const wakeLine = linesOf(script).find((line) => line.includes('instabox wake "$box"'));
-		// stdout 纯净：唤醒的输出（包括 `start` 那一支）全部丢到 /dev/null，一个字节也不留
-		expect(wakeLine?.endsWith("|| true")).toBe(true);
-		expect(wakeLine).not.toContain(">&2");
-		expect(wakeLine).not.toContain("printf");
-		expect((wakeLine?.match(/>\/dev\/null 2>&1/g) ?? []).length).toBe(2);
-	});
-
-	it("唤醒与拉起各包一层 `timeout`（有就用，没有就不加），并在 stderr 注释里说明上界", () => {
-		const code = linesOf(script);
-		const toIndex = code.findIndex((line) => line.startsWith("if command -v timeout"));
-		const wakeIndex = code.findIndex((line) => line.startsWith("$TO instabox wake"));
-		expect(code[toIndex]).toBe(
-			`if command -v timeout >/dev/null 2>&1; then TO="timeout ${PREPARE_TIMEOUT_SECONDS}"; else TO=""; fi`,
-		);
-		// 先定 `TO` 再用：顺序反过来会在 `set -u` 下报未定义变量
-		expect(wakeIndex).toBeGreaterThan(toIndex);
-		// 两条命令各用一次 `$TO`（wake 失败才退到 start）
-		expect((code[wakeIndex]?.match(/\$TO /g) ?? []).length).toBe(2);
-		// 注释说明「准备阶段上限 60s，真实上界仍是 pi 的 MCP per-request timeout」
-		expect(script).toContain(`准备阶段上限 ${PREPARE_TIMEOUT_SECONDS}s`);
-		expect(script).toContain("真实上界仍是 pi 的 MCP per-request timeout");
-	});
-
-	it("唤醒/拉起在安装检查之前，紧跟在 PATH 定义之后且在 if 块之外", () => {
-		const code = linesOf(script);
-		const wakeIndex = code.findIndex((line) => line.startsWith("$TO instabox wake"));
-		const checkIndex = code.findIndex((line) => line.startsWith("if ! instabox exec"));
-		const pathIndex = code.findIndex((line) => line.startsWith("remote_path="));
-		expect(pathIndex).toBeGreaterThan(-1);
-		expect(wakeIndex).toBeGreaterThan(pathIndex);
-		expect(checkIndex).toBeGreaterThan(wakeIndex);
-		// 顶层语句：唤醒行不能缩进（缩进意味着被包进了 if 块）
-		expect(code[wakeIndex]).toBe(WAKE_LINE);
-	});
-
-	it("安装检查用 `instabox exec --env PATH=…`，结果丢弃、不阻断", () => {
-		expect(script).toContain(`instabox exec "$box" --env "PATH=$remote_path" --timeout 10 --`);
-		expect(script).toContain("sh -c 'command -v chrome-devtools-mcp >/dev/null 2>&1'");
-		expect(script).toContain("sh -c 'command -v chrome-devtools-mcp >/dev/null 2>&1' >/dev/null 2>&1; then");
-	});
-
-	it("最后一段是 ssh 形式的 exec，参数原样透传", () => {
-		const execLine = 'exec instabox ssh "$box" -- env "PATH=$remote_path" chrome-devtools-mcp "$@"';
-		expect(script).toContain(execLine);
-		const lastCodeLine = linesOf(script)
-			.filter((line) => line.trim() !== "")
-			.at(-1);
-		expect(lastCodeLine).toBe(execLine);
-	});
-
-	it("PATH 来自参数：脚本里钉的是传入值，不是 DEFAULT_CONFIG", () => {
-		expect(script).toContain(`remote_path='${REMOTE_PATH}'`);
-		const custom = buildHelperScript({ remotePath: "/custom/bin", autoInstall: true });
-		expect(custom).toContain("remote_path='/custom/bin'");
-		expect(custom).toContain('--env "PATH=$remote_path"');
-		expect(custom).not.toContain(DEFAULT_CONFIG.remotePath);
-	});
-
-	it("同一入参两次生成完全一致（幂等覆盖的前提）", () => {
-		expect(buildHelperScript({ remotePath: REMOTE_PATH, autoInstall: true })).toBe(script);
-	});
-});
-
-describe("buildHelperScript 的 autoInstall 分支", () => {
-	it("true：装一次 `sudo -n env PATH=… npm i -g chrome-devtools-mcp`，40 秒、失败不阻断", () => {
-		const script = buildHelperScript({ remotePath: REMOTE_PATH, autoInstall: true });
-		expect(script).toContain(`sudo -n env "PATH=${REMOTE_PATH}" npm i -g chrome-devtools-mcp`);
-		expect(script).toContain('--env "PATH=$remote_path" --timeout 40 --');
-		expect(script).toContain(
-			`sh -c 'sudo -n env "PATH=${REMOTE_PATH}" npm i -g chrome-devtools-mcp' >&2 2>&1 || true`,
-		);
-		expect(script).toContain("installing chrome-devtools-mcp on %s");
-		expect(script).not.toContain("auto-install disabled");
-	});
-
-	it("false：不装、不超时 40，只在 stderr 说明原因", () => {
-		const script = buildHelperScript({ remotePath: REMOTE_PATH, autoInstall: false });
-		expect(script).not.toContain("sudo");
-		expect(script).not.toContain("--timeout 40");
-		expect(script).toContain("auto-install disabled (autoInstallDevTools=false)");
-		// 唤醒、检查与 ssh 段不随开关变化
-		expect(script).toContain(WAKE_LINE);
-		expect(script).toContain("--timeout 10 --");
-		expect(script).toContain('exec instabox ssh "$box" -- env "PATH=$remote_path" chrome-devtools-mcp "$@"');
-	});
-
-	it("安装命令里的 PATH 也走单引号转义，不破出 `sh -c` 的字面量", () => {
-		const script = buildHelperScript({ remotePath: "/opt/it's/bin", autoInstall: true });
-		expect(script).toContain(String.raw`sh -c 'sudo -n env "PATH=/opt/it'\''s/bin" npm i -g chrome-devtools-mcp'`);
-	});
-});
-
-describe("脚本预算与 MCP per-request timeout", () => {
-	// pi 的 MCP 客户端对 `initialize` 也计时，而 helper 的唤醒/检查/安装都在 `initialize` 应答之前跑完，
-	// 所以四段之和必须小于注册配置的 `timeout`，否则冷箱唤醒或安装会被提前报死。
-	it("autoInstall=true 时「唤醒 ×2 + 检查 + 安装」< 注册的 per-request timeout", () => {
-		const script = buildHelperScript({ remotePath: REMOTE_PATH, autoInstall: true });
-		const budgets = [...script.matchAll(/--timeout (\d+) --/g)].map((match) => Number(match[1]));
-		// 两段：检查 + 安装（最后一段 `instabox ssh` 不设 `--timeout`）
-		expect(budgets).toEqual([10, 40]);
-		const checked = budgets.reduce((sum, seconds) => sum + seconds, 0);
-		// 唤醒/拉起没有 `--timeout` 可设，上界由 shell 的 `timeout` 包装给出（wake + start 各一次）
-		const preambleWorstCase = PREPARE_TIMEOUT_SECONDS * 2 + checked;
-		expect(preambleWorstCase).toBe(170);
-		expect(preambleWorstCase).toBeLessThan(
-			buildMcpServerConfig({ ...DEFAULT_CONFIG, devToolsBox: "agent" }, PATHS).config.timeout,
-		);
-	});
-});
-
-describe("buildHelperScript 的 sh 引号转义", () => {
-	it("PATH 里的单引号写成 '\\''，不破出字面量", () => {
-		const script = buildHelperScript({ remotePath: "/opt/it's/bin", autoInstall: true });
-		expect(script).toContain(String.raw`remote_path='/opt/it'\''s/bin'`);
-	});
-
-	it("转义后的行引号成对（POSIX 单引号字面量可闭合）", () => {
-		const script = buildHelperScript({ remotePath: "/a'b'c", autoInstall: true });
-		const line = linesOf(script).find((candidate) => candidate.startsWith("remote_path="));
-		expect(line).toBe(String.raw`remote_path='/a'\''b'\''c'`);
-		// 引号总数成对，字面量能闭合
-		expect((line?.match(/'/g) ?? []).length % 2).toBe(0);
-	});
-
-	it("`$` 与反引号不会被脚本解释（单引号内原样）", () => {
-		const script = buildHelperScript({ remotePath: "/opt/$HOME/`id`/bin", autoInstall: true });
-		expect(script).toContain("remote_path='/opt/$HOME/`id`/bin'");
-		// 唯一的使用点仍然走变量，不做二次展开
-		expect(script).toContain('--env "PATH=$remote_path"');
-	});
-});
-
-describe("ensureHelperScript", () => {
-	const file = PATHS.helperScript;
-
-	it("写到 <agentDir>/pi-instabox/bin/devtools-connect.sh，mkdir -p + 写 + chmod 0o755", () => {
-		expect(file).toBe(path.join(path.sep, "tmp", "agent", "pi-instabox", "bin", "devtools-connect.sh"));
-		const { io, calls, dirs, files, modes } = fakeFileSystem();
-		const result = ensureHelperScript({ paths: PATHS, remotePath: REMOTE_PATH, autoInstall: true, fs: io });
-		expect(result).toEqual({ ok: true });
-		expect(calls).toEqual(["ensureDir", "writeText", "setMode"]);
-		expect(dirs).toEqual([path.dirname(file)]);
-		expect(files.get(file)).toBe(buildHelperScript({ remotePath: REMOTE_PATH, autoInstall: true }));
-		expect(modes.get(file)).toBe(0o755);
-	});
-
-	it("幂等：连调两次得到同一份内容与同一权限位", () => {
-		const { io, calls, files, modes } = fakeFileSystem();
-		ensureHelperScript({ paths: PATHS, remotePath: REMOTE_PATH, autoInstall: true, fs: io });
-		const first = files.get(file);
-		const again = ensureHelperScript({ paths: PATHS, remotePath: REMOTE_PATH, autoInstall: true, fs: io });
-		expect(again).toEqual({ ok: true });
-		expect(files.get(file)).toBe(first);
-		expect(modes.get(file)).toBe(0o755);
-		expect(calls.filter((call) => call === "writeText").length).toBe(2);
-	});
-
-	it("autoInstall 透传到脚本内容", () => {
-		const { io, files } = fakeFileSystem();
-		ensureHelperScript({ paths: PATHS, remotePath: REMOTE_PATH, autoInstall: false, fs: io });
-		expect(files.get(file)).toBe(buildHelperScript({ remotePath: REMOTE_PATH, autoInstall: false }));
-	});
-
-	for (const step of ["ensureDir", "writeText", "setMode"] as const) {
-		it(`${step} 失败：只 warn 一次并返回 { ok: false }，不抛异常`, () => {
-			const warnings: string[] = [];
-			const { io } = fakeFileSystem(step);
-			let result: EnsureHelperScriptResult = { ok: true };
-			expect(() => {
-				result = ensureHelperScript({
-					paths: PATHS,
-					remotePath: REMOTE_PATH,
-					autoInstall: true,
-					fs: io,
-					warn: (message) => warnings.push(message),
-				});
-			}).not.toThrow();
-			expect(result.ok).toBe(false);
-			expect(result.error).toBe(`${step}: EACCES`);
-			expect(warnings.length).toBe(1);
-			expect(warnings[0]).toContain(file);
-			expect(warnings[0]).toContain(`${step}: EACCES`);
-		});
-	}
-
-	it("没注入 warn 时失败依然静默返回（不替代调用方报错）", () => {
-		const { io } = fakeFileSystem("writeText");
-		expect(ensureHelperScript({ paths: PATHS, remotePath: REMOTE_PATH, autoInstall: true, fs: io })).toEqual({
-			ok: false,
-			error: "writeText: EACCES",
-		});
-	});
-
-	it("埋点：写盘成功/失败各一条 devtools.helper，带 path 与 error", () => {
-		const logger = createMemoryLogger();
-		const okIo = fakeFileSystem();
-		const failingIo = fakeFileSystem("setMode");
-		setLogger(logger);
-		try {
-			ensureHelperScript({ paths: PATHS, remotePath: REMOTE_PATH, autoInstall: true, fs: okIo.io });
-			ensureHelperScript({ paths: PATHS, remotePath: REMOTE_PATH, autoInstall: true, fs: failingIo.io });
-		} finally {
-			setLogger(undefined);
-		}
-
-		const records = logger.records.filter((record) => record.event === "devtools.helper");
-		expect(records).toHaveLength(2);
-		expect(records[0]?.fields).toEqual({ ok: true, path: file });
-		expect(records[1]?.fields).toEqual({ ok: false, path: file, error: "setMode: EACCES" });
-	});
-});
 
 describe("buildMcpServerConfig", () => {
-	const cfg = { ...DEFAULT_CONFIG, devToolsBox: "agent" };
-	const registration = buildMcpServerConfig(cfg, PATHS);
+	const cfg = config();
+	const registration = buildMcpServerConfig(cfg);
 
 	it("server 名固定为 instabox-devtools（只允许这一种拼写）", () => {
 		expect(registration.name).toBe("instabox-devtools");
 	});
 
-	it("command 是 helper 绝对路径，args = [box, ...devToolsArgs]", () => {
-		expect(registration.config.command).toBe(PATHS.helperScript);
-		expect(registration.config.args).toEqual(["agent", ...DEFAULT_CONFIG.devToolsArgs]);
+	it("command 是 `instabox`，args 就是 `ssh <box> -- env PATH=… chrome-devtools-mcp …`", () => {
+		expect(registration.config.command).toBe("instabox");
+		expect(registration.config.args).toEqual([
+			"ssh",
+			"agent",
+			"--",
+			"env",
+			`PATH=${REMOTE_PATH}`,
+			DEVTOOLS_BIN,
+			...DEFAULT_CONFIG.devToolsArgs,
+		]);
 		// 不与配置共享数组引用：改配置不影响已构造的注册参数
 		expect(registration.config.args).not.toBe(cfg.devToolsArgs);
-		expect(registration.config.args.length).toBe(DEFAULT_CONFIG.devToolsArgs.length + 1);
 	});
 
-	it("exposure 钉 codemode、timeout 180（每请求秒数，覆盖唤醒 + 检查 + 安装）", () => {
+	it("exposure 钉 codemode、timeout 180（每请求秒数）", () => {
 		expect(registration.config.exposure).toBe("codemode");
 		expect(registration.config.timeout).toBe(180);
 	});
@@ -333,22 +97,181 @@ describe("buildMcpServerConfig", () => {
 		expect(description.split("instabox_devtools").length).toBe(2);
 	});
 
-	it("换 box 只改 args[0]，其余字段不变", () => {
-		const other = buildMcpServerConfig({ ...cfg, devToolsBox: "libretv" }, PATHS);
-		expect(other.name).toBe(registration.name);
-		expect(other.config.args[0]).toBe("libretv");
-		expect(other.config.command).toBe(registration.config.command);
-		expect(other.config.description).not.toBe(registration.config.description);
-		expect(other.config.description).toContain("instabox 'libretv'");
-	});
-
 	it("显式 box 参数覆盖 cfg.devToolsBox（flag / `/instabox-devtools on` 的动态路径）", () => {
-		const dynamic = buildMcpServerConfig(cfg, PATHS, "libretv");
-		expect(dynamic.name).toBe(registration.name);
-		expect(dynamic.config.args).toEqual(["libretv", ...DEFAULT_CONFIG.devToolsArgs]);
+		const dynamic = buildMcpServerConfig(cfg, "libretv");
+		expect(dynamic.config.args.slice(0, 2)).toEqual(["ssh", "libretv"]);
 		expect(dynamic.config.description).toContain("instabox 'libretv'");
 		// cfg 本身不被写回：同一份配置可以反复构造不同 box 的注册
 		expect(cfg.devToolsBox).toBe("agent");
-		expect(buildMcpServerConfig(cfg, PATHS).config.args[0]).toBe("agent");
+		expect(buildMcpServerConfig(cfg).config.args[1]).toBe("agent");
+	});
+
+	it("PATH 来自 cfg.remotePath，不硬编码", () => {
+		const custom = buildMcpServerConfig(config({ remotePath: "/custom/bin" }));
+		expect(custom.config.args[4]).toBe("PATH=/custom/bin");
+		expect(custom.config.args).not.toContain(`PATH=${REMOTE_PATH}`);
+	});
+});
+
+/** 假 `ensureReady`：记录调用参数，返回给定结果（默认成功）。 */
+function createFakeEnsureReady(result: EnsureReadyResult = { ok: true }) {
+	const calls: { box: string; opts?: PoolGetOptions }[] = [];
+	const ensureReady: Pool["ensureReady"] = async (box, opts) => {
+		calls.push({ box, opts });
+		return result;
+	};
+	return { ensureReady, calls };
+}
+
+describe("prepareDevTools", () => {
+	it("先 `ensureReady(box, { allowWake: true })`，成功后只做远端检查（没有唤醒链）", async () => {
+		const { exec, calls } = createFakeExec();
+		const { ensureReady, calls: readyCalls } = createFakeEnsureReady();
+
+		expect(await prepareDevTools({ exec, ensureReady, box: "agent", cfg: config() })).toEqual({ ok: true });
+		expect(readyCalls).toEqual([{ box: "agent", opts: { allowWake: true, signal: undefined } }]);
+		// 唤醒链在 `pool.ensureReady` 里，这里只有那一条远端检查
+		expect(calls.map((call) => call[1])).toEqual(["exec"]);
+	});
+
+	it("远端检查就是 `instabox exec <box> --env PATH=… --timeout 20 -- sh -c 'command -v chrome-devtools-mcp'`", async () => {
+		const { exec, calls } = createFakeExec();
+		const { ensureReady } = createFakeEnsureReady();
+
+		await prepareDevTools({ exec, ensureReady, box: "agent", cfg: config() });
+		expect(calls).toContainEqual([
+			"instabox",
+			"exec",
+			"agent",
+			"--env",
+			`PATH=${REMOTE_PATH}`,
+			"--timeout",
+			"20",
+			"--",
+			"sh",
+			"-c",
+			`command -v ${DEVTOOLS_BIN}`,
+		]);
+	});
+
+	it("`ensureReady` 失败 → 整体 ok:false 且沿用它的 error，零远端命令", async () => {
+		const { exec, calls } = createFakeExec();
+		const { ensureReady } = createFakeEnsureReady({
+			ok: false,
+			error: 'could not wake box "agent": instabox wake agent reported an error: machine_not_running',
+		});
+
+		const result = await prepareDevTools({ exec, ensureReady, box: "agent", cfg: config() });
+
+		expect(result).toEqual({
+			ok: false,
+			error: 'could not wake box "agent": instabox wake agent reported an error: machine_not_running',
+		});
+		expect(calls).toEqual([]);
+	});
+
+	it("`ensureReady` 抛错 → ok:false，不外抛", async () => {
+		const { exec } = createFakeExec();
+		const ensureReady: Pool["ensureReady"] = async () => {
+			throw new Error("pool exploded");
+		};
+
+		expect(await prepareDevTools({ exec, ensureReady, box: "agent", cfg: config() })).toEqual({
+			ok: false,
+			error: "pool exploded",
+		});
+	});
+
+	it("远端缺包且 autoInstallDevTools → 装一次 `sudo -n env PATH=… npm i -g chrome-devtools-mcp`（60 秒）", async () => {
+		const { exec, calls, timeouts } = createFakeExec({ hasBinary: false });
+		const { ensureReady } = createFakeEnsureReady();
+
+		expect(await prepareDevTools({ exec, ensureReady, box: "agent", cfg: config() })).toEqual({ ok: true });
+		expect(calls).toContainEqual([
+			"instabox",
+			"exec",
+			"agent",
+			"--env",
+			`PATH=${REMOTE_PATH}`,
+			"--timeout",
+			"60",
+			"--",
+			"sudo",
+			"-n",
+			"env",
+			`PATH=${REMOTE_PATH}`,
+			"npm",
+			"i",
+			"-g",
+			DEVTOOLS_BIN,
+		]);
+		// 本地兜底超时比远端 60 秒宽（先让 CLI 自己超时）
+		expect(timeouts[calls.findIndex((call) => call.includes("npm"))]).toBeGreaterThan(60_000);
+	});
+
+	it("autoInstallDevTools=false → 缺包也不装，只 warn（结果仍 ok）", async () => {
+		const { exec, calls } = createFakeExec({ hasBinary: false });
+		const { ensureReady } = createFakeEnsureReady();
+		const warnings: string[] = [];
+
+		const result = await prepareDevTools({
+			exec,
+			ensureReady,
+			box: "agent",
+			cfg: config({ autoInstallDevTools: false }),
+			warn: (message) => warnings.push(message),
+		});
+		expect(result).toEqual({ ok: true });
+		expect(calls.some((call) => call.includes("npm"))).toBe(false);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain(DEVTOOLS_BIN);
+		expect(warnings[0]).toContain("autoInstallDevTools=false");
+	});
+
+	it("安装失败 → 只 warn，结果仍是 ok（不阻断注册）", async () => {
+		const { exec } = createFakeExec({ hasBinary: false, installOk: false });
+		const { ensureReady } = createFakeEnsureReady();
+		const warnings: string[] = [];
+
+		const result = await prepareDevTools({
+			exec,
+			ensureReady,
+			box: "agent",
+			cfg: config(),
+			warn: (message) => warnings.push(message),
+		});
+		expect(result).toEqual({ ok: true });
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain("安装");
+		expect(warnings[0]).toContain("boom");
+	});
+
+	it("埋点：devtools.prepare 一次一条（ok/ms/error），安装另记 devtools.install", async () => {
+		const logger = createMemoryLogger();
+		setLogger(logger);
+		try {
+			const ok = createFakeExec({ hasBinary: false });
+			const okReady = createFakeEnsureReady();
+			await prepareDevTools({ exec: ok.exec, ensureReady: okReady.ensureReady, box: "agent", cfg: config() });
+
+			const failing = createFakeExec();
+			const failingReady = createFakeEnsureReady({ ok: false, error: "box is not usable" });
+			await prepareDevTools({
+				exec: failing.exec,
+				ensureReady: failingReady.ensureReady,
+				box: "agent",
+				cfg: config(),
+			});
+		} finally {
+			setLogger(undefined);
+		}
+
+		const prepare = logger.records.filter((record) => record.event === "devtools.prepare");
+		expect(prepare).toHaveLength(2);
+		expect(prepare[0]?.fields).toMatchObject({ box: "agent", ok: true });
+		expect(prepare[0]?.fields?.error).toBeUndefined();
+		expect(prepare[1]?.level).toBe("warn");
+		expect(prepare[1]?.fields).toMatchObject({ box: "agent", ok: false, error: "box is not usable" });
+		expect(logger.records.some((record) => record.event === "devtools.install")).toBe(true);
 	});
 });

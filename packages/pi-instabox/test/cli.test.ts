@@ -373,6 +373,26 @@ describe("execRemote", () => {
 		]);
 	});
 
+	it("envPath 加 `--env PATH=<值>`，位置在 `--timeout` 之前（DevTools 准备阶段的远端检查）", async () => {
+		const { exec, calls } = recordingExec(okResult());
+		await execRemote(exec, "agent", ["sh", "-c", "command -v chrome-devtools-mcp"], {
+			timeoutMs: 20_000,
+			envPath: "/opt/npm/bin:/usr/bin",
+		});
+		expect(calls[0]?.args).toEqual([
+			"exec",
+			"agent",
+			"--env",
+			"PATH=/opt/npm/bin:/usr/bin",
+			"--timeout",
+			"20",
+			"--",
+			"sh",
+			"-c",
+			"command -v chrome-devtools-mcp",
+		]);
+	});
+
 	it("timeoutMs 向上取整成秒并钳制到 600 秒上限", async () => {
 		const { exec, calls } = recordingExec(okResult());
 		await execRemote(exec, "agent", ["true"], { timeoutMs: 900_000 });

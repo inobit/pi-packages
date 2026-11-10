@@ -91,23 +91,23 @@ describe("DEFAULT_CONFIG", () => {
 	});
 });
 
-describe("resolvePaths / getAgentDir（V3 四路径＋日志目录）", () => {
-	it("路径按 agentDir 展开（配置进 extensions/，状态与 helper 进 pi-instabox/，日志进 logs/pi-instabox/）", () => {
+describe("resolvePaths / getAgentDir（V3 四路径）", () => {
+	it("路径按 agentDir 展开（配置进 extensions/，状态进 pi-instabox/，日志进 logs/pi-instabox/）", () => {
 		const paths = resolvePaths(AGENT_DIR);
 		expect(paths.configFile).toBe(path.join(AGENT_DIR, "extensions", "pi-instabox", "config.json"));
 		expect(paths.stateDir).toBe(path.join(AGENT_DIR, "pi-instabox"));
 		expect(paths.templateCacheFile).toBe(path.join(AGENT_DIR, "pi-instabox", "templates.json"));
-		expect(paths.helperScript).toBe(path.join(AGENT_DIR, "pi-instabox", "bin", "devtools-connect.sh"));
 		// 生态惯例（同 `logs/pi-permission`）：扩展目录只放配置，日志与 `pi-debug.log` 同级
 		expect(paths.logDir).toBe(path.join(AGENT_DIR, "logs", "pi-instabox"));
+		// DevTools 直接注册 `instabox ssh …`，没有 helper 脚本，路径表里也就不该有它
+		expect(Object.keys(paths).sort()).toEqual(["configFile", "logDir", "stateDir", "templateCacheFile"]);
 	});
 
-	it("`PI_CODING_AGENT_DIR` 覆盖 agent 目录（helper/缓存/日志目录随之移动）", () => {
+	it("`PI_CODING_AGENT_DIR` 覆盖 agent 目录（缓存/状态/日志目录随之移动）", () => {
 		withEnv({ PI_CODING_AGENT_DIR: "/tmp/x" }, () => {
 			expect(getAgentDir()).toBe("/tmp/x");
 			expect(resolvePaths(getAgentDir()).configFile).toBe("/tmp/x/extensions/pi-instabox/config.json");
 			expect(resolvePaths(getAgentDir()).templateCacheFile).toBe("/tmp/x/pi-instabox/templates.json");
-			expect(resolvePaths(getAgentDir()).helperScript).toBe("/tmp/x/pi-instabox/bin/devtools-connect.sh");
 			expect(resolvePaths(getAgentDir()).logDir).toBe("/tmp/x/logs/pi-instabox");
 		});
 	});
