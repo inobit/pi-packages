@@ -56,8 +56,9 @@ const GLOBAL_FILE = path.join(AGENT_DIR, "extensions", "pi-instabox", "config.js
 const PROJECT_FILE = path.join(CWD, ".pi", "extensions", "pi-instabox", "config.json");
 
 describe("DEFAULT_CONFIG", () => {
-	it("默认值：两个 box 留空、autoInstall 开、PATH 钉死、5 条 devToolsArgs、7 段超时", () => {
+	it("默认值：两个 box 留空、devTools 开、autoInstall 开、PATH 钉死、5 条 devToolsArgs、7 段超时", () => {
 		expect(DEFAULT_CONFIG.defaultBox).toBe("");
+		expect(DEFAULT_CONFIG.devTools).toBe(true);
 		expect(DEFAULT_CONFIG.devToolsBox).toBe("");
 		expect(DEFAULT_CONFIG.autoInstallDevTools).toBe(true);
 		expect(DEFAULT_CONFIG.remotePath).toBe("/opt/npm/bin:/usr/local/bin:/usr/bin:/bin");
@@ -134,6 +135,7 @@ describe("normalizeConfig（纯函数，不 throw）", () => {
 	it("合法字段全覆盖生效", () => {
 		const cfg = normalizeConfig({
 			defaultBox: "agent",
+			devTools: false,
 			devToolsBox: "libretv",
 			autoInstallDevTools: false,
 			remotePath: "/usr/local/bin:/usr/bin",
@@ -142,6 +144,7 @@ describe("normalizeConfig（纯函数，不 throw）", () => {
 		});
 		expect(cfg).toEqual({
 			defaultBox: "agent",
+			devTools: false,
 			devToolsBox: "libretv",
 			autoInstallDevTools: false,
 			remotePath: "/usr/local/bin:/usr/bin",
@@ -153,6 +156,7 @@ describe("normalizeConfig（纯函数，不 throw）", () => {
 	it("未知类型逐字段回落默认值（不污染其它字段）", () => {
 		const cfg = normalizeConfig({
 			defaultBox: 5,
+			devTools: "yes",
 			devToolsBox: null,
 			autoInstallDevTools: "yes",
 			remotePath: "",
@@ -162,6 +166,12 @@ describe("normalizeConfig（纯函数，不 throw）", () => {
 		});
 		expect(cfg).toEqual(DEFAULT_CONFIG);
 		expect((cfg as unknown as Record<string, unknown>)["unknownKey"]).toBeUndefined();
+	});
+
+	it("devTools：默认 true，显式 false/true 原样生效", () => {
+		expect(normalizeConfig(undefined).devTools).toBe(true);
+		expect(normalizeConfig({ devTools: false }).devTools).toBe(false);
+		expect(normalizeConfig({ devTools: true }).devTools).toBe(true);
 	});
 
 	it("devToolsArgs：显式 [] 表示清空", () => {
@@ -253,7 +263,7 @@ describe("loadConfig（逐层叠加）", () => {
 });
 
 describe("环境变量层（最后覆盖）", () => {
-	it("四个 INSTABOX_MCP_* 覆盖文件层", () => {
+	it("五个 INSTABOX_MCP_* 覆盖文件层（含 devTools）", () => {
 		const fsMemory = memoryFs(
 			new Map([[GLOBAL_FILE, JSON.stringify({ defaultBox: "file-box", devToolsBox: "file-devtools" })]]),
 		);
@@ -263,26 +273,39 @@ describe("环境变量层（最后覆盖）", () => {
 			...fsMemory,
 			env: {
 				INSTABOX_MCP_DEFAULT_BOX: "env-box",
+				INSTABOX_MCP_DEVTOOLS: "0",
 				INSTABOX_MCP_DEVTOOLS_BOX: "env-devtools",
 				INSTABOX_MCP_AUTO_INSTALL: "0",
 				INSTABOX_MCP_PATH: "/custom/bin:/usr/bin",
 			},
 		});
 		expect(cfg.defaultBox).toBe("env-box");
+		expect(cfg.devTools).toBe(false);
 		expect(cfg.devToolsBox).toBe("env-devtools");
 		expect(cfg.autoInstallDevTools).toBe(false);
 		expect(cfg.remotePath).toBe("/custom/bin:/usr/bin");
 	});
 
-	it("空串与非法值忽略（`AUTO_INSTALL` 只认 0/1，其余不动默认 true）", () => {
+	it("INSTABOX_MCP_DEVTOOLS 覆盖配置层的 devTools=false", () => {
+		const fsMemory = memoryFs(new Map([[GLOBAL_FILE, JSON.stringify({ devTools: false })]]));
+		expect(loadConfig({ agentDir: AGENT_DIR, cwd: CWD, ...fsMemory, env: { INSTABOX_MCP_DEVTOOLS: "1" } }).devTools).toBe(
+			true,
+		);
+		expect(normalizeEnvOverlay({ INSTABOX_MCP_DEVTOOLS: "0" })).toEqual({ devTools: false });
+		expect(normalizeEnvOverlay({ INSTABOX_MCP_DEVTOOLS: "1" })).toEqual({ devTools: true });
+	});
+
+	it("空串与非法值忽略（`AUTO_INSTALL` / `DEVTOOLS` 只认 0/1，其余不动默认）", () => {
 		expect(
 			normalizeEnvOverlay({
 				INSTABOX_MCP_DEFAULT_BOX: "",
+				INSTABOX_MCP_DEVTOOLS: "",
 				INSTABOX_MCP_DEVTOOLS_BOX: "",
 				INSTABOX_MCP_AUTO_INSTALL: "false",
 				INSTABOX_MCP_PATH: "",
 			}),
 		).toEqual({});
+		expect(normalizeEnvOverlay({ INSTABOX_MCP_DEVTOOLS: "false" })).toEqual({});
 		expect(normalizeEnvOverlay({ INSTABOX_MCP_AUTO_INSTALL: "1" })).toEqual({ autoInstallDevTools: true });
 	});
 });
@@ -294,6 +317,7 @@ describe("VITEST 短路", () => {
 		withEnv(
 			{
 				INSTABOX_MCP_DEFAULT_BOX: undefined,
+				INSTABOX_MCP_DEVTOOLS: undefined,
 				INSTABOX_MCP_DEVTOOLS_BOX: undefined,
 				INSTABOX_MCP_AUTO_INSTALL: undefined,
 				INSTABOX_MCP_PATH: undefined,
@@ -304,6 +328,7 @@ describe("VITEST 短路", () => {
 					const cfg = loadConfig({ agentDir: AGENT_DIR, cwd: CWD, isTrusted: true, ...fsMemory });
 					expect(cfg.defaultBox).toBe("env-box");
 					expect(cfg.devToolsBox).toBe("");
+					expect(cfg.devTools).toBe(true);
 				});
 			},
 		);

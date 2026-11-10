@@ -56,7 +56,14 @@ export interface InstaboxTimeouts {
 export interface InstaboxConfig {
 	/** 解析链靠后的兜底目标；空串＝未配置（退到「`instabox ls` 第一台」） */
 	defaultBox: string;
-	/** DevTools 唯一对应的 box；空串＝该能力整体不存在（不注册 MCP、不提示） */
+	/**
+	 * 远端 DevTools MCP 的开关（默认 `true`）：`on` 注册、`off` 完全不碰该能力。
+	 *
+	 * 优先级（高到低）：`--instabox-devtools` / `--no-instabox-devtools` → `INSTABOX_MCP_DEVTOOLS`
+	 * → 本字段。它只决定开关，不提供箱名（箱名见 {@link devToolsBox}）。
+	 */
+	devTools: boolean;
+	/** DevTools 唯一对应的 box；空串＝没有默认箱（开关开着时会提示一次并拒绝注册） */
 	devToolsBox: string;
 	/** 指定了 devToolsBox 但远端没装 `chrome-devtools-mcp` 时，连接前尝试自动安装 */
 	autoInstallDevTools: boolean;
@@ -69,6 +76,7 @@ export interface InstaboxConfig {
 
 export const DEFAULT_CONFIG: InstaboxConfig = {
 	defaultBox: "",
+	devTools: true,
 	devToolsBox: "",
 	autoInstallDevTools: true,
 	remotePath: "/opt/npm/bin:/usr/local/bin:/usr/bin:/bin",
@@ -141,6 +149,7 @@ export function resolvePaths(agentDir: string): InstaboxPaths {
 /** 单层覆盖：只含逐字段合法的值；非法字段直接缺席（＝保留底层值） */
 export interface InstaboxConfigOverlay {
 	defaultBox?: string;
+	devTools?: boolean;
 	devToolsBox?: string;
 	autoInstallDevTools?: boolean;
 	remotePath?: string;
@@ -191,6 +200,8 @@ export function normalizeConfigOverlay(raw: unknown): InstaboxConfigOverlay {
 	const out: InstaboxConfigOverlay = {};
 	const defaultBox = rec["defaultBox"];
 	if (typeof defaultBox === "string") out.defaultBox = defaultBox;
+	const devTools = rec["devTools"];
+	if (typeof devTools === "boolean") out.devTools = devTools;
 	const devToolsBox = rec["devToolsBox"];
 	if (typeof devToolsBox === "string") out.devToolsBox = devToolsBox;
 	const autoInstallDevTools = rec["autoInstallDevTools"];
@@ -208,6 +219,7 @@ export function normalizeConfigOverlay(raw: unknown): InstaboxConfigOverlay {
 export function applyOverlay(base: InstaboxConfig, overlay: InstaboxConfigOverlay): InstaboxConfig {
 	return {
 		defaultBox: overlay.defaultBox ?? base.defaultBox,
+		devTools: overlay.devTools ?? base.devTools,
 		devToolsBox: overlay.devToolsBox ?? base.devToolsBox,
 		autoInstallDevTools: overlay.autoInstallDevTools ?? base.autoInstallDevTools,
 		remotePath: overlay.remotePath ?? base.remotePath,
@@ -221,9 +233,14 @@ export function normalizeConfig(raw: unknown): InstaboxConfig {
 	return applyOverlay(DEFAULT_CONFIG, normalizeConfigOverlay(raw));
 }
 
-/** 环境变量名（`INSTABOX_MCP_AUTO_INSTALL` 取值 `0|1`，`INSTABOX_MCP_PATH` 喂远端命令的 PATH） */
-const ENV_KEYS = {
+/**
+ * 环境变量名（`INSTABOX_MCP_AUTO_INSTALL` / `INSTABOX_MCP_DEVTOOLS` 取值 `0|1`，
+ * `INSTABOX_MCP_PATH` 喂远端命令的 PATH）。装配层复用 {@link ENV_KEYS} 判定开关来源，
+ * 因此在配置里统一命名一次。
+ */
+export const ENV_KEYS = {
 	defaultBox: "INSTABOX_MCP_DEFAULT_BOX",
+	devTools: "INSTABOX_MCP_DEVTOOLS",
 	devToolsBox: "INSTABOX_MCP_DEVTOOLS_BOX",
 	autoInstall: "INSTABOX_MCP_AUTO_INSTALL",
 	remotePath: "INSTABOX_MCP_PATH",
@@ -231,11 +248,14 @@ const ENV_KEYS = {
 
 export type EnvLike = Record<string, string | undefined>;
 
-/** 环境变量层：空串＝未设置（忽略）；`INSTABOX_MCP_AUTO_INSTALL` 只认 `0`/`1` */
+/** 环境变量层：空串＝未设置（忽略）；`INSTABOX_MCP_DEVTOOLS` / `INSTABOX_MCP_AUTO_INSTALL` 只认 `0`/`1` */
 export function normalizeEnvOverlay(env: EnvLike): InstaboxConfigOverlay {
 	const overlay: InstaboxConfigOverlay = {};
 	const defaultBox = env[ENV_KEYS.defaultBox];
 	if (defaultBox) overlay.defaultBox = defaultBox;
+	const devTools = env[ENV_KEYS.devTools];
+	if (devTools === "0") overlay.devTools = false;
+	else if (devTools === "1") overlay.devTools = true;
 	const devToolsBox = env[ENV_KEYS.devToolsBox];
 	if (devToolsBox) overlay.devToolsBox = devToolsBox;
 	const autoInstall = env[ENV_KEYS.autoInstall];

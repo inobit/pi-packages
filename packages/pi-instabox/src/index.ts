@@ -22,12 +22,16 @@
  *    装配失败 / 无 CLI 时**只**写日志，不建 `templates.json` 等运行期目录。
  * 3. 命令 `/instabox-use`（含冷启动唯一重试入口）、`/instabox-status`（诊断）与
  *    `/instabox-devtools`（`status` / `on [box]` / `off` / `reset`，动态开关远端 MCP）、目标 entry
- *    renderer、两个 CLI flag（`--instabox-devtools` / `--instabox-devtools-box`，必须在工厂最前面登记，
- *    否则 pi 会把它们当成未知选项直接 exit(1)）。
- *    **DevTools MCP 默认关闭**：只有 `--instabox-devtools`（或 `/instabox-devtools on`）能开启；
- *    box 的优先级是**会话绑定 > `--instabox-devtools-box` > `config.devToolsBox`**，会话绑定由
+ *    renderer、三个 CLI flag（`--instabox-devtools` / `--no-instabox-devtools` /
+ *    `--instabox-devtools-box`，必须在工厂最前面登记，否则 pi 会把它们当成未知选项直接 exit(1)）。
+ *    **DevTools MCP 默认开启**（`config.devTools` 默认 `true`），开关优先级是 CLI flag（两个布尔，
+ *    显式者优先）> 环境变量 `INSTABOX_MCP_DEVTOOLS` > `config.devTools`；box 的优先级是
+ *    **会话绑定 > `--instabox-devtools-box` > `config.devToolsBox`**，会话绑定由
  *    `/instabox-devtools on <box>` 写成一条 entry（`reset` 写清除标记，不改开关、不注销）。
  *    加载期读不到命令行 flag 值，所以判定一律在 `session_start` 之后。
+ *    **默认开启不打扰用户**：开关开着但缺 box / box 不在 `ls` 里 / 唤醒或安装失败都**不注册也不提示**
+ *    （只 `debug()`，`PI_INSTABOX_DEBUG=1` 可见；唤醒/安装/注册的失败另落 `warn` 级日志）；
+ *    只有显式动作（`--instabox-devtools`、`/instabox-devtools on`）才把同样的失败报成 warning。
  *    **普通注册，没有中间层**：DevTools MCP 就是一条 `instabox ssh <box> -- env PATH=…
  *    chrome-devtools-mcp …` 的 stdio 配置（效果等同于手写 `mcp.json`），不生成脚本、不落盘。
  *    前置工作因此在注册**之前**用普通函数做完（`prepareDevTools`：唤醒箱 + 确保远端可执行）；
@@ -72,7 +76,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { type BoxInfo, createBoxLister } from "./boxes.ts";
 import { type ExecFn, type ProbeVersionResult, probeVersion } from "./cli.ts";
-import { getAgentDir, loadConfig, resolvePaths } from "./config.ts";
+import { ENV_KEYS, getAgentDir, loadConfig, resolvePaths } from "./config.ts";
 import { buildMcpServerConfig, prepareDevTools } from "./devtools.ts";
 import { createTargetRendererWithHostText } from "./entry-render.ts";
 import { type LogLevel, type Logger, createFileLogger, logEvent, setLogger } from "./log.ts";
@@ -118,16 +122,19 @@ const CODEMODE_LABELS = {
 	unavailable: "unavailable (no codemode tool in this session)",
 } as const;
 
-/** 开关 flag：**唯一**能开启远端 DevTools MCP 的入口（config 只补默认 box）。 */
+/** 开 flag：强制打开远端 DevTools MCP（覆盖 `devTools: false` / `INSTABOX_MCP_DEVTOOLS=0`）。 */
 const DEVTOOLS_FLAG = "instabox-devtools";
+
+/** 关 flag：强制关闭（覆盖默认开启的 `devTools: true`）；两个 flag 都给时以开 flag 为准。 */
+const DEVTOOLS_OFF_FLAG = "no-instabox-devtools";
 
 /** box flag：覆盖 `config.devToolsBox` 的默认箱名；空串＝没给。 */
 const DEVTOOLS_BOX_FLAG = "instabox-devtools-box";
 
-/** 只给了 box flag、没给开关：明说怎么开启，不静默启用（config 里的 box 同理）。 */
+/** 开关显式关着、却只给了 box flag：明说怎么强制开启，不静默启用。 */
 const DEVTOOLS_SWITCH_MISSING_MESSAGE = "instabox: 已指定 box 但未开启 devtools，请加 --instabox-devtools";
 
-/** 开关开着但三个来源都没给箱名：不猜，直接不注册。 */
+/** 开关开着但三个来源都没给箱名：不猜，直接不注册（只在显式开启时提示，默认开启只 debug）。 */
 const DEVTOOLS_NO_BOX_MESSAGE =
 	"instabox: 未指定 devtools box（--instabox-devtools-box 或 config.devToolsBox），DevTools MCP 未注册";
 
@@ -147,6 +154,19 @@ type CodemodeState = keyof typeof CODEMODE_LABELS;
  * DevTools box 的三个来源（优先级同序）：会话绑定 > `--instabox-devtools-box` > `config.devToolsBox`。
  */
 type DevtoolsBoxSource = "session" | "flag" | "config";
+
+/**
+ * 开关（`devTools`）的四个来源，与 {@link DevtoolsBoxSource} 是两件事：`flag`（两个 CLI flag）、
+ * `env`（`INSTABOX_MCP_DEVTOOLS`）、`config`（`config.devTools`）、`command`（`/instabox-devtools
+ * on|off` 写的本会话运行期覆盖）。`status` 的开关行按它回显。
+ */
+type DevtoolsSwitchSource = "flag" | "env" | "config" | "command";
+
+/** 一次开关判定的结果：`on` = 该能力开着，`source` = 这个结论从哪来。 */
+interface DevtoolsSwitch {
+	on: boolean;
+	source: DevtoolsSwitchSource;
+}
 
 /**
  * 一次 DevTools 注册的来源（`devtools.enabled` 与 `status` 回显）：
@@ -316,15 +336,20 @@ export default async function instaboxExtension(
 	pi: ExtensionAPI,
 	deps: InstaboxAssemblyDeps = {},
 ): Promise<void> {
-	// —— 工厂最前面：登记两个 CLI flag ——
-	// pi 只在扩展加载期判定 flag 合法性，未登记的 flag 会让进程直接 exit(1)，所以这两条必须
+	// —— 工厂最前面：登记三个 CLI flag ——
+	// pi 只在扩展加载期判定 flag 合法性，未登记的 flag 会让进程直接 exit(1)，所以这三条必须
 	// 早于配置解析、日志接线与 CLI 探测。这里只登记；加载期 `getFlag()` 读到的仍是默认值
 	// （命令行值在扩展加载完成之后才写进 `runtime.flagValues`），真正的判定在 `session_start`
-	// 之后（见 `assemble()` 里的 `devToolsSwitchOn`）。
+	// 之后（见 `assemble()` 里的 `devToolsSwitch`）。
 	pi.registerFlag(DEVTOOLS_FLAG, {
 		type: "boolean",
 		default: false,
-		description: "Enable the remote chrome-devtools-mcp server (default: disabled)",
+		description: "Enable the remote chrome-devtools-mcp server (overrides devTools: false)",
+	});
+	pi.registerFlag(DEVTOOLS_OFF_FLAG, {
+		type: "boolean",
+		default: false,
+		description: "Disable the remote chrome-devtools-mcp server (overrides devTools: true)",
 	});
 	pi.registerFlag(DEVTOOLS_BOX_FLAG, {
 		type: "string",
@@ -737,8 +762,9 @@ export default async function instaboxExtension(
 		async function handleStatus(ctx: ExtensionCommandContext): Promise<void> {
 			const lines: string[] = [];
 			lines.push(
-				`config: defaultBox=${cfg.defaultBox || "(unset)"} devToolsBox=${cfg.devToolsBox || "(unset)"} autoInstallDevTools=${String(cfg.autoInstallDevTools)} remotePath=${cfg.remotePath}`,
+				`config: defaultBox=${cfg.defaultBox || "(unset)"} devTools=${String(cfg.devTools)} devToolsBox=${cfg.devToolsBox || "(unset)"} autoInstallDevTools=${String(cfg.autoInstallDevTools)} remotePath=${cfg.remotePath}`,
 			);
+			lines.push(`instabox-devtools: ${devToolsSwitchLabel(devToolsSwitch())}`);
 			lines.push(`session target: ${readTarget(branchOf(ctx)) ?? "(not set)"}`);
 			try {
 				const resolved = await resolveTarget(undefined, ctx);
@@ -789,20 +815,65 @@ export default async function instaboxExtension(
 		// —— 目标 entry 的转录渲染（R5：返回 Component，`Text` 只收到着色字符串） ——
 		pi.registerEntryRenderer(TARGET_ENTRY, createTargetRendererWithHostText());
 
-		// —— DevTools MCP：**默认关闭**，只有 `--instabox-devtools`（或 `/instabox-devtools on`）
-		//    能开启；box 的来源优先级是会话绑定 > `--instabox-devtools-box` > `config.devToolsBox` ——
+		// —— DevTools MCP：**默认开启**（`config.devTools` 默认 `true`），开关优先级是
+		//    会话覆盖（本会话 `on`/`off`）> CLI flag > `INSTABOX_MCP_DEVTOOLS` > `config.devTools`；
+		//    box 的来源优先级是会话绑定 > `--instabox-devtools-box` > `config.devToolsBox` ——
 		/** 本会话已注册的 DevTools MCP（`undefined` = 未注册）；`source` 只在 `devtools.enabled` 与 `status` 里回显 */
 		let registeredDevTools: { box: string; name: string; source: DevtoolsRegistrationSource } | undefined;
+		/** `/instabox-devtools on|off` 写的本会话运行期覆盖（`undefined` = 没覆盖，回到 flag/env/config） */
+		let commandSwitch: boolean | undefined;
 
 		/**
-		 * 开关 flag 的当前值（**只在装配完成后读**）。
+		 * 开关的当前状态与来源：本会话覆盖（`on`/`off` 命令）> CLI flag（开 flag 先于关 flag）>
+		 * `INSTABOX_MCP_DEVTOOLS` > `config.devTools`（默认 `true`）。
 		 *
-		 * pi 在扩展加载结束之后才把命令行里的 flag 值写进 `runtime.flagValues`
-		 * （`applyExtensionFlagValues` 在 `resourceLoader.reload()` 之后跑），加载期读到的永远只是
-		 * 注册时的默认值 `false`。所以判定放在 `session_start` 与命令里，不要挤回加载期。
+		 * flag 值只在装配完成后才就绪（pi 在扩展加载结束之后才把命令行值写进
+		 * `runtime.flagValues`，加载期读到的永远只是注册默认值 `false`），所以判定放在
+		 * `session_start` 与命令里，不要挤回加载期。环境变量直接读 `process.env`：`cfg.devTools`
+		 * 已经把同名变量叠进去了，但只有直读才能把「环境变量给的」与「配置给的」区分开。
 		 */
-		function devToolsSwitchOn(): boolean {
+		function devToolsSwitch(): DevtoolsSwitch {
+			if (commandSwitch !== undefined) return { on: commandSwitch, source: "command" };
+			if (pi.getFlag(DEVTOOLS_FLAG) === true) return { on: true, source: "flag" };
+			if (pi.getFlag(DEVTOOLS_OFF_FLAG) === true) return { on: false, source: "flag" };
+			const fromEnv = process.env[ENV_KEYS.devTools];
+			if (fromEnv === "0") return { on: false, source: "env" };
+			if (fromEnv === "1") return { on: true, source: "env" };
+			return { on: cfg.devTools, source: "config" };
+		}
+
+		/**
+		 * 开关行的文案：`on (config)` / `on (--instabox-devtools)` / `off (--no-instabox-devtools)` /
+		 * `on (INSTABOX_MCP_DEVTOOLS)` / `off (/instabox-devtools)`。来源比裸 `on|off` 更有用：
+		 * 默认开着时用户需要知道是哪一个入口把开关定成了现在这样。
+		 */
+		function devToolsSwitchLabel(state: DevtoolsSwitch): string {
+			const value = state.on ? "on" : "off";
+			if (state.source === "command") return `${value} (/${DEVTOOLS_FLAG})`;
+			if (state.source === "flag") return `${value} (${state.on ? "--" : "--no-"}${DEVTOOLS_FLAG})`;
+			if (state.source === "env") return `${value} (${ENV_KEYS.devTools})`;
+			return `${value} (config)`;
+		}
+
+		/**
+		 * 启动路径上是不是「用户显式要的」：只有 `--instabox-devtools` 算。
+		 *
+		 * 默认开启（`devTools: true` / `INSTABOX_MCP_DEVTOOLS=1`）属后台行为：缺 box、box 不在 `ls` 里、
+		 * 唤醒/安装失败都只落 `debug()`（`PI_INSTABOX_DEBUG=1` 才可见），不往会话里推 warning——
+		 * 用户没主动要这个能力，就不该被它打扰。`/instabox-devtools on` 走命令路径，总是提示。
+		 */
+		function devToolsExplicit(): boolean {
 			return pi.getFlag(DEVTOOLS_FLAG) === true;
+		}
+
+		/**
+		 * DevTools 的提示出口：`explicit` 为真才 `notifyOnce`，否则只 `debug()`。
+		 * 唤醒/安装/注册失败的 warn 级落盘由 `devtools.ts`（`devtools.prepare` / `devtools.install`）
+		 * 与 `devtools.register` 自己负责，这里只管「要不要打扰用户」。
+		 */
+		function devToolsNotice(explicit: boolean, key: string, message: string): void {
+			if (explicit) notifyOnce(key, message);
+			else debug(message);
 		}
 
 		/** `--instabox-devtools-box`：空串＝没给（两侧空白裁掉，与 box 名匹配口径一致） */
@@ -841,12 +912,15 @@ export default async function instaboxExtension(
 		 * `source` 记录本次注册的 box 是从哪来的：启动路径取实际生效的来源（session / flag / config），
 		 * 命令路径一律 `command`（即使最终 box 由 flag/config 提供）。
 		 * 注册前先 `prepareDevTools`（唤醒箱 → 确认 `running` → 确保远端可执行）：MCP 客户端自己
-		 * 不会唤醒箱，pi 也不会重连失败的 server，所以箱没起来就不该注册——准备失败只 notify。
+		 * 不会唤醒箱，pi 也不会重连失败的 server，所以箱没起来就不该注册。
+		 * 提示只听 `source`：命令路径一律 notify；启动路径只有 `--instabox-devtools`（显式）才 notify，
+		 * 默认开启时失败只 debug（属后台行为，不往会话里推 warning）。
 		 * 注册本身是一条普通的 `instabox ssh …` stdio 配置（不生成脚本、不落盘）；已注册时先
 		 * `unregister` 再注册，换 box 不会留下旧连接。
-		 * 返回是否注册成功（失败已经提示过，调用方不必再报一次）。
+		 * 返回是否注册成功（失败已经处理过提示，调用方不必再报一次）。
 		 */
 		async function registerDevTools(box: string, source: DevtoolsRegistrationSource): Promise<boolean> {
+			const explicit = source === "command" || devToolsExplicit();
 			const prepared = await prepareDevTools({
 				exec,
 				// 「准备一个可用的 box」只有一套实现：桌面工具走 `pool.get`（内部同一个 ensureReady）
@@ -854,10 +928,11 @@ export default async function instaboxExtension(
 				box,
 				cfg,
 				signal: sessionCtx?.signal,
-				warn: (message) => notifyOnce(`devtools-install:${box}`, message),
+				warn: (message) => devToolsNotice(explicit, `devtools-install:${box}`, message),
 			});
 			if (!prepared.ok) {
-				notifyOnce(
+				devToolsNotice(
+					explicit,
 					`devtools-prepare:${box}`,
 					`instabox: 远端 DevTools MCP 未注册（${prepared.error ?? "unknown error"}）；桌面工具不受影响。`,
 				);
@@ -870,7 +945,8 @@ export default async function instaboxExtension(
 				pi.registerMcpServer(registration.name, registration.config);
 			} catch (error) {
 				ok = false;
-				notifyOnce(
+				devToolsNotice(
+					explicit,
 					`devtools-register:${box}`,
 					`instabox: 远端 DevTools MCP 注册失败（${messageOf(error)}）；桌面工具不受影响。`,
 				);
@@ -886,26 +962,32 @@ export default async function instaboxExtension(
 		}
 
 		/**
-		 * `session_start` 后台体里的启动判定：开关关着就什么都不做（只给了 box flag 时提示一次）；
-		 * 开关开着就按「会话绑定 > flag > config」取 box，缺失 / 不在 `ls` 里则 warning + 不注册
-		 * （**不静默换机**）。会话恢复后曾 `on` 过的 box 因此能继续生效。
+		 * `session_start` 后台体里的启动判定：开关关着（`--no-instabox-devtools` /
+		 * `INSTABOX_MCP_DEVTOOLS=0` / `devTools: false` / 本会话 `off`）就什么都不做（只给了 box flag
+		 * 时提示一次）；开关开着就按「会话绑定 > flag > config」取 box。
+		 *
+		 * 失败一律不挡路：缺 box / `ls` 失败 / box 不在 `ls` 里都**不注册**（**不静默换机**），
+		 * 并且默认开启是后台行为——**不提示**，只 `debug()`；只有 `--instabox-devtools` 显式开启才 notify。
+		 * 会话恢复后曾 `on` 过的 box 因此能继续生效。
 		 */
 		async function syncDevToolsOnStartup(ctx: ExtensionContext): Promise<void> {
-			if (!devToolsSwitchOn()) {
+			if (!devToolsSwitch().on) {
 				if (devToolsFlagBox() !== "") notifyOnce("devtools-switch-missing", DEVTOOLS_SWITCH_MISSING_MESSAGE);
 				return;
 			}
 			// 本会话已注册（命令开过、或更早一次 session_start）：不重复准备，也不打扰用户
 			if (registeredDevTools !== undefined) return;
+			const explicit = devToolsExplicit();
 			const choice = devToolsBoxChoice(ctx);
 			if (choice === undefined) {
-				notifyOnce("devtools-no-box", DEVTOOLS_NO_BOX_MESSAGE);
+				devToolsNotice(explicit, "devtools-no-box", DEVTOOLS_NO_BOX_MESSAGE);
 				return;
 			}
 			const box = choice.box;
 			const listed = await boxLister.list();
 			if (!listed.ok) {
-				notifyOnce(
+				devToolsNotice(
+					explicit,
 					"devtools-ls-failed",
 					`instabox: 无法校验 devtools box "${box}"（${listed.error ?? "unknown error"}）；DevTools MCP 未注册`,
 				);
@@ -913,7 +995,8 @@ export default async function instaboxExtension(
 			}
 			if (!listed.boxes.some((candidate) => candidate.name === box)) {
 				const candidates = namesOf(listed.boxes).join(", ") || "(none)";
-				notifyOnce(
+				devToolsNotice(
+					explicit,
 					`devtools-unknown-box:${box}`,
 					`instabox: devtools box "${box}" 不在 instabox ls 里；DevTools MCP 未注册（候选：${candidates}）`,
 				);
@@ -936,7 +1019,7 @@ export default async function instaboxExtension(
 				const effective = devToolsBoxChoice(ctx);
 				ctx.ui.notify(
 					[
-						`instabox-devtools: ${devToolsSwitchOn() ? "on" : "off"} (--${DEVTOOLS_FLAG})`,
+						`instabox-devtools: ${devToolsSwitchLabel(devToolsSwitch())}`,
 						`registration: ${
 							registeredDevTools === undefined
 								? "(none)"
@@ -951,6 +1034,8 @@ export default async function instaboxExtension(
 				return;
 			}
 			if (action === "off") {
+				// 运行期覆盖：本会话保持关闭（启动判定与 `status` 都读它），`reset` 不动它
+				commandSwitch = false;
 				if (registeredDevTools === undefined) {
 					ctx.ui.notify("instabox: DevTools MCP 未注册，无操作", "info");
 					return;
@@ -993,6 +1078,8 @@ export default async function instaboxExtension(
 					return;
 				}
 				if (requested !== "") pi.appendEntry(DEVTOOLS_TARGET_ENTRY, devtoolsTargetEntryData(box));
+				// 运行期覆盖：本会话保持开启（无论 flag / 环境变量 / 配置怎么定）
+				commandSwitch = true;
 				if (!(await registerDevTools(box, "command"))) return; // 失败原因已提示
 				ctx.ui.notify(`instabox: DevTools MCP registered for box "${box}"`, "info");
 				return;
@@ -1000,7 +1087,7 @@ export default async function instaboxExtension(
 			ctx.ui.notify(`instabox: 未知参数 "${subcommand}"；${DEVTOOLS_USAGE}`, "warning");
 		}
 
-		// —— 命令：动态开关（flag 之外的运行期入口；`off` 只关本会话的注册，`reset` 只清会话绑定） ——
+		// —— 命令：动态开关（本会话运行期覆盖：`on` 置开并注册、`off` 置关并注销；`reset` 只清会话绑定） ——
 		pi.registerCommand("instabox-devtools", {
 			description: "Show, enable (on [box]), disable (off) or reset the session box of the remote DevTools MCP server",
 			handler: async (args, ctx) => {
@@ -1093,6 +1180,8 @@ export default async function instaboxExtension(
 			// 在飞的建连由池自己按代数校验丢弃（`dispose` 会把 clients 与 inflight 两侧都驱逐），
 			// 这里只把已失效的 ctx 放掉：之后的 `notifyOnce` 会走排队，等下一个会话 drain。
 			sessionCtx = undefined;
+			// 运行期开关覆盖也是会话级的：`/instabox-devtools off` 只关本会话，新会话重新按 flag/env/config 判定
+			commandSwitch = undefined;
 			logEvent("session.shutdown", { open });
 			// 本实例已收尾：复位日志单例，避免进程内遗留（下一个会话重新装配时再建）
 			setLogger(undefined);
