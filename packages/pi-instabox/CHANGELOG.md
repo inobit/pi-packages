@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.1] - 2026-11-10
+
+- fix: unify the devtools switch on `on` / `off` across the config (`"devTools": "on"`), the environment variable (`INSTABOX_MCP_DEVTOOLS=on|off`), the CLI flags and `/instabox-devtools`
+
 ## [0.2.0] - 2026-11-10
 
 - feat: enable the devtools MCP by default (`devTools: "on"`) and add `--no-instabox-devtools`
