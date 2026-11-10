@@ -2,7 +2,7 @@
 
 [English](./README.md) | **中文**
 
-在 Pi 会话里驱动 instabox 沙箱：九个 `instabox_desktop_*` 桌面工具，每次调用都明说自己打到哪台箱；另有一个绑定单台箱的远端 `chrome-devtools-mcp` server，**默认关闭**，需 `--instabox-devtools` 才开启。
+在 Pi 会话里驱动 instabox 沙箱：九个 `instabox_desktop_*` 桌面工具，每次调用都明说自己打到哪台箱；另有一个绑定单台箱的远端 `chrome-devtools-mcp` server，**默认开启**，要关闭就用 `--no-instabox-devtools` / `devTools: false` / `/instabox-devtools off`。
 
 - **每次调用都点名箱**：可选的 `box` 参数（或五级目标解析链）决定哪台沙箱执行，且每条成功结果首行固定为 `[box=<name>]`
 - **不静默降级**：箱名写错或有歧义就是错误并列出候选；唯一会降级的是失效的 `defaultBox`（每会话一条 warning）
@@ -40,13 +40,13 @@ pi install npm:@inobit/pi-instabox
 
 **`/instabox-use [box]`**——设置或查看本会话的目标箱。不带参数时打印当前目标与候选箱；箱名不存在则拒绝，原目标保留。目标以一条自定义会话条目存储（不进 LLM 上下文，按分支生效，因此 `/tree` 切分支与 `--continue` 都能恢复）。若当时还没注册任何桌面工具（冷启动、无缓存），这条命令还会唤醒该箱、拉取 `tools/list` 并注册工具——这就是会话启动时箱子没在跑的重试路径。
 
-**`/instabox-status`**——一次性诊断：配置摘要（`defaultBox`、`devToolsBox`、`autoInstallDevTools`、`remotePath`——那里出现的 `devToolsBox` 只是 DevTools 的默认箱，不是开关）、会话目标、解析出的目标及其来源、已注册的 `instabox_desktop_*` 工具与 exposure（显示为 `deferred`）、当前声明来自哪台箱的缓存模板（`tool declarations: from the cached template of box "…"`）、active tools、codemode 状态，以及扩展注册的 MCP server——`instabox-devtools` 只在 DevTools server 开着时出现在最后这一段；开关本身由 `/instabox-devtools status` 报告（见 [DevTools MCP](#devtools-mcp)）。
+**`/instabox-status`**——一次性诊断：配置摘要（`defaultBox`、`devTools`、`devToolsBox`、`autoInstallDevTools`、`remotePath`——那里出现的 `devToolsBox` 只是 DevTools 的默认箱，不是开关）、DevTools 开关及其来源（`instabox-devtools: on (config)` / `on (--instabox-devtools)` / `off (--no-instabox-devtools)` / `off (/instabox-devtools)`）、会话目标、解析出的目标及其来源、已注册的 `instabox_desktop_*` 工具与 exposure（显示为 `deferred`）、当前声明来自哪台箱的缓存模板（`tool declarations: from the cached template of box "…"`）、active tools、codemode 状态，以及扩展注册的 MCP server——`instabox-devtools` 在 DevTools server 注册期间出现在最后这一段（见 [DevTools MCP](#devtools-mcp)）。
 
-**`/instabox-devtools [status|on [box]|off|reset]`**——远端 DevTools MCP server 的运行期开关：不带参数（或 `status`）显示开关、本会话已注册的 server、会话绑定的箱，以及下一次将使用的箱及其来源（`session` / `flag` / `config`）；`on [box]` 注册或替换，给了箱名就同时把它绑到本会话；`off` 在本会话内注销它、但**不清除**该绑定；`reset` 只清会话绑定。细节见 [DevTools MCP](#devtools-mcp)。
+**`/instabox-devtools [status|on [box]|off|reset]`**——远端 DevTools MCP server 的运行期开关：不带参数（或 `status`）显示开关及其来源（`on (config)` / `on (--instabox-devtools)` / `off (--no-instabox-devtools)` / `on (INSTABOX_MCP_DEVTOOLS)` / `off (/instabox-devtools)`）、本会话已注册的 server、会话绑定的箱，以及下一次将使用的箱及其来源（`session` / `flag` / `config`）；`on [box]` 在本会话打开该能力并注册或替换 server，给了箱名就同时把它绑到本会话；`off` 在本会话关闭并注销它、但**不清除**该绑定；`reset` 只清会话绑定。细节见 [DevTools MCP](#devtools-mcp)。
 
 **工具声明的来源。**加载期命中缓存就静默注册桌面工具——零 ssh、零提示。否则会话启动在后台替你决定：有缓存时对「声明来源」那台箱做一次版本校验（会话目标 → `defaultBox` → 缓存里最近拉取的那台，均要求该箱有缓存条目）；没有缓存时先 `ls`，取**第一台 `state === "running"`** 的箱，一台 running 都没有时取列表第一台。**连接即唤醒**：无论桌面工具调用还是这个后台同步，建连前都先确保箱子在跑（`instabox wake`、再 `instabox start`、再 `instabox resume`），因此暂停的箱会在后台被唤醒——不显示进度、不阻塞会话——而不是被跳过。成功一律静默：工具出现就是唯一的成功信号。只有真的同步不了才提示：`instabox ls` 为空或失败 → 一条「没有可用沙箱」；同步本身失败 → 一条带 `/instabox-use <box>` 的提示，都是每会话一次。
 
-**codemode 前提。** `deferred` exposure 的含义是：工具已注册、可从 codemode 脚本调用，但永不声明给模型、也永不列进 codemode 描述——deferred 工具被完全排除在那段描述之外，因此不占它那 3000 token 共享预算，工具陆续注册也不会让描述变化。模型仍需知道它们存在，所以扩展在 `before_agent_start` 写一段 system prompt section（tag `instabox-desktop`，只在桌面工具已注册时写）：一行 intro 加一行 `- instabox-desktop (codemode): <描述>`，与 pi 写给 MCP 工具的 `mcp_servers` 段同款。那行描述**不是**写死的常量——它按远端数据生成：取远端 `initialize` 的 `instructions` 首行（截断到 250 字符），远端没给时回退到包内命名空间描述——因此远端升版（或任意一次重拉，例如 168 小时 TTL 到期）后，下一次注册（加载期缓存命中、`session_start` 后台同步、`/instabox-use`）就自动换上新描述，不需要改代码。内容只在远端数据变化时变，因此不会每轮产生 system prompt 补丁，也不破坏 prompt 前缀缓存。脚本里用 `describeNamespace("instabox-desktop")` 拿到命名空间与整组的工具名，用 `describeTool(name)` 取单个工具的完整声明（`ALL_TOOLS` 里也带声明），或用 `searchTools("instabox")` 做 BM25 检索。codemode 本身仍须处于激活态——只有脚本才跑得动这些工具——扩展不会替你激活 codemode，且只在**已注册桌面工具**时才判定状态（会话启动一次，`/instabox-status` 每次实时读）。若 codemode 未激活、且会话里没有 `codemode` exposure 的 MCP server，你会收到每会话一条 warning 并附带补救命令：用 `pi --tools +codemode` 启动，或在 settings 里设 `"defaultTools": ["+codemode"]`。若本会话根本没有 `codemode` 工具条目（被 `--tools` / `--exclude-tools` 剔除，或内置扩展被替换），则用另一条一次性文案明说桌面工具在本会话不可调用。配置了 DevTools server 时（`--instabox-devtools` 或 `/instabox-devtools on`），pi 会自动激活 codemode（见下文），因此两条提示都不会出现。两种情况下 `/instabox-use` 与 `/instabox-status` 都可用。
+**codemode 前提。** `deferred` exposure 的含义是:工具已注册、可从 codemode 脚本调用,但永不声明给模型、也永不列进 codemode 描述--deferred 工具被完全排除在那段描述之外,因此不占它那 3000 token 共享预算,工具陆续注册也不会让描述变化。模型仍需知道它们存在,所以扩展在 `before_agent_start` 写一段 system prompt section(tag `instabox-desktop`,只在桌面工具已注册时写):一行 intro 加一行 `- instabox-desktop (codemode): <描述>`,与 pi 写给 MCP 工具的 `mcp_servers` 段同款。那行描述**不是**写死的常量--它按远端数据生成:取远端 `initialize` 的 `instructions` 首行(截断到 250 字符),远端没给时回退到包内命名空间描述--因此远端升版(或任意一次重拉,例如 168 小时 TTL 到期)后,下一次注册(加载期缓存命中、`session_start` 后台同步、`/instabox-use`)就自动换上新描述,不需要改代码。内容只在远端数据变化时变,因此不会每轮产生 system prompt 补丁,也不破坏 prompt 前缀缓存。脚本里用 `describeNamespace("instabox-desktop")` 拿到命名空间与整组的工具名,用 `describeTool(name)` 取单个工具的完整声明(`ALL_TOOLS` 里也带声明),或用 `searchTools("instabox")` 做 BM25 检索。codemode 本身仍须处于激活态--只有脚本才跑得动这些工具--扩展不会替你激活 codemode,且只在**已注册桌面工具**时才判定状态(会话启动一次,`/instabox-status` 每次实时读)。若 codemode 未激活、且会话里没有 `codemode` exposure 的 MCP server,你会收到每会话一条 warning 并附带补救命令:用 `pi --tools +codemode` 启动,或在 settings 里设 `"defaultTools": ["+codemode"]`。若本会话根本没有 `codemode` 工具条目(被 `--tools` / `--exclude-tools` 剔除,或内置扩展被替换),则用另一条一次性文案明说桌面工具在本会话不可调用。配置了 DevTools server 时（默认开启，见 [DevTools MCP](#devtools-mcp)），pi 会自动激活 codemode，因此两条提示都不会出现。两种情况下 `/instabox-use` 与 `/instabox-status` 都可用。
 
 ## 配置
 
@@ -55,6 +55,7 @@ pi install npm:@inobit/pi-instabox
 ```json
 {
   "defaultBox": "",
+  "devTools": true,
   "devToolsBox": "",
   "autoInstallDevTools": true,
   "remotePath": "/opt/npm/bin:/usr/local/bin:/usr/bin:/bin",
@@ -80,7 +81,8 @@ pi install npm:@inobit/pi-instabox
 | 键 | 默认值 | 含义 |
 | --- | --- | --- |
 | `defaultBox` | `""` | 解析链靠后的兜底目标；空串＝未配置（退到 `instabox ls` 第一台） |
-| `devToolsBox` | `""` | DevTools server 开启后 `chrome-devtools-mcp` 的默认箱；它本身不开启该能力，且 `--instabox-devtools-box` 与会话绑定（`/instabox-devtools on <box>`）都会覆盖它 |
+| `devTools` | `true` | 远端 DevTools MCP 的开关。`false` 时保持关闭，除非 `--instabox-devtools` 或 `/instabox-devtools on` 覆盖。优先级：`--instabox-devtools` / `--no-instabox-devtools` → `INSTABOX_MCP_DEVTOOLS` → 本键 |
+| `devToolsBox` | `""` | `chrome-devtools-mcp` 的默认箱；它本身不开启该能力，且 `--instabox-devtools-box` 与会话绑定（`/instabox-devtools on <box>`）都会覆盖它 |
 | `autoInstallDevTools` | `true` | 远端缺 `chrome-devtools-mcp` 时尝试一次 `sudo -n env "PATH=<remotePath>" npm i -g chrome-devtools-mcp` |
 | `remotePath` | `/opt/npm/bin:/usr/local/bin:/usr/bin:/bin` | 箱内使用的 PATH；默认值覆盖目前已在箱模板上见到的 npm 前缀 |
 | `devToolsArgs` | 见上 | 原样透传给 `chrome-devtools-mcp` |
@@ -96,7 +98,7 @@ pi install npm:@inobit/pi-instabox
 
 叠加顺序后者覆盖前者：内置默认值 → 全局 `config.json` → 项目 `config.json`（仅 trusted 项目）→ 环境变量。非法值被忽略，即该层保留下一层的值；`timeouts` 逐字段合并，显式写 `"devToolsArgs": []` 表示清空。
 
-环境变量（空串＝未设置）：`INSTABOX_MCP_DEFAULT_BOX`、`INSTABOX_MCP_DEVTOOLS_BOX`、`INSTABOX_MCP_AUTO_INSTALL`（`0` / `1`）、`INSTABOX_MCP_PATH`（远端 PATH）。
+环境变量（空串＝未设置）：`INSTABOX_MCP_DEFAULT_BOX`、`INSTABOX_MCP_DEVTOOLS`（`0` / `1`——关/开 DevTools server）、`INSTABOX_MCP_DEVTOOLS_BOX`、`INSTABOX_MCP_AUTO_INSTALL`（`0` / `1`）、`INSTABOX_MCP_PATH`（远端 PATH）。
 
 ## 路径
 
@@ -162,15 +164,20 @@ grep '"event":"resolve"' ~/.pi/agent/logs/pi-instabox/pi-instabox.jsonl
 
 ## DevTools MCP
 
-远端 `chrome-devtools-mcp` server **默认关闭**。三个入口决定它在一次会话里存不存在：
+远端 `chrome-devtools-mcp` server **默认开启**（`devTools: true`）。开关与箱名的入口如下，开关先命中先用：
 
 | 入口 | 含义 |
 | --- | --- |
-| `--instabox-devtools` | 打开该能力（boolean，默认 `false`） |
+| `--instabox-devtools` | 强制打开该能力（boolean，默认 `false`） |
+| `--no-instabox-devtools` | 强制关闭（boolean，默认 `false`）；压过配置里的默认值 |
+| `INSTABOX_MCP_DEVTOOLS` | `0` / `1`，位置在 flag 与配置之间 |
+| `devTools`（配置） | 开关本身（boolean，默认 `true`） |
 | `--instabox-devtools-box <name>` | 承载该 server 的箱；覆盖 `devToolsBox`、但低于会话绑定（string，默认 `""`） |
-| `/instabox-devtools [status\|on [box]\|off\|reset]` | 运行期开关与会话绑定（见下文） |
+| `/instabox-devtools [status\|on [box]\|off\|reset]` | 本会话的运行期覆盖与会话绑定（见下文） |
 
-箱子按三级取，先命中先用：`/instabox-devtools on <box>` 写下的**会话绑定**（按分支生效的 session entry，`--continue` 能恢复、`/tree` 切分支会跟着变）→ `--instabox-devtools-box` → `config.devToolsBox`。三者都没配时（且开关开着）给一条 warning 说箱名缺失，**不注册**。箱不在 `instabox ls` 里也是 warning + 不注册并列出候选——绝不静默换一台。只给 `--instabox-devtools-box` 而不给开关，会有一条 warning 提示加开关、什么都不启用；只配 `config.devToolsBox` 则完全静默，因为配置只负责提供默认箱。
+关闭方式：`--no-instabox-devtools`、`config.json` 里的 `"devTools": false`、`INSTABOX_MCP_DEVTOOLS=0`，或在当前会话执行 `/instabox-devtools off`。四种关闭方式用的是同一套词汇：开关叫 `devTools`，状态只有 `on` / `off`。
+
+箱子按三级取，先命中先用：`/instabox-devtools on <box>` 写下的**会话绑定**（按分支生效的 session entry，`--continue` 能恢复、`/tree` 切分支会跟着变）→ `--instabox-devtools-box` → `config.devToolsBox`。三者都没配时（且开关开着）**不注册**；由于开关默认开启、这属于后台行为，此时**完全静默**（只有 `PI_INSTABOX_DEBUG=1` 时看得见一行 `[pi-instabox] …` debug）。箱不在 `instabox ls` 里同理：不注册、绝不静默换一台，也不提示——除非你是显式要这个能力（`--instabox-devtools` 或 `/instabox-devtools on`）。开关显式关着却只给 `--instabox-devtools-box`，会有一条 warning 说要加 `--instabox-devtools` 强制开启、什么都不启用；只配 `config.devToolsBox` 则完全静默，因为配置只负责提供默认箱。
 
 开关打开后，扩展先准备箱子，再注册**一条普通的 stdio MCP 配置**，名为 `instabox-devtools`：
 
@@ -182,12 +189,12 @@ grep '"event":"resolve"' ~/.pi/agent/logs/pi-instabox/pi-instabox.jsonl
 
 准备阶段是**注册之前**的普通函数调用（MCP 客户端自己从不唤醒箱，pi 也不会重连失败的 server）：
 
-1. **准备箱子**：直接复用桌面工具那套 `pool.ensureReady()`（只有一份实现、一套语义：箱不存在则失败并列出候选，`running` 直接返回，否则 `wake` → `start` → `resume` 且每步之后轮询 `running`，全程共享 `timeouts.prepareMs` 截止时间）。箱准备不好就**不注册**，并给一条 warning 说明原因。
+1. **准备箱子**：直接复用桌面工具那套 `pool.ensureReady()`（只有一份实现、一套语义：箱不存在则失败并列出候选，`running` 直接返回，否则 `wake` → `start` → `resume` 且每步之后轮询 `running`，全程共享 `timeouts.prepareMs` 截止时间）。箱准备不好就**不注册**；只有显式要这个能力（`--instabox-devtools` 或 `/instabox-devtools on`）才给一条 warning 说明原因，默认开启的后台路径只 debug。
 2. **查二进制**：`instabox exec <box> --env PATH=<remotePath> --timeout 20 -- sh -c 'command -v chrome-devtools-mcp'`。缺失且 `autoInstallDevTools` 开启时装一次 `sudo -n env "PATH=<remotePath>" npm i -g chrome-devtools-mcp`（60 秒；sudo 会按 `secure_path` 重写 PATH，所以远端 PATH 显式再传一遍）。检查或安装失败只 warn——server 照旧注册，真正的 `command not found` 会在第一次 MCP 调用时原样冒出来。
 
 `devToolsArgs` 原样接在 `chrome-devtools-mcp` 之后；`remotePath` 同时是 `instabox ssh` 载荷与上面那些 `instabox exec` 的 `PATH`。注册本身带 `exposure: "codemode"` 与 180 秒每请求超时（现在它只约束 MCP 请求——准备阶段发生在 server 存在之前）。
 
-**`/instabox-devtools`** 不带参数就是 `status`，打印五行：开关（`instabox-devtools: on (--instabox-devtools)` / `instabox-devtools: off (--instabox-devtools)`）、本会话已注册的 server（`registration: <名称> (via <来源>)`，未注册时为 `registration: (none)`；`<来源>` 本命令注册的取 `command`，其余取提供箱名的那一级 `session` / `flag` / `config`）、本会话绑定的箱（`session binding: <名称>` / `session binding: (unset)`）、下一次 `on` 或会话启动将使用的箱及其来源（`effective box: <名称> (<来源>)` / `effective box: (unset)`；三级按 `session` → `flag` → `config` 解析）、候选箱（`candidates: …`）。中间三段分开报是有意的：`reset` 只清会话绑定，所以 `registration` 仍指向那台还在跑的 server，而 `effective box` 已经回退到下一次会用的箱。`on [box]` 为该箱注册 server（箱名依次取参数、会话绑定、`--instabox-devtools-box`、`devToolsBox`），给了箱名参数时同时把它写成会话绑定；重复执行 `on` 会先注销旧注册再重注，所以拿到的是新连接而不是复用旧连接。箱名不存在则拒绝且保持现状。`off` 在本会话内注销该 server：它的工具变成 `exposure: "hidden"`（pi 不支持反注册工具），因此从 codemode 的 `ALL_TOOLS` 与 `searchTools` 里消失，已经发出的调用会报错，但转录里已有的消息不变；之后再 `on` 会建立新连接。`off` **不清除**会话绑定。`reset` 只清会话绑定：下一次 `on`（以及开关开着时的下一次会话启动）回退到 `--instabox-devtools-box` → `config.devToolsBox`，开关状态与已注册的 server 都不动。
+**`/instabox-devtools`** 不带参数就是 `status`，打印五行：开关及其来源（`instabox-devtools: on (config)` / `on (--instabox-devtools)` / `off (--no-instabox-devtools)` / `on (INSTABOX_MCP_DEVTOOLS)` / `off (/instabox-devtools)`）、本会话已注册的 server（`registration: <名称> (via <来源>)`，未注册时为 `registration: (none)`；`<来源>` 本命令注册的取 `command`，其余取提供箱名的那一级 `session` / `flag` / `config`）、本会话绑定的箱（`session binding: <名称>` / `session binding: (unset)`）、下一次 `on` 或会话启动将使用的箱及其来源（`effective box: <名称> (<来源>)` / `effective box: (unset)`；三级按 `session` → `flag` → `config` 解析）、候选箱（`candidates: …`）。中间三段分开报是有意的：`reset` 只清会话绑定，所以 `registration` 仍指向那台还在跑的 server，而 `effective box` 已经回退到下一次会用的箱。`on [box]` 在本会话打开该能力并为该箱注册 server（箱名依次取参数、会话绑定、`--instabox-devtools-box`、`devToolsBox`），给了箱名参数时同时把它写成会话绑定；重复执行 `on` 会先注销旧注册再重注，所以拿到的是新连接而不是复用旧连接。箱名不存在则拒绝且保持现状。`off` 在本会话关闭该能力并注销 server：它的工具变成 `exposure: "hidden"`（pi 不支持反注册工具），因此从 codemode 的 `ALL_TOOLS` 与 `searchTools` 里消失，已经发出的调用会报错，但转录里已有的消息不变；之后再 `on` 会建立新连接。`off` **不清除**会话绑定。`reset` 只清会话绑定：下一次 `on`（以及开关开着时的下一次会话启动）回退到 `--instabox-devtools-box` → `config.devToolsBox`，开关状态与已注册的 server 都不动。
 
 它的工具——DOM/无障碍快照、元素截图、CSS 级联、网络、console、性能 trace——不会声明给模型。模型在 codemode 脚本里发现它们：
 
@@ -198,7 +205,7 @@ const ns = describeNamespace("mcp__instabox_devtools"); // { name, tools }
 
 正因为这个 server 是 `codemode` exposure，它在注册期间会让 pi 自动激活 codemode，这也是同一会话里桌面工具变得可调用的原因。
 
-**首次连接失败时 pi 不会自己重试。**该 MCP server 会一直处于失败状态直到你用 `/mcp` 重连、再执行一次 `/instabox-devtools on <box>`（这是一次全新注册）或重启会话，期间命名空间里拿不到任何工具。这也是扩展在注册**之前**先唤醒箱、先确认二进制的原因：等到那条 stdio 命令真正跑起来时，箱已经 running、二进制也已就位。唤醒不了的箱根本不注册（一条 warning 说明原因），于是你在开启时就能看到明确信息，而不是面对一个死掉的命名空间。
+**首次连接失败时 pi 不会自己重试。**该 MCP server 会一直处于失败状态直到你用 `/mcp` 重连、再执行一次 `/instabox-devtools on <box>`（这是一次全新注册）或重启会话，期间命名空间里拿不到任何工具。这也是扩展在注册**之前**先唤醒箱、先确认二进制的原因：等到那条 stdio 命令真正跑起来时，箱已经 running、二进制也已就位。唤醒不了的箱根本不注册；显式开启时有一条 warning 说明原因，于是开启时就能看到明确信息，而不是面对一个死掉的命名空间；默认开启的后台路径同样只 debug。
 
 ## 兼容与限制
 
@@ -206,10 +213,10 @@ const ns = describeNamespace("mcp__instabox_devtools"); // { name, tools }
 - **工具选择集归你：**扩展从不调用 `setActiveTools`，不写 `settings.json`，也不改 `defaultTools`；它只报告 codemode 状态与补救命令。
 - **codemode 未激活＝不可调用：**工具已注册，但 codemode 关掉时模型够不到它们；也没有任何列表会提到它们——模型得先自己搜（`describeNamespace("instabox-desktop")` / `searchTools("instabox")`）才知道名字。见「用法」里的前提说明。
 - **工具集跟随模板而非扩展：**定义来自该箱缓存的 `tools/list`。不同箱可能跑不同版本的 `instabox-computer-use`，因此工具集与 schema 可能逐箱不同。校验口径是每次会话启动一次握手：远端版本相同则沿用缓存的工具、不动磁盘，不同则重拉并重写该箱条目，另有 168 小时 TTL 单独触发重拉。工具名稳定（`instabox_desktop_<远端名>`），所以写死了名字的 codemode 脚本跨版本仍可用。
-- **默认安静：**后台声明成功不提示——成功路径没有任何通知，工具直接出现。会话启动只有三种提示：`ls` 空/失败的「没有可用沙箱」、同步失败并给出 `/instabox-use <box>`，以及 DevTools 开关配置有误或箱子没就绪（箱名缺失、箱不在 `ls` 里、只给了 `--instabox-devtools-box` 没给 `--instabox-devtools`、箱唤醒不了，或 `chrome-devtools-mcp` 安装失败，见 [DevTools MCP](#devtools-mcp)）。内部 `[pi-instabox] …` 的 stderr 输出与 JSONL 日志的 `debug` 级记录（见[日志](#日志)）默认关闭，设 `PI_INSTABOX_DEBUG=1` 才能看到唤醒、spawn 参数与握手内部细节；**选箱不需要开关**：每次工具调用都会以 `info` 落一条 `resolve`。
+- **默认安静：**后台声明成功不提示——成功路径没有任何通知，工具直接出现。会话启动只有两种提示：`ls` 空/失败的「没有可用沙箱」、同步失败并给出 `/instabox-use <box>`。DevTools 默认开启但**不主动打扰**：箱名缺失、箱不在 `ls` 里、箱唤醒不了、`chrome-devtools-mcp` 安装失败这些情况只写 debug（`PI_INSTABOX_DEBUG=1`）与 JSONL 里的 `warn` 记录；只有显式开启（`--instabox-devtools` 或 `/instabox-devtools on`）才各给一条 warning，开关显式关着却给了 `--instabox-devtools-box` 也提示（这是明确但无法执行的请求，见 [DevTools MCP](#devtools-mcp)）。内部 `[pi-instabox] …` 的 stderr 输出与 JSONL 日志的 `debug` 级记录（见[日志](#日志)）默认关闭，设 `PI_INSTABOX_DEBUG=1` 才能看到唤醒、spawn 参数与握手内部细节；**选箱不需要开关**：每次工具调用都会以 `info` 落一条 `resolve`。
 - **全部暂停也会被拉起：**没有 running 的箱时，取 `instabox ls` 第一台在后台唤醒并拉模板——唤醒发生在建连这一步，所以缓存命中但箱已暂停时也会为版本校验把它唤醒；唤醒失败降级为那一条提示，会话不会被阻塞或拖住。
-- **桌面截图成本高：**DevTools server 开启时，浏览器相关工作优先走它；命名空间说明里也对模型传达了同一条。
-- **`box` 只作用于桌面工具：**它为 `instabox_desktop_*` 调用选择沙箱。DevTools server 固定绑定一台箱——会话绑定优先，其次 `--instabox-devtools-box`，最后 `devToolsBox`；换箱用 `/instabox-devtools on <box>`（同时更新会话绑定），不需要重新加载扩展；`/instabox-devtools reset` 可以撤掉这条会话绑定。
+- **桌面截图成本高：**浏览器相关工作优先走 DevTools server（默认开启）；不需要时用 `--no-instabox-devtools` 或 `"devTools": false` 关掉。命名空间说明里也对模型传达了同一条。
+- **`box` 只作用于桌面工具：**它为 `instabox_desktop_*` 调用选择沙箱。DevTools server 固定绑定一台箱——会话绑定优先，其次 `--instabox-devtools-box`，最后 `devToolsBox`；换箱用 `/instabox-devtools on <box>`（同时更新会话绑定），不需要重新加载扩展；`/instabox-devtools reset` 可以撤掉这条会话绑定。能力本身跟随 `devTools`（默认 `true`），直到某个 flag 或 `/instabox-devtools off` 改了它。
 - **`off` 会留下旧工具名：**`/instabox-devtools off` 只是把它们隐藏。转录里已经出现过的工具名仍可能被模型尝试，然后以报错告终——连接已关，而 pi 不会因为隐藏而改写历史消息。
 
 ## 开发
