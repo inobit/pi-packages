@@ -56,9 +56,9 @@ const GLOBAL_FILE = path.join(AGENT_DIR, "extensions", "pi-instabox", "config.js
 const PROJECT_FILE = path.join(CWD, ".pi", "extensions", "pi-instabox", "config.json");
 
 describe("DEFAULT_CONFIG", () => {
-	it("默认值：两个 box 留空、devTools 开、autoInstall 开、PATH 钉死、5 条 devToolsArgs、7 段超时", () => {
+	it("默认值：两个 box 留空、devTools 默认 on、autoInstall 开、PATH 钉死、5 条 devToolsArgs、7 段超时", () => {
 		expect(DEFAULT_CONFIG.defaultBox).toBe("");
-		expect(DEFAULT_CONFIG.devTools).toBe(true);
+		expect(DEFAULT_CONFIG.devTools).toBe("on");
 		expect(DEFAULT_CONFIG.devToolsBox).toBe("");
 		expect(DEFAULT_CONFIG.autoInstallDevTools).toBe(true);
 		expect(DEFAULT_CONFIG.remotePath).toBe("/opt/npm/bin:/usr/local/bin:/usr/bin:/bin");
@@ -135,7 +135,7 @@ describe("normalizeConfig（纯函数，不 throw）", () => {
 	it("合法字段全覆盖生效", () => {
 		const cfg = normalizeConfig({
 			defaultBox: "agent",
-			devTools: false,
+			devTools: "off",
 			devToolsBox: "libretv",
 			autoInstallDevTools: false,
 			remotePath: "/usr/local/bin:/usr/bin",
@@ -144,7 +144,7 @@ describe("normalizeConfig（纯函数，不 throw）", () => {
 		});
 		expect(cfg).toEqual({
 			defaultBox: "agent",
-			devTools: false,
+			devTools: "off",
 			devToolsBox: "libretv",
 			autoInstallDevTools: false,
 			remotePath: "/usr/local/bin:/usr/bin",
@@ -168,10 +168,16 @@ describe("normalizeConfig（纯函数，不 throw）", () => {
 		expect((cfg as unknown as Record<string, unknown>)["unknownKey"]).toBeUndefined();
 	});
 
-	it("devTools：默认 true，显式 false/true 原样生效", () => {
-		expect(normalizeConfig(undefined).devTools).toBe(true);
-		expect(normalizeConfig({ devTools: false }).devTools).toBe(false);
-		expect(normalizeConfig({ devTools: true }).devTools).toBe(true);
+	it("devTools：默认 on，显式 on/off 原样生效", () => {
+		expect(normalizeConfig(undefined).devTools).toBe("on");
+		expect(normalizeConfig({ devTools: "on" }).devTools).toBe("on");
+		expect(normalizeConfig({ devTools: "off" }).devTools).toBe("off");
+	});
+
+	it("devTools：布尔值、0/1 与大小写变体都非法 → 忽略该层（仍用下层值）", () => {
+		for (const raw of [true, false, 1, 0, "1", "0", "true", "false", "On", "OFF", null]) {
+			expect(normalizeConfig({ devTools: raw }).devTools).toBe("on");
+		}
 	});
 
 	it("devToolsArgs：显式 [] 表示清空", () => {
@@ -210,6 +216,18 @@ describe("loadConfig（逐层叠加）", () => {
 		const untrusted = loadConfig({ agentDir: AGENT_DIR, cwd: CWD, env: {}, isTrusted: false, ...fsMemory });
 		expect(untrusted.defaultBox).toBe("agent");
 		expect(untrusted.devToolsBox).toBe("global-box");
+	});
+
+	it("devTools 非法值忽略该层：项目层的 true / \"1\" 不会覆盖全局层的 off", () => {
+		for (const invalid of [true, false, "1", "true", "On"]) {
+			const fsMemory = memoryFs(
+				new Map([
+					[GLOBAL_FILE, JSON.stringify({ devTools: "off" })],
+					[PROJECT_FILE, JSON.stringify({ devTools: invalid })],
+				]),
+			);
+			expect(loadConfig({ agentDir: AGENT_DIR, cwd: CWD, env: {}, isTrusted: true, ...fsMemory }).devTools).toBe("off");
+		}
 	});
 
 	it("嵌套 timeouts 逐字段深合并（项目层只覆盖自己写的那项）", () => {
@@ -271,31 +289,31 @@ describe("环境变量层（最后覆盖）", () => {
 			agentDir: AGENT_DIR,
 			cwd: CWD,
 			...fsMemory,
-			env: {
+				env: {
 				INSTABOX_MCP_DEFAULT_BOX: "env-box",
-				INSTABOX_MCP_DEVTOOLS: "0",
+				INSTABOX_MCP_DEVTOOLS: "off",
 				INSTABOX_MCP_DEVTOOLS_BOX: "env-devtools",
 				INSTABOX_MCP_AUTO_INSTALL: "0",
 				INSTABOX_MCP_PATH: "/custom/bin:/usr/bin",
 			},
 		});
 		expect(cfg.defaultBox).toBe("env-box");
-		expect(cfg.devTools).toBe(false);
+		expect(cfg.devTools).toBe("off");
 		expect(cfg.devToolsBox).toBe("env-devtools");
 		expect(cfg.autoInstallDevTools).toBe(false);
 		expect(cfg.remotePath).toBe("/custom/bin:/usr/bin");
 	});
 
-	it("INSTABOX_MCP_DEVTOOLS 覆盖配置层的 devTools=false", () => {
-		const fsMemory = memoryFs(new Map([[GLOBAL_FILE, JSON.stringify({ devTools: false })]]));
-		expect(loadConfig({ agentDir: AGENT_DIR, cwd: CWD, ...fsMemory, env: { INSTABOX_MCP_DEVTOOLS: "1" } }).devTools).toBe(
-			true,
+	it("INSTABOX_MCP_DEVTOOLS 覆盖配置层的 devTools=off", () => {
+		const fsMemory = memoryFs(new Map([[GLOBAL_FILE, JSON.stringify({ devTools: "off" })]]));
+		expect(loadConfig({ agentDir: AGENT_DIR, cwd: CWD, ...fsMemory, env: { INSTABOX_MCP_DEVTOOLS: "on" } }).devTools).toBe(
+			"on",
 		);
-		expect(normalizeEnvOverlay({ INSTABOX_MCP_DEVTOOLS: "0" })).toEqual({ devTools: false });
-		expect(normalizeEnvOverlay({ INSTABOX_MCP_DEVTOOLS: "1" })).toEqual({ devTools: true });
+		expect(normalizeEnvOverlay({ INSTABOX_MCP_DEVTOOLS: "off" })).toEqual({ devTools: "off" });
+		expect(normalizeEnvOverlay({ INSTABOX_MCP_DEVTOOLS: "on" })).toEqual({ devTools: "on" });
 	});
 
-	it("空串与非法值忽略（`AUTO_INSTALL` / `DEVTOOLS` 只认 0/1，其余不动默认）", () => {
+	it("空串与非法值忽略（`AUTO_INSTALL` 只认 0/1，`DEVTOOLS` 只认 on/off，其余不动默认）", () => {
 		expect(
 			normalizeEnvOverlay({
 				INSTABOX_MCP_DEFAULT_BOX: "",
@@ -306,6 +324,9 @@ describe("环境变量层（最后覆盖）", () => {
 			}),
 		).toEqual({});
 		expect(normalizeEnvOverlay({ INSTABOX_MCP_DEVTOOLS: "false" })).toEqual({});
+		for (const raw of ["true", "0", "1", "On", "OFF"]) {
+			expect(normalizeEnvOverlay({ INSTABOX_MCP_DEVTOOLS: raw })).toEqual({});
+		}
 		expect(normalizeEnvOverlay({ INSTABOX_MCP_AUTO_INSTALL: "1" })).toEqual({ autoInstallDevTools: true });
 	});
 });
@@ -328,7 +349,7 @@ describe("VITEST 短路", () => {
 					const cfg = loadConfig({ agentDir: AGENT_DIR, cwd: CWD, isTrusted: true, ...fsMemory });
 					expect(cfg.defaultBox).toBe("env-box");
 					expect(cfg.devToolsBox).toBe("");
-					expect(cfg.devTools).toBe(true);
+					expect(cfg.devTools).toBe("on");
 				});
 			},
 		);

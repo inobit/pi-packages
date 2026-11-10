@@ -13,8 +13,8 @@
  *   一条 user 消息，第二次的目标随之改变）；
  * - codemode 三分支（已激活不提示 / 未激活提示一次 / 无条目提示不可用）+ 有 codemode-exposure
  *   MCP server 时不提示（含 `exposure` 缺省即 codemode 的情形）；
- * - **DevTools MCP 默认开启**（`config.devTools` 默认 `true`）：开关优先级是
- *   `--instabox-devtools` / `--no-instabox-devtools` > `INSTABOX_MCP_DEVTOOLS` > `config.devTools`；
+ * - **DevTools MCP 默认开启**（`config.devTools` 默认 `"on"`）：开关优先级是
+ *   `--instabox-devtools` / `--no-instabox-devtools` > `INSTABOX_MCP_DEVTOOLS`（`on`/`off`）> `config.devTools`；
  *   box 的优先级是**会话绑定 > `--instabox-devtools-box` > `config.devToolsBox`**（启动与 `on` 同一顺序），
  *   箱名缺失 / 不在 `ls` / 开关显式关着却只给 box 都给一条 warning 且不注册；
  *   `/instabox-devtools` 的 `status`（开关来源 / 注册 / 会话绑定 / 生效箱四段）/ `on [box]`（写会话绑定）/
@@ -635,9 +635,9 @@ describe("@inobit/pi-instabox 装配", () => {
 		agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-instabox-index-"));
 		vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
 		vi.stubEnv("INSTABOX_MCP_DEFAULT_BOX", "general");
-		// 默认窄化：DevTools 本来默认开启（`devTools: true`），但除「DevTools MCP」组外，
+		// 默认窄化：DevTools 本来默认开启（`devTools: "on"`），但除「DevTools MCP」组外，
 		// 本文件只关心桌面工具/日志/解析链，不需要它的启动注册与提示。
-		vi.stubEnv("INSTABOX_MCP_DEVTOOLS", "0");
+		vi.stubEnv("INSTABOX_MCP_DEVTOOLS", "off");
 	});
 
 	afterEach(() => {
@@ -1316,7 +1316,7 @@ describe("@inobit/pi-instabox 装配", () => {
 		 * 装配并跑完 `session_start` 的后台体：开关与 flag 判定都在那里（命令行值只有那时才就绪）。
 		 *
 		 * `switchEnv` 模拟 `INSTABOX_MCP_DEVTOOLS`（`""` = 未设置 → 开关回到 `config.devTools`，
-		 * 默认 `true`）；`flag` / `offFlag` 模拟 `--instabox-devtools` / `--no-instabox-devtools`；
+		 * 默认 `on`）；`flag` / `offFlag` 模拟 `--instabox-devtools` / `--no-instabox-devtools`；
 		 * `flagBox` 模拟 `--instabox-devtools-box <name>`；`configBox` 模拟 `config.devToolsBox`
 		 * （经 `INSTABOX_MCP_DEVTOOLS_BOX`）。
 		 */
@@ -1356,7 +1356,7 @@ describe("@inobit/pi-instabox 装配", () => {
 			return { pi, calls, ...fake };
 		}
 
-		it("开关默认开（config.devTools=true）且有 box → 注册 MCP（source=config）", async () => {
+		it("开关默认开（config.devTools=\"on\"）且有 box → 注册 MCP（source=config）", async () => {
 			const logger = createMemoryLogger();
 			setLogger(logger);
 			try {
@@ -1449,15 +1449,15 @@ describe("@inobit/pi-instabox 装配", () => {
 			expect(messagesOf(notifications)).toEqual([]);
 		});
 
-		it("INSTABOX_MCP_DEVTOOLS=0 → 关掉默认开启；=1 时按环境变量开", async () => {
-			const off = await startSession({ switchEnv: "0", configBox: "agent", boxes: [{ name: "agent" }] });
+		it("INSTABOX_MCP_DEVTOOLS=off → 关掉默认开启；=on 时按环境变量开", async () => {
+			const off = await startSession({ switchEnv: "off", configBox: "agent", boxes: [{ name: "agent" }] });
 			expect(off.pi.registeredServers).toEqual([]);
 			expect(messagesOf(off.notifications)).toEqual([]);
 
 			const logger = createMemoryLogger();
 			setLogger(logger);
 			try {
-				const on = await startSession({ switchEnv: "1", configBox: "agent", boxes: [{ name: "agent" }] });
+				const on = await startSession({ switchEnv: "on", configBox: "agent", boxes: [{ name: "agent" }] });
 				await waitFor(() => on.pi.registeredServers.length > 0, "devtools registration from env");
 				expect(logger.records.find((record) => record.event === "devtools.enabled")?.fields).toEqual({
 					box: "agent",
@@ -1468,9 +1468,9 @@ describe("@inobit/pi-instabox 装配", () => {
 			}
 		});
 
-		it("--instabox-devtools 优先于 INSTABOX_MCP_DEVTOOLS=0", async () => {
+		it("--instabox-devtools 优先于 INSTABOX_MCP_DEVTOOLS=off", async () => {
 			const { pi } = await startSession({
-				switchEnv: "0",
+				switchEnv: "off",
 				configBox: "agent",
 				boxes: [{ name: "agent" }],
 				flag: true,
@@ -1603,7 +1603,7 @@ describe("@inobit/pi-instabox 装配", () => {
 		});
 
 		it("开关显式关着却给了 box flag → 一条 warning，不注册", async () => {
-			const { pi, notifications } = await startSession({ switchEnv: "0", flagBox: "agent", boxes: [{ name: "agent" }] });
+			const { pi, notifications } = await startSession({ switchEnv: "off", flagBox: "agent", boxes: [{ name: "agent" }] });
 			await waitFor(() => notifications.length > 0, "switch missing warning");
 
 			expect(messagesOf(notifications)).toEqual(["instabox: 已指定 box 但未开启 devtools，请加 --instabox-devtools"]);
@@ -1627,7 +1627,7 @@ describe("@inobit/pi-instabox 装配", () => {
 
 		it("后台同步：暂停箱的模板缓存也会被唤醒并取到连接（allowWake 不再是 false）", async () => {
 			noDefaultBox();
-			vi.stubEnv("INSTABOX_MCP_DEVTOOLS", "0");
+			vi.stubEnv("INSTABOX_MCP_DEVTOOLS", "off");
 			vi.stubEnv("INSTABOX_MCP_DEVTOOLS_BOX", "");
 			// 缓存命中 → 后台走 `templateStore.ensure(cachedBox, { allowWake: true })`；箱是 suspended，
 			// 只有 allowWake=true 时池才会 `wake` 并建连（false 时直接报 not-running 并降级用旧缓存）。
@@ -1658,7 +1658,7 @@ describe("@inobit/pi-instabox 装配", () => {
 			options: {
 				boxes?: FakeBoxSpec[];
 				configBox?: string;
-				/** `INSTABOX_MCP_DEVTOOLS`（`""` = 未设置 → 开关回到 `config.devTools`，默认 `true`） */
+				/** `INSTABOX_MCP_DEVTOOLS`（`""` = 未设置 → 开关回到 `config.devTools`，默认 `on`） */
 				switchEnv?: string;
 				flag?: boolean;
 				offFlag?: boolean;
@@ -1957,11 +1957,13 @@ describe("@inobit/pi-instabox 装配", () => {
 		it("`status` 的开关来源：config / env / flag / command", async () => {
 			const cases: { options: Parameters<typeof assemble>[0]; expected: string }[] = [
 				{ options: {}, expected: "instabox-devtools: on (config)" },
-				{ options: { switchEnv: "0" }, expected: "instabox-devtools: off (INSTABOX_MCP_DEVTOOLS)" },
-				{ options: { switchEnv: "1" }, expected: "instabox-devtools: on (INSTABOX_MCP_DEVTOOLS)" },
+				{ options: { switchEnv: "off" }, expected: "instabox-devtools: off (INSTABOX_MCP_DEVTOOLS)" },
+				{ options: { switchEnv: "on" }, expected: "instabox-devtools: on (INSTABOX_MCP_DEVTOOLS)" },
+				// 旧写法（0/1、true/false）非法 → 忽略，回落到 config（默认 on）
+				{ options: { switchEnv: "0" }, expected: "instabox-devtools: on (config)" },
 				{ options: { offFlag: true }, expected: "instabox-devtools: off (--no-instabox-devtools)" },
 				// 两个 flag 都给：开 flag 优先
-				{ options: { switchEnv: "0", flag: true, offFlag: true }, expected: "instabox-devtools: on (--instabox-devtools)" },
+				{ options: { switchEnv: "off", flag: true, offFlag: true }, expected: "instabox-devtools: on (--instabox-devtools)" },
 			];
 			for (const { options, expected } of cases) {
 				const { pi, commandCtx, notifications } = await assemble(options);

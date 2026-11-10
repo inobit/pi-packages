@@ -9,7 +9,7 @@
 - **把远端桌面工具映射成 pi 工具**：远端 `instabox-computer-use` 暴露的每个桌面动作在 pi 侧都有一个稳定名字的工具，schema 与名字来自远端而非手写，因此不随远端版本漂移
 - **按调用选箱，且不静默降级**：这次打到哪台沙箱必须显式、可回显；选不出唯一目标时宁可报错并列出候选，也不换一台继续跑
 - **目标可以是默认值，但不是隐藏状态**：会话绑定记住的箱按分支生效、可恢复，单次指定可临时覆盖；两者都不改用户配置
-- **浏览器能力默认开启**：远端 `chrome-devtools-mcp` 默认注册（`config.devTools` 默认 `true`），可用 `--no-instabox-devtools` / `INSTABOX_MCP_DEVTOOLS=0` / `config.devTools=false` / `/instabox-devtools off` 显式关闭；它与桌面工具的目标互不影响（可以指向不同箱）
+- **浏览器能力默认开启**：远端 `chrome-devtools-mcp` 默认注册（`config.devTools` 默认 `"on"`），可用 `--no-instabox-devtools` / `INSTABOX_MCP_DEVTOOLS=off` / `config.devTools: "off"` / `/instabox-devtools off` 显式关闭；它与桌面工具的目标互不影响（可以指向不同箱）
 - **不替用户改工具选择集**：能力不可用时只说清状态与补救命令，不自动启用、不写设置、不改用户默认工具
 - **不占描述预算，靠命名空间发现**：桌面工具以 `deferred` 暴露，既不直接声明给模型也不进 codemode 描述，发现走命名空间（`describeNamespace` / `searchTools`）；`before_agent_start` 那段发现提示的描述**不写死**，按远端 `instructions` 生成
 
@@ -43,7 +43,7 @@
 - **永不 throw 到会话层**：CLI、远端握手、读写盘的任何失败都归一成 `isError` 工具结果、结构化失败或一条 `notify`
 - **所有远端操作只经 `instabox` CLI**：不自建 ssh/远程协议，也不绕过 CLI 直接碰沙箱
 - **「准备一个可用 box」只有一套实现**：`pool.ensureReady(box, opts)`（查状态 → `wake`/`start`/`resume` → 确认 `running`，共享 `prepareMs` 截止时间）是唯一入口；`pool.get` 先 `await` 它再建连，DevTools 注册前的准备也从装配层注入同一个方法——不要在别处再写一遍唤醒链
-- **DevTools 默认开，可显式关；词汇统一 `devTools` / `on|off`**：开关只有一套写法——配置 `devTools: boolean`（默认 `true`）、环境变量 `INSTABOX_MCP_DEVTOOLS=0|1`、flag `--instabox-devtools`（强制开）/ `--no-instabox-devtools`（强制关）、命令 `/instabox-devtools on|off|reset|status`，状态值只有 `on` / `off`（开关就叫 `devTools`，不要给它另起第二个名字）。开关优先级：本会话 `/instabox-devtools on|off` 的运行期覆盖 > 两个 flag（显式者优先）> 环境变量 > `config.devTools`；箱名优先级固定为会话绑定 > `--instabox-devtools-box` > `config.devToolsBox`，缺箱不注册。开启时先 `prepareDevTools`（`ensureReady` 准备箱 + 检查/安装 `chrome-devtools-mcp`）再 `registerMcpServer({ command: "instabox", args: ["ssh", …] })`，不生成 helper、不额外包进程。**提示只听显式动作**：默认开启属后台行为，缺 box / box 不在 `ls` 里 / 唤醒或安装失败都**不 notify**（只 `debug()` + 一条 `warn` 级 `logEvent`）；只有 `--instabox-devtools` 与 `/instabox-devtools on` 才 notify
+- **DevTools 默认开，可显式关；词汇统一 `devTools` / `on|off`**：开关只有一套写法——配置 `devTools: "on"|"off"`（默认 `"on"`；其它值包括布尔与 `0`/`1` 一律非法、忽略该层）、环境变量 `INSTABOX_MCP_DEVTOOLS=on|off`（严格小写）、flag `--instabox-devtools`（强制开）/ `--no-instabox-devtools`（强制关）、命令 `/instabox-devtools on|off|reset|status`，状态值只有 `on` / `off`（开关就叫 `devTools`，不要给它另起第二个名字）。开关优先级：本会话 `/instabox-devtools on|off` 的运行期覆盖 > 两个 flag（显式者优先）> 环境变量 > `config.devTools`；箱名优先级固定为会话绑定 > `--instabox-devtools-box` > `config.devToolsBox`，缺箱不注册。开启时先 `prepareDevTools`（`ensureReady` 准备箱 + 检查/安装 `chrome-devtools-mcp`）再 `registerMcpServer({ command: "instabox", args: ["ssh", …] })`，不生成 helper、不额外包进程。**提示只听显式动作**：默认开启属后台行为，缺 box / box 不在 `ls` 里 / 唤醒或安装失败都**不 notify**（只 `debug()` + 一条 `warn` 级 `logEvent`）；只有 `--instabox-devtools` 与 `/instabox-devtools on` 才 notify
 - **测试必须离线**：exec / spawn / 文件系统 / 时钟全部走注入面，单测不连远端、不读真实配置；真机行为靠冒烟
 
 ## 常用命令

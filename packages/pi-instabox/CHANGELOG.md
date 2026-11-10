@@ -2,9 +2,9 @@
 
 ## [0.2.0] - 2026-11-10
 
-- feat: enable the devtools MCP by default (`devTools: true`) and add `--no-instabox-devtools`
+- feat: enable the devtools MCP by default (`devTools: "on"`) and add `--no-instabox-devtools`
 - feat: keep the default-on devtools startup silent when the box is missing or unusable (debug log only) — only `--instabox-devtools` and `/instabox-devtools on` report failures
-- refactor: use one vocabulary for the devtools switch (devTools / on|off)
+- refactor: use one vocabulary for the devtools switch (devTools / on|off) — the flag, the environment variable, the config and the command all speak `on` / `off`
 
 ## [0.1.2] - 2026-11-10
 

@@ -2,7 +2,7 @@
 
 **English** | [中文](./README.zh-CN.md)
 
-Drive instabox sandboxes from Pi sessions: nine `instabox_desktop_*` computer-use tools whose every call names the box it targets, plus a remote `chrome-devtools-mcp` server bound to one fixed box that is **on by default** and can be switched off (`--no-instabox-devtools`, `devTools: false`, or `/instabox-devtools off`).
+Drive instabox sandboxes from Pi sessions: nine `instabox_desktop_*` computer-use tools whose every call names the box it targets, plus a remote `chrome-devtools-mcp` server bound to one fixed box that is **on by default** and can be switched off (`--no-instabox-devtools`, `devTools: "off"`, or `/instabox-devtools off`).
 
 - **Every call names its box**: an optional `box` parameter (or the five-level target resolution chain) decides which sandbox runs, and the first line of every successful result is `[box=<name>]`
 - **No silent fallback**: a mistyped or ambiguous target is an error listing candidates; only a stale `defaultBox` degrades (with one warning per session)
@@ -55,7 +55,7 @@ Optional `config.json` (global `<agentDir>/extensions/pi-instabox/config.json`, 
 ```json
 {
   "defaultBox": "",
-  "devTools": true,
+  "devTools": "on",
   "devToolsBox": "",
   "autoInstallDevTools": true,
   "remotePath": "/opt/npm/bin:/usr/local/bin:/usr/bin:/bin",
@@ -81,7 +81,7 @@ Optional `config.json` (global `<agentDir>/extensions/pi-instabox/config.json`, 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `defaultBox` | `""` | Late fallback target; empty means unset (falls back to the first `instabox ls` box) |
-| `devTools` | `true` | Switch for the remote DevTools MCP server. `false` keeps it off unless `--instabox-devtools` or `/instabox-devtools on` overrides it. Precedence: `--instabox-devtools` / `--no-instabox-devtools` → `INSTABOX_MCP_DEVTOOLS` → this key |
+| `devTools` | `"on"` | Switch for the remote DevTools MCP server: `"on"` or `"off"` (any other value — including `true` / `false` — is ignored and the layer below wins). `"off"` keeps it off unless `--instabox-devtools` or `/instabox-devtools on` overrides it. Precedence: `--instabox-devtools` / `--no-instabox-devtools` → `INSTABOX_MCP_DEVTOOLS` → this key |
 | `devToolsBox` | `""` | Default box for `chrome-devtools-mcp`; it never enables the server by itself, and both `--instabox-devtools-box` and the session binding (`/instabox-devtools on <box>`) override it |
 | `autoInstallDevTools` | `true` | Try `sudo -n env "PATH=<remotePath>" npm i -g chrome-devtools-mcp` on the box once when it is missing |
 | `remotePath` | `/opt/npm/bin:/usr/local/bin:/usr/bin:/bin` | PATH used inside the box; the defaults cover the npm prefixes seen so far on box templates |
@@ -98,7 +98,7 @@ Optional `config.json` (global `<agentDir>/extensions/pi-instabox/config.json`, 
 
 Layers are applied in order, later wins: built-in defaults → the global `config.json` → the project `config.json` (trusted projects only) → environment variables. Invalid values are ignored, so that layer simply keeps the value below it; `timeouts` merges field by field, and an explicit `"devToolsArgs": []` clears the list.
 
-Environment variables (empty means unset): `INSTABOX_MCP_DEFAULT_BOX`, `INSTABOX_MCP_DEVTOOLS` (`0` or `1` — switches the DevTools server off/on), `INSTABOX_MCP_DEVTOOLS_BOX`, `INSTABOX_MCP_AUTO_INSTALL` (`0` or `1`), `INSTABOX_MCP_PATH` (the remote PATH).
+Environment variables (empty means unset): `INSTABOX_MCP_DEFAULT_BOX`, `INSTABOX_MCP_DEVTOOLS` (`on` or `off`, lowercase only — switches the DevTools server on/off), `INSTABOX_MCP_DEVTOOLS_BOX`, `INSTABOX_MCP_AUTO_INSTALL` (`0` or `1`), `INSTABOX_MCP_PATH` (the remote PATH).
 
 ## Paths
 
@@ -164,18 +164,18 @@ Each record says which of the five levels won (`source`), which box that produce
 
 ## DevTools MCP
 
-The remote `chrome-devtools-mcp` server is **on by default** (`devTools: true`). These inputs decide the switch and the box; for the switch the first one that is set wins:
+The remote `chrome-devtools-mcp` server is **on by default** (`devTools: "on"`). These inputs decide the switch and the box; for the switch the first one that is set wins:
 
 | Input | Meaning |
 | --- | --- |
 | `--instabox-devtools` | Force the capability on (boolean, default `false`) |
 | `--no-instabox-devtools` | Force it off (boolean, default `false`); wins over the config default |
-| `INSTABOX_MCP_DEVTOOLS` | `0` / `1`, sits between the flags and the config |
-| `devTools` (config) | The switch itself (boolean, default `true`) |
+| `INSTABOX_MCP_DEVTOOLS` | `on` / `off` (lowercase only, anything else is ignored), sits between the flags and the config |
+| `devTools` (config) | The switch itself (`"on"` / `"off"`, default `"on"`) |
 | `--instabox-devtools-box <name>` | The box that hosts the server; beats `devToolsBox`, loses to the session binding (string, default `""`) |
 | `/instabox-devtools [status\|on [box]\|off\|reset]` | The runtime override for this session plus the session binding (see below) |
 
-To turn it off: `--no-instabox-devtools`, `"devTools": false` in `config.json`, `INSTABOX_MCP_DEVTOOLS=0`, or `/instabox-devtools off` for the current session. All of them speak the same vocabulary: the switch is `devTools`, its state is `on` / `off`.
+To turn it off: `--no-instabox-devtools`, `"devTools": "off"` in `config.json`, `INSTABOX_MCP_DEVTOOLS=off`, or `/instabox-devtools off` for the current session. All four inputs — flag, environment variable, config and command — speak the same vocabulary: the switch is `devTools`, its state is `on` / `off`.
 
 The box is resolved in this order: the **session binding** written by `/instabox-devtools on <box>` (a branch-scoped session entry, so it survives `--continue` and follows `/tree`), then `--instabox-devtools-box`, then `config.devToolsBox`. With none of the three — and the switch on — **no server is registered**. Because the switch is on by default that is background behaviour and **stays silent** (one `[pi-instabox] …` debug line, visible with `PI_INSTABOX_DEBUG=1`); a box that `instabox ls` does not list is treated the same way — no registration, never silently swapped for another box, no warning unless you asked for the server explicitly. Passing only `--instabox-devtools-box` while the switch is explicitly off warns once and enables nothing; `config.devToolsBox` alone is silent, because the config only supplies a default box.
 
@@ -215,8 +215,8 @@ Because this server has `codemode` exposure, Pi activates codemode automatically
 - **Tool sets follow the template, not the extension:** definitions come from the cached `tools/list` of the box they came from. Different boxes may run different `instabox-computer-use` versions, so the set and the schemas can differ per box. Validation is one handshake per session start: the same remote version keeps the cached tools as they are, a different version refetches `tools/list` and rewrites the entry, and a 168-hour TTL refetches on its own. Names are stable (`instabox_desktop_<remote_name>`), so a codemode script that names a tool keeps working across versions.
 - **Quiet by design:** a successful background sync says nothing at all — the tools simply show up, and the transcript carries no notification about the declaration. The only session-start warnings are "no usable sandbox" (`ls` empty or failing) and a failed sync naming `/instabox-use <box>`. DevTools stays silent unless you asked for it explicitly: with the default-on switch, a missing box, a box that `ls` does not list, a box that cannot be woken, or a failed `chrome-devtools-mcp` install only produce debug lines (`PI_INSTABOX_DEBUG=1`) and a `warn` record in the JSONL log; `--instabox-devtools` turns the same situations into one warning per session, and `--instabox-devtools-box` while the switch is explicitly off warns because that is a direct request that cannot be honoured. Internal `[pi-instabox] …` stderr output and the `debug`-level half of the JSONL log (see [Logs](#logs)) are off by default; set `PI_INSTABOX_DEBUG=1` to see wakes, spawn argv and handshake internals. Box selection needs no switch: each tool call writes its `resolve` record at `info`.
 - **A fully paused fleet is still woken:** when no box is running, the first box from `instabox ls` is woken in the background and its template fetched — the wake happens on connect, so a cached box that is paused gets woken for the version check too; a wake failure degrades to that one warning, and the session is never blocked or held up.
-- **Desktop screenshots are expensive:** for browser work prefer the DevTools server (on by default); switch it off with `--no-instabox-devtools` or `"devTools": false` when you do not need it. The namespace instructions tell the model the same.
-- **`box` covers desktop tools only:** it selects the sandbox for `instabox_desktop_*` calls. The DevTools server is bound to one box — session binding first, then `--instabox-devtools-box`, then `devToolsBox`; switch the box at runtime with `/instabox-devtools on <box>` (which also updates the session binding), no reload needed, and `/instabox-devtools reset` drops the binding again. The capability itself follows `devTools` (default `true`) until a flag or `/instabox-devtools off` says otherwise.
+- **Desktop screenshots are expensive:** for browser work prefer the DevTools server (on by default); switch it off with `--no-instabox-devtools` or `"devTools": "off"` when you do not need it. The namespace instructions tell the model the same.
+- **`box` covers desktop tools only:** it selects the sandbox for `instabox_desktop_*` calls. The DevTools server is bound to one box — session binding first, then `--instabox-devtools-box`, then `devToolsBox`; switch the box at runtime with `/instabox-devtools on <box>` (which also updates the session binding), no reload needed, and `/instabox-devtools reset` drops the binding again. The capability itself follows `devTools` (default `"on"`) until a flag or `/instabox-devtools off` says otherwise.
 - **`off` leaves names behind:** `/instabox-devtools off` only hides the server's tools. Tool names that already appear in the transcript can still be tried by the model and then fail, because the connection is gone and Pi does not reload history.
 
 ## Development
