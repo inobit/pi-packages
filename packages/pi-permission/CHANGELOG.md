@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.3.1] - 2026-11-19
+
+### Fixed
+
+- **`.env.example` is no longer treated as a sensitive file**: basenames ending in `.env.example` no longer match filename rules such as `*.env.*` in `isSensitivePath`, so reads and writes are handled identically. The special "sensitive read" exception and the `envExampleReadAllowed` config field are removed (existing configs carrying the key are ignored). Directory rules (e.g. `~/.ssh/*`) and the realpath/deep forms still apply, so a `.env.example` symlink resolving to a real sensitive target (e.g. `.env`) remains blocked; mode rules are unchanged.
+
 ## [1.3.0] - 2026-10-12
 
 ### Fixed

@@ -6,8 +6,6 @@ import path from "node:path";
 export interface PermissionConfig {
   /** 敏感文件清单（FR-1 / D2），glob 模式；含 `/` 的匹配绝对路径，否则匹配文件名。 */
   sensitivePatterns: string[];
-  /** `.env.example` 读取是否免弹窗（FR-1 例外），写入仍按敏感文件处理。 */
-  envExampleReadAllowed: boolean;
   /** 高频只读 bash 命令白名单（FR-5），命令名命中即视为只读。 */
   readonlyBashCommands: string[];
   /**
@@ -79,7 +77,6 @@ export const DEFAULT_CONFIG: PermissionConfig = {
     ".npmrc",
     "~/.config/gh/hosts.yml",
   ],
-  envExampleReadAllowed: true,
   readonlyBashCommands: [
     // 环境/目录/Shell 内建类
     "cd", "pwd", "env", "which", "echo", "printf", "export", "unset", "alias", "type", "command", "builtin", "hash", "set",

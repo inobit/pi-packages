@@ -62,6 +62,7 @@ Pi coding agent 的权限控制扩展：按「效果可证明性 × 信任域」
 - **三档完备是安全基石**：每个段必属 R/W/X 之一；未识别程序、glob/冷门语法解析失败一律降 X——禁止新增「看起来无害就当 R」的规则；禁止恢复「不在清单的 git 子命令视为只读」（假只读漏洞）
 - **危险叠加与档位无关**：改写重试（如把 `python3 x.py` 拆成 mv/cp）永远逃不出叠加与敏感检查——这是「邀请改写」类文案的安全前提，动分类器时不得破坏
 - **敏感判定永远优先于信任域**：trusted 目录内的敏感文件写仍弹窗（如 `/tmp/.env`）；危险叠加最先拦截
+- **`.env.example` 是普通文件**：在 `isSensitivePath` 里按 basename 跳过文件名规则，不设读取例外；目录级规则（如 `~/.ssh/*`）与 realpath/deep 形态仍生效，软链到 `.env` 不得绕过 FR-1
 - **FR-10/FR-4/FR-1 批准键按模式隔离**（`unverified:<mode>:<program>`、`dangerous:<mode>:<tool>:<id>`、`sensitive:<mode>:<path>`）：任何模式的会话级批准不得泄漏到其它模式（尤其 build 的执行器批准不得泄漏到 plan 只读契约）；plan 无任何执行器豁免配置（设计裁决，勿重新引入）
 - **critical 只增不减**：新增 critical 谓词同时抬升 build/plan 拦截面（`critical ⟹ danger`），动这两条共享固定规则必须同步 README（双语）「build 行为变化」与 CHANGELOG 行为变更条目
 - **realpathDeep 是写边界保证**：不存在目标的父目录软链必须深解析；新增路径判定入口时必须用 deep 形态而非 `realpathOf ?? abs`

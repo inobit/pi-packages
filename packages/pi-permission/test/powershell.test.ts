@@ -160,7 +160,7 @@ describe("powershell 决策（三模式）", () => {
     expect(psReq("build", "Start-Process notepad").rule).toBe("FR-4");
   });
 
-  it("build：敏感文件访问 ask（FR-1），.env.example 豁免", () => {
+  it("build：敏感文件访问 ask（FR-1），.env.example 是普通文件", () => {
     expect(psReq("build", "gc .env").action).toBe("ask");
     expect(psReq("build", "gc .env").rule).toBe("FR-1");
     expect(psReq("build", "gc .env.example").action).toBe("allow");

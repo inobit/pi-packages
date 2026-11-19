@@ -12,7 +12,6 @@
     ".npmrc",
     "~/.config/gh/hosts.yml"
   ],
-  "envExampleReadAllowed": true,
   "readonlyBashCommands": [
     "cd",
     "pwd",

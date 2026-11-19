@@ -5,7 +5,6 @@ import { describe, expect, it } from "vitest";
 import {
   findGitRoot,
   isSensitivePath,
-  isSensitiveReadException,
   isTrustedPath,
   realpathDeep,
   isWithinCwd,
@@ -52,6 +51,16 @@ describe("isSensitivePath", () => {
     expect(isSensitivePath("/proj/.env.production", patterns, "/proj", HOME)).toBe(true);
   });
 
+  it(".env.example 不再命中文件名规则（读写一视同仁）", () => {
+    expect(isSensitivePath("/proj/.env.example", patterns, "/proj", HOME)).toBe(false);
+    expect(isSensitivePath(".env.example", patterns, "/proj", HOME)).toBe(false);
+    expect(isSensitivePath("/proj/app.env.example", patterns, "/proj", HOME)).toBe(false);
+  });
+
+  it("目录级规则仍生效：~/.ssh/.env.example 依然敏感", () => {
+    expect(isSensitivePath(path.join(HOME, ".ssh", ".env.example"), patterns, "/proj", HOME)).toBe(true);
+  });
+
   it("不命中普通文件", () => {
     expect(isSensitivePath("/proj/src/index.ts", patterns, "/proj", HOME)).toBe(false);
   });
@@ -82,17 +91,22 @@ describe("isSensitivePath", () => {
     expect(isSensitivePath(link, patterns, dir, HOME)).toBe(true);
   });
 
+  it(".env.example 软链到 .env 仍命中（防绕过）", () => {
+    const dir = tmpdir();
+    const envFile = path.join(dir, ".env");
+    const link = path.join(dir, ".env.example");
+    fs.writeFileSync(envFile, "SECRET=x");
+    try {
+      fs.symlinkSync(".env", link);
+    } catch {
+      expect(true).toBe(true);
+      return;
+    }
+    expect(isSensitivePath(link, patterns, dir, HOME)).toBe(true);
+  });
+
   it("目录本身引用命中（grep -r ~/.ssh）", () => {
     expect(isSensitivePath("~/.ssh", patterns, "/proj", HOME)).toBe(true);
-  });
-});
-
-describe("isSensitiveReadException", () => {
-  it(".env.example 读取豁免", () => {
-    expect(isSensitiveReadException("/proj/.env.example", "/proj", HOME)).toBe(true);
-  });
-  it("普通 .env 非豁免", () => {
-    expect(isSensitiveReadException("/proj/.env", "/proj", HOME)).toBe(false);
   });
 });
 

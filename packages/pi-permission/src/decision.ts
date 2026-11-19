@@ -16,7 +16,7 @@ import {
   type ParsedCommand,
 } from "./bash.ts";
 import { POWERSHELL_ADAPTER } from "./powershell.ts";
-import { findGitRoot, isSensitivePath, isSensitiveReadException, isTrustedPath, isWithinProject, resolveCwdTarget } from "./path.ts";
+import { findGitRoot, isSensitivePath, isTrustedPath, isWithinProject, resolveCwdTarget } from "./path.ts";
 
 export type DecisionAction = "allow" | "ask" | "deny";
 
@@ -153,20 +153,16 @@ function projectRoots(config: PermissionConfig, cwd: string): string[] {
 
 /**
  * FR-1 敏感文件检查：任何模式、任何优先级之前评估，命中即 ask（D9：ask 非 deny）。
- * `readRefs` 中命中的 `.env.example` 读取豁免（FR-1 例外）。
+ * `.env.example` 已在 isSensitivePath 中按普通文件排除，不设读写特例。
  */
 function sensitiveDecision(
   paths: string[],
   cwd: string,
   cfg: PermissionConfig,
-  readRefs: string[],
   label: string,
 ): Decision | undefined {
   for (const p of paths) {
-    const sensitive = isSensitivePath(p, cfg.sensitivePatterns, cwd, home());
-    if (sensitive) {
-      const isRead = readRefs.includes(p);
-      if (isRead && cfg.envExampleReadAllowed && isSensitiveReadException(p, cwd, home())) continue;
+    if (isSensitivePath(p, cfg.sensitivePatterns, cwd, home())) {
       return { action: "ask", rule: "FR-1", reason: `${label} sensitive file access requires confirmation`, details: [p] };
     }
   }
@@ -203,7 +199,7 @@ export function decideToolRequest(req: ToolDecisionRequest): Decision {
 
   // yolo：彻底放行但敏感文件仍 deny（FR-1）
   if (mode === "yolo") {
-    const sensitive = sensitiveDecision(paths, cwd, config, readTool ? paths : [], label);
+    const sensitive = sensitiveDecision(paths, cwd, config, label);
     if (sensitive) {
       return { action: "deny", rule: "FR-1", reason: `${label} sensitive file access requires confirmation`, details: [...(sensitive.details ?? []), `tool:${toolName}`] };
     }
@@ -217,12 +213,12 @@ export function decideToolRequest(req: ToolDecisionRequest): Decision {
       if (nonTrusted.length > 0 || paths.length === 0) {
         return { action: "deny", rule: "FR-8", reason: `[tool:${toolName}] Plan mode forbids writes outside trusted paths. Use /build for writes.`, details: paths.length > 0 ? paths : undefined };
       }
-      const sensitive = sensitiveDecision(paths, cwd, config, [], label);
+      const sensitive = sensitiveDecision(paths, cwd, config, label);
       if (sensitive) return { ...sensitive, details: [...(sensitive.details ?? []), `tool:${toolName}`] };
       return { action: "allow", rule: "FR-9", reason: `${label} plan mode trusted scratch write allowed`, details: paths };
     }
     // 2. 敏感文件 ask
-    const sensitive = sensitiveDecision(paths, cwd, config, readTool ? paths : [], label);
+    const sensitive = sensitiveDecision(paths, cwd, config, label);
     if (sensitive) return { ...sensitive, details: [...(sensitive.details ?? []), `tool:${toolName}`] };
     // 3. read 白名单放行
     if (readTool) {
@@ -237,7 +233,7 @@ export function decideToolRequest(req: ToolDecisionRequest): Decision {
 
   // chill：敏感文件 deny（`chillSensitiveAction: "ask"` 时改弹窗），其余一律放行
   if (mode === "chill") {
-    const sensitive = sensitiveDecision(paths, cwd, config, readTool ? paths : [], label);
+    const sensitive = sensitiveDecision(paths, cwd, config, label);
     if (sensitive) {
       const details = [...(sensitive.details ?? []), `tool:${toolName}`];
       if (normalizeChillSensitiveAction(config.chillSensitiveAction) === "ask") {
@@ -250,7 +246,7 @@ export function decideToolRequest(req: ToolDecisionRequest): Decision {
 
   // build 模式
   // 1. 敏感文件 ask（工具层无敏感操作概念，最前）
-  const sensitive = sensitiveDecision(paths, cwd, config, readTool ? paths : [], label);
+  const sensitive = sensitiveDecision(paths, cwd, config, label);
   if (sensitive) return { ...sensitive, details: [...(sensitive.details ?? []), `tool:${toolName}`] };
   // 2. 无路径信息（MCP 等未知工具）→ 视为 cwd 内，放行
   if (paths.length === 0) {
@@ -357,7 +353,7 @@ function checkInnerText(
     if (kind.tier !== "R" || kind.danger) return { pass: false };
     const readRefs = collectReadRefs(seg);
     const writeTargets = collectWriteTargets(seg);
-    const hit = sensitiveDecision([...readRefs, ...writeTargets], segCwd, config, readRefs, label);
+    const hit = sensitiveDecision([...readRefs, ...writeTargets], segCwd, config, label);
     if (hit) return { pass: false, sensitive: hit };
   }
   return { pass: true };
@@ -455,7 +451,7 @@ function chillShellDecision(req: BashDecisionRequest, adapter: ShellAdapter, lab
       const seg = segs[i]!;
       const readRefs = adapter.readRefs(seg);
       const writeTargets = adapter.writeTargets(seg);
-      const hit = sensitiveDecision([...readRefs, ...writeTargets], cwds[i] ?? cwd, config, readRefs, label);
+      const hit = sensitiveDecision([...readRefs, ...writeTargets], cwds[i] ?? cwd, config, label);
       if (hit) return hit;
     }
     return undefined;
@@ -532,7 +528,7 @@ export function decideShellRequest(req: BashDecisionRequest, adapter: ShellAdapt
         const segCwd = yoloSegmentCwds[i] ?? cwd;
         const readRefs = adapter.readRefs(seg);
         const writeTargets = adapter.writeTargets(seg);
-        const hit = sensitiveDecision([...readRefs, ...writeTargets], segCwd, config, readRefs, label);
+        const hit = sensitiveDecision([...readRefs, ...writeTargets], segCwd, config, label);
         if (hit) return hit;
       }
       return undefined;
@@ -629,7 +625,7 @@ export function decideShellRequest(req: BashDecisionRequest, adapter: ShellAdapt
       const segCwd = activeCwds[i] ?? cwd;
       const readRefs = adapter.readRefs(seg);
       const writeTargets = adapter.writeTargets(seg);
-      const hit = sensitiveDecision([...readRefs, ...writeTargets], segCwd, config, readRefs, label);
+      const hit = sensitiveDecision([...readRefs, ...writeTargets], segCwd, config, label);
       if (hit) return hit;
     }
     return undefined;

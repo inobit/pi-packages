@@ -43,11 +43,17 @@ describe("工具级决策（build 模式）", () => {
     expect(d.rule).toBe("FR-1");
   });
 
-  it("读取 .env.example 放行（FR-1 例外，验收 2）", () => {
+  it(".env.example 是普通文件：读取放行", () => {
     const dir = tmpdir();
     fs.writeFileSync(path.join(dir, ".env.example"), "KEY=1");
     const d = decideToolRequest({ mode: "build", config: cfg, cwd: dir, toolName: "read", input: { path: ".env.example" } });
     expect(d.action).toBe("allow");
+  });
+
+  it(".env.example 是普通文件：写入放行（含 plan trusted scratch）", () => {
+    const dir = tmpdir();
+    expect(decideToolRequest({ mode: "build", config: cfg, cwd: dir, toolName: "write", input: { path: ".env.example", content: "KEY=1" } }).action).toBe("allow");
+    expect(decideToolRequest({ mode: "plan", config: cfg, cwd: dir, toolName: "write", input: { path: ".env.example", content: "KEY=1" } }).action).toBe("allow");
   });
 
   it("未知工具无路径信息视为 cwd 内，默认放行", () => {
@@ -323,10 +329,24 @@ describe("bash 决策（build 模式）", () => {
     expect(bashReq("build", "cat .env", dir).action).toBe("ask");
   });
 
-  it("cat .env.example 放行", () => {
+  it(".env.example 是普通文件：cat / 写入放行", () => {
     const dir = tmpdir();
     fs.writeFileSync(path.join(dir, ".env.example"), "KEY=1");
     expect(bashReq("build", "cat .env.example", dir).action).toBe("allow");
+    expect(bashReq("build", "echo KEY=1 > .env.example", dir).action).toBe("allow");
+  });
+
+  it(".env.example 软链到 .env 仍按 FR-1 拦截", () => {
+    const dir = tmpdir();
+    fs.writeFileSync(path.join(dir, ".env"), "SECRET=x");
+    try {
+      fs.symlinkSync(".env", path.join(dir, ".env.example"));
+    } catch {
+      return;
+    }
+    const d = bashReq("build", "cat .env.example", dir);
+    expect(d.action).toBe("ask");
+    expect(d.rule).toBe("FR-1");
   });
 
   it("项目外 bash 写弹窗 ask（FR-3，验收 5）", () => {
@@ -747,6 +767,7 @@ describe("chill 模式（§2.1 语义矩阵）", () => {
     expect(bashReq("chill", "bash -c \"cat ~/.ssh/id_rsa\"").action).toBe("deny");
     expect(bashReq("chill", "bash -c \"cp ~/.env /tmp/x\"").action).toBe("deny");
     expect(bashReq("chill", "echo $(cat ~/.ssh/id_rsa)").action).toBe("deny");
+    expect(bashReq("chill", "echo x > .env.example", dir).action).toBe("allow");
   });
 
   it("chill bash：脚本文件/编码/动态/超深嵌套不深挖，直接放行", () => {

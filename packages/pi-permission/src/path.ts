@@ -68,11 +68,17 @@ export function patternToRegExp(pattern: string): RegExp {
   return new RegExp(`^${re}$`);
 }
 
+/** `.env.example`（含 `app.env.example`）是模板文件，不再被文件名规则判为敏感。 */
+const ENV_EXAMPLE_BASENAME = /\.env\.example$/;
+const isEnvExampleBasename = (p: string): boolean => ENV_EXAMPLE_BASENAME.test(p);
+
 /**
  * 判断路径是否命中敏感文件清单（FR-1 / D2）。
  *
  * 双形态匹配：引用路径 + realpath 解析后路径都参与匹配（防 symlink 绕过）；
  * 含 `/` 的模式匹配绝对路径，不含 `/` 的模式匹配文件名。
+ * `.env.example` 形态的 basename 不再命中文件名规则（如 `*.env.*`）；目录级规则
+ * （如 `~/.ssh/*`）与 realpath/deep 形态仍生效，软链到真敏感文件时照常命中。
  */
 export function isSensitivePath(
   target: string,
@@ -99,7 +105,10 @@ export function isSensitivePath(
       }
     } else {
       const basenames = candidates.map((c) => path.basename(c));
-      for (const b of basenames) if (rx.test(b)) return true;
+      for (const b of basenames) {
+        if (isEnvExampleBasename(b)) continue;
+        if (rx.test(b)) return true;
+      }
     }
   }
   return false;
@@ -188,13 +197,6 @@ export function isWithinProject(
     return roots.some((r) => r !== "" && isWithinCwd(abs, r, home));
   }
   return roots.some((r) => r !== "" && isWithinCwd(target, r, home));
-}
-
-/** 是否为 `.env.example`（读取豁免，FR-1 例外）。 */
-export function isSensitiveReadException(target: string, cwd: string, home: string): boolean {
-  const abs = normalizePath(target, cwd, home);
-  const base = path.basename(abs);
-  return base === ".env.example" || /\.env\.example$/.test(base);
 }
 
 /**

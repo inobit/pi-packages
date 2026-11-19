@@ -4,7 +4,7 @@
 
 Lightweight permission control for [Pi coding agent](https://pi.dev). Decisions are tiered by "effect provability" — only block what needs blocking:
 
-1. **Sensitive file protection**: `.env`, `~/.ssh/*`, `*.pem`, `.npmrc`, `~/.config/gh/hosts.yml` etc. — any read or write (tool or bash) triggers a confirmation prompt.
+1. **Sensitive file protection**: `.env`, `~/.ssh/*`, `*.pem`, `.npmrc`, `~/.config/gh/hosts.yml` etc. — any read or write (tool or bash) triggers a confirmation prompt. `.env.example` (and `*.env.example`) is deliberately **not** sensitive: it is a normal template file, readable and writable.
 2. **Trust domain boundary**: plan is read-only (out-of-domain writes silently denied); build trust domain = project dir ∪ trusted paths — everything inside is allowed, crossings are gated.
 3. **Dangerous operation confirmation**: `git push` / `rm -rf`, `sudo`, `curl | sh` and the danger overlay always require confirmation; unverifiable execution (interpreters/unknown programs) asks in plan and is allowed inside the build domain.
 4. **Plan / Build modes**: `/plan` is read-only (out-of-domain writes silently denied), `/build` returns to normal.
@@ -149,7 +149,6 @@ Merged by layer (array fields are **union**-deduplicated across layers, non-arra
 | Field | Description | Default |
 | -- | --- | --- |
 | `sensitivePatterns` | Sensitive file glob list | `*.env` `*.env.*` `~/.ssh/*` `*.pem` `*.key` `id_rsa*` `credentials.json` `secrets*.yaml` `~/.aws/*` `.npmrc` `~/.config/gh/hosts.yml` |
-| `envExampleReadAllowed` | Allow reading `.env.example` without prompt | `true` |
 | `readonlyBashCommands` | Bash read allowlist | High-frequency read-only commands (cat/grep/ls/..., 92 entries) |
 | `dangerousBashCommands` | Unified dangerous operation list (`sudo` or `git commit`) | Git write subcommands + dangerous shell |
 | `criticalBashCommands` | **Critical** severity list — one level above dangerous; used by chill (always ask) and by the effective dangerous union in all modes | `dd` `mkfs` `fdisk` `gdisk` `parted` `wipefs` `shutdown` `reboot` `halt` `poweroff` `init` |

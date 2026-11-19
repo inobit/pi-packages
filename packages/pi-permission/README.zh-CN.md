@@ -4,7 +4,7 @@
 
 轻量权限控制扩展，用于 [Pi coding agent](https://pi.dev)。按「效果可证明性」分档决策，只拦该拦的，其余一概不打扰：
 
-1. **敏感文件保护**：`.env`、`~/.ssh/*`、`*.pem`、`.npmrc`、`~/.config/gh/hosts.yml` 等，任何通道（工具/bash）的读与写都弹窗确认。
+1. **敏感文件保护**：`.env`、`~/.ssh/*`、`*.pem`、`.npmrc`、`~/.config/gh/hosts.yml` 等，任何通道（工具/bash）的读与写都弹窗确认。`.env.example`（含 `*.env.example`）刻意**不算敏感文件**：它是普通模板，读写一视同仁。
 2. **信任域边界**：plan 只读（跨域写静默拒绝）；build 下信任域 = 项目目录 ∪ trusted 路径，域内放行、跨域设门。
 3. **危险操作确认**：`git push`/`rm -rf`、`sudo`、`curl | sh` 等危险叠加始终确认；不可证执行（解释器/未知程序）在 plan 下确认、build 域内放行。
 4. **plan/build 模式**：`/plan` 只读（跨域写静默拒绝），`/build` 回到正常模式。
@@ -139,7 +139,6 @@ PS     Format-Volume、diskpart、Remove-Computer、Restart-Computer、Stop-Comp
 | 字段 | 含义 | 默认 |
 | -- | ---- | ---- |
 | `sensitivePatterns` | 敏感文件 glob 清单 | `*.env` `*.env.*` `~/.ssh/*` `*.pem` `*.key` `id_rsa*` `credentials.json` `secrets*.yaml` `~/.aws/*` `.npmrc` `~/.config/gh/hosts.yml` |
-| `envExampleReadAllowed` | `.env.example` 读取免弹窗 | `true` |
 | `readonlyBashCommands` | bash read 白名单 | 高频只读命令（cat/grep/ls/...，92 项） |
 | `dangerousBashCommands` | 敏感操作统一清单（`sudo` 或 `git commit`） | git 写子命令 + 危险 shell |
 | `readonlyPowerShellCommands` | PowerShell read 白名单（规范 cmdlet 名，匹配前别名已归一化） | 只读 cmdlet（get-childitem/get-content/select-string/...） |
